@@ -24,8 +24,8 @@ $env:VT_API_KEY = "your-api-key-here"
 export VT_API_KEY="your-api-key-here"
 
 # Optional corporate proxy
-$env:HTTP_PROXY  = "http://proxy.example.com:8080"
-$env:HTTPS_PROXY = "http://proxy.example.com:8080"
+$env:HTTP_PROXY  = "http://proxy.example.com:"
+$env:HTTPS_PROXY = "http://proxy.example.com:"
 # If needed (not recommended):
 $env:VT_VERIFY_SSL = "false"
 
