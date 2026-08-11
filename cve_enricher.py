@@ -47,6 +47,13 @@ section with the exception message.
 
 from __future__ import annotations
 
+# --- Standard library ---
+# argparse: CLI surface for operators who prefer flags over editing .env
+# csv / html / json: input parsing and report serialization
+# logging: operational visibility without printing secrets
+# os / subprocess / webbrowser: env access and reliable browser open on Windows
+# random / time: jittered backoff so concurrent clients do not thundering-herd the API
+# traceback: captured into the HTML failure banner so SSL/proxy issues are visible offline
 import argparse
 import csv
 import html
@@ -65,6 +72,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
+# --- Third party ---
+# requests: HTTP client; verify= path-or-True supports corporate MITM CAs
+# dotenv: load project .env so PowerShell session variables are not required
+# rich: progress bars and color cards on the terminal (stderr for logs)
 import requests
 from dotenv import load_dotenv
 from rich import box
@@ -76,36 +87,44 @@ from rich.table import Table
 from rich.text import Text
 
 # ---------------------------------------------------------------------------
-# Configuration (override via .env / env vars / CLI; never hard-code secrets)
+# Configuration defaults
+# Values may be overridden by .env, process environment, or CLI flags.
+# Secrets are never hard-coded here — only safe defaults and path conventions.
 # ---------------------------------------------------------------------------
 
-# Project root = directory containing this script (stable regardless of cwd)
+# Anchor paths to the script directory so runs work regardless of the caller's cwd.
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
+# Preferred drop-location for the org root CA used during SSL inspection.
 DEFAULT_CA_BUNDLE = PROJECT_ROOT / "certs" / "corporate-ca.pem"
 
 DEFAULT_API_BASE = "https://www.virustotal.com/api/v3"
 DEFAULT_INPUT = "cve_list.csv"
 DEFAULT_OUTPUT = "cve_enriched.csv"
+# HTML path is always used (report is written even when enrichment fails).
 DEFAULT_HTML = "report.html"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BACKOFF_BASE = 2.0  # seconds; exponential: base^attempt + jitter
 
+# Canonical CVE ID shape used for validation after normalization.
 CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 
-# GTI priority derivation uses these normalized labels.
-# Exploit availability values observed in GTI docs / UI.
+# GTI priority derivation treats these labels as "no known exploit availability".
+# Values observed across GTI docs / UI wording variants.
 NO_KNOWN_ALIASES = {"", "n/a", "none", "no known", "no_known", "unknown"}
 
 # Fallback delay; actual value is resolved after .env load (see resolve_request_delay).
 DEFAULT_DELAY = 1.0
 
+# stdout for human-facing cards; stderr for logs so piping CSV/HTML stays clean.
 console = Console(stderr=False)
 log_console = Console(stderr=True)
 
 
 # ---------------------------------------------------------------------------
 # Environment / config loading
+# All secrets and proxy URLs should come from .env (or explicit CLI overrides).
+# This avoids requiring $env:HTTP_PROXY / API key in every new PowerShell window.
 # ---------------------------------------------------------------------------
 
 
@@ -119,6 +138,7 @@ def load_project_dotenv(env_file: Optional[Path] = None) -> Optional[Path]:
 
     Returns the path that was loaded, or None if no ``.env`` was found.
     """
+    # Build an ordered search list: explicit path, script-dir .env, then cwd .env.
     candidates: list[Path] = []
     if env_file is not None:
         candidates.append(Path(env_file))
@@ -129,10 +149,11 @@ def load_project_dotenv(env_file: Optional[Path] = None) -> Optional[Path]:
 
     for path in candidates:
         if path.is_file():
+            # override=False: pre-set env (e.g. CI secrets) takes precedence over .env.
             load_dotenv(dotenv_path=path, override=False)
             return path.resolve()
 
-    # Still call load_dotenv so python-dotenv can find a parent .env if any
+    # Fall back to python-dotenv's default discovery (parent dirs) if present.
     load_dotenv(override=False)
     return None
 
@@ -150,6 +171,8 @@ def resolve_request_delay(cli_value: Optional[float] = None) -> float:
     return DEFAULT_DELAY
 
 
+# Reject copy-paste placeholders so operators get a clear config error
+# instead of a confusing 401 from VirusTotal.
 _PLACEHOLDER_API_KEYS = frozenset(
     {
         "insert_key_here",
@@ -190,6 +213,11 @@ def resolve_ssl_verify(
 
     Always verifies certificates — never returns ``False``.
 
+    Corporate SSL inspection (MITM) signs TLS with an internal root CA that is
+    not in Python's default certifi bundle. Passing the CA path as
+    ``session.verify = "<pem>"`` is the supported fix; disabling verification
+    is intentionally unsupported.
+
     Resolution order:
       1. Explicit CLI / argument path (``ca_bundle``)
       2. ``CORPORATE_CA_BUNDLE`` from environment / ``.env``
@@ -210,6 +238,7 @@ def resolve_ssl_verify(
     env_ca = (os.getenv("CORPORATE_CA_BUNDLE") or "").strip()
     if env_ca:
         candidates.append(env_ca)
+    # Honor standard Python/requests env vars used by many enterprise images.
     for env_name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
         val = (os.getenv(env_name) or "").strip()
         if val:
@@ -218,7 +247,8 @@ def resolve_ssl_verify(
     for raw in candidates:
         path = Path(raw).expanduser()
         if not path.is_absolute():
-            # Resolve relative to project root first, then cwd
+            # Prefer project-root relative paths (how README/.env document them),
+            # then fall back to the caller's working directory.
             project_relative = (PROJECT_ROOT / path).resolve()
             cwd_relative = (Path.cwd() / path).resolve()
             if project_relative.is_file():
@@ -230,21 +260,26 @@ def resolve_ssl_verify(
         else:
             path = path.resolve()
         if path.is_file():
+            # requests accepts a filesystem path string for verify=
             return str(path)
+        # Explicit path was configured but missing — fail loud rather than
+        # silently falling back (would surface as a less actionable SSLError).
         raise FileNotFoundError(
             f"CA bundle not found: {raw!r} (resolved to {path}). "
             "Export your corporate root CA to PEM/CRT and set CORPORATE_CA_BUNDLE, "
             f"or place it at {DEFAULT_CA_BUNDLE}. See SETUP.md."
         )
 
-    # Optional default location — use only if the operator placed a file there
+    # Convention path: use only when the operator has already dropped the file in.
     if DEFAULT_CA_BUNDLE.is_file():
         return str(DEFAULT_CA_BUNDLE.resolve())
 
+    # No corporate CA configured — rely on certifi / system trust (direct TLS).
     return True
 
 
 def describe_ssl_verify(verify: Union[bool, str]) -> str:
+    """Human-readable TLS mode for startup logs (never logs secret material)."""
     if isinstance(verify, str):
         return f"custom CA bundle → {verify}"
     return "default trust store (certifi / system)"
@@ -252,6 +287,8 @@ def describe_ssl_verify(verify: Union[bool, str]) -> str:
 
 # ---------------------------------------------------------------------------
 # Data model
+# One flat record per CVE so CSV, Rich, and HTML share the same fields.
+# Nested GTI JSON is normalized here for analyst-friendly consumption.
 # ---------------------------------------------------------------------------
 
 
@@ -260,17 +297,18 @@ class CVERecord:
     """Flattened, decision-ready CVE enrichment record."""
 
     cve: str
-    status: str = "ok"  # ok | not_found | error | rate_limited | forbidden
+    # ok | not_found | error | rate_limited | forbidden
+    status: str = "ok"
     error_message: str = ""
 
-    # Core prioritization
+    # Core prioritization (priority_rating is derived; priority_raw is API as-is)
     priority_rating: str = "N/A"  # P0–P4 (derived)
     priority_raw: str = "N/A"  # raw API field (may be bool / missing)
     risk_rating: str = "N/A"
     predicted_risk_rating: str = "N/A"
     risk_factors: str = "N/A"
 
-    # Exploitation
+    # Exploitation posture
     exploitation_state: str = "N/A"
     exploit_availability: str = "N/A"
     exploited_in_the_wild: str = "False"
@@ -280,13 +318,13 @@ class CVERecord:
     first_exploitation: str = "N/A"
     exploit_release_date: str = "N/A"
 
-    # CISA KEV
+    # CISA Known Exploited Vulnerabilities catalog
     cisa_kev: str = "False"
     cisa_added_date: str = "N/A"
     cisa_due_date: str = "N/A"
     cisa_ransomware_use: str = "N/A"
 
-    # EPSS
+    # Exploit Prediction Scoring System
     epss_score: str = "N/A"
     epss_percentile: str = "N/A"
 
@@ -300,16 +338,16 @@ class CVERecord:
     cvss_v4_vector: str = "N/A"
     cvss_v4_exploit_maturity: str = "N/A"
 
-    # CVSS v2 (supporting)
+    # CVSS v2 (supporting / legacy)
     cvss_v2_base: str = "N/A"
     cvss_v2_temporal: str = "N/A"
     cvss_v2_vector: str = "N/A"
 
-    # Products
+    # Affected products (flattened from CPE ranges)
     affected_products: str = "N/A"
     affected_products_count: int = 0
 
-    # Supporting context
+    # Supporting context for triage notes and reports
     mve_id: str = "N/A"
     name: str = "N/A"
     description: str = "N/A"
@@ -327,11 +365,11 @@ class CVERecord:
     vt_url: str = "N/A"
     ioc_count: str = "N/A"
 
-    # Preserve interesting nested bits for advanced consumers
+    # Truncated JSON bag for advanced consumers (SIEM, custom parsers)
     extra_json: str = ""
 
 
-# CSV column order (stable, analyst-friendly)
+# Stable CSV column order — keep in sync with CVERecord fields used in write_csv.
 CSV_COLUMNS: list[str] = [
     "cve",
     "status",
@@ -386,11 +424,12 @@ CSV_COLUMNS: list[str] = [
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers — logging, display coercion, CVE ID normalization
 # ---------------------------------------------------------------------------
 
 
 def setup_logging(verbose: bool = False) -> None:
+    """Configure Rich-backed logging on stderr (keeps stdout free for piping)."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -411,7 +450,7 @@ def na(value: Any, default: str = "N/A") -> str:
             return default
         return "; ".join(str(v) for v in value if v is not None and str(v).strip() != "")
     if isinstance(value, float):
-        # Keep enough precision for EPSS/CVSS without scientific noise
+        # Enough precision for EPSS/CVSS without scientific notation noise
         return f"{value:.6f}".rstrip("0").rstrip(".") if value != 0 else "0"
     text = str(value).strip()
     return text if text else default
@@ -426,7 +465,7 @@ def fmt_ts(value: Any) -> str:
         return value if value.strip() else "N/A"
     try:
         ts = int(value)
-        # Heuristic: millisecond timestamps
+        # Heuristic: values larger than ~year 2286 are likely milliseconds
         if ts > 10_000_000_000:
             ts //= 1000
         return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -439,9 +478,10 @@ def normalize_cve(raw: str) -> Optional[str]:
     if not raw:
         return None
     cleaned = raw.strip().upper().replace(" ", "")
-    # Tolerate missing hyphen variants slightly
+    # Tolerate underscore separators from some export tools
     cleaned = cleaned.replace("_", "-")
     if not cleaned.startswith("CVE-"):
+        # Accept bare "2024-3400" and promote to CVE-YYYY-NNNN
         if re.match(r"^\d{4}-\d{4,}$", cleaned):
             cleaned = f"CVE-{cleaned}"
     if not CVE_PATTERN.match(cleaned):
@@ -450,15 +490,21 @@ def normalize_cve(raw: str) -> Optional[str]:
 
 
 def cve_api_id(cve: str) -> str:
-    """Build the collections object id: vulnerability--cve-yyyy-nnnnn (lowercase)."""
+    """
+    Build the GTI collections object id.
+
+    API path requires lowercase: vulnerability--cve-yyyy-nnnnn
+    """
     return f"vulnerability--{cve.lower()}"
 
 
 def _norm_label(value: str) -> str:
+    """Lowercase + collapse whitespace for fuzzy matching of GTI enum labels."""
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
 def _is_no_known(value: str) -> bool:
+    """True when exploit-availability wording means 'none / unknown'."""
     return _norm_label(value) in NO_KNOWN_ALIASES
 
 
@@ -503,12 +549,17 @@ def derive_priority_rating(
     exploitation_state: str,
     exploit_availability: str,
 ) -> str:
-    """Derive GTI-style P0–P4 priority from risk + exploitation signals."""
+    """
+    Derive GTI-style P0–P4 priority from risk + exploitation signals.
+
+    The collections API exposes ``priority`` as a boolean; the P0–P4 badge in
+    the GTI UI is a product of this combination table (documented above).
+    """
     risk = _norm_label(risk_rating)
     state = _norm_label(exploitation_state)
     avail = _norm_label(exploit_availability)
 
-    # Normalize common aliases
+    # Collapse missing / synonym labels so the decision table stays small
     if risk in {"n/a", "none", "unrated", ""}:
         risk = "unrated"
     if state in {"n/a", "none", ""}:
@@ -516,10 +567,11 @@ def derive_priority_rating(
     if avail in {"n/a", "none", "unknown", ""}:
         avail = "no known"
 
-    # Map "Known" (older filter wording) toward public availability for matching
+    # Older filter wording "Known" ≈ publicly available exploit code
     if avail == "known":
         avail = "publicly available"
 
+    # Pre-built sets for membership tests in the P0–P4 rules
     wide_confirmed_reported = {"wide", "confirmed", "reported"}
     suspected_no_known = {"suspected", "no known"}
     confirmed_reported_suspected = {"confirmed", "reported", "suspected"}
@@ -533,7 +585,7 @@ def derive_priority_rating(
     }
     low_interest = {"interest observed", "no known"}
 
-    # --- P0 ---
+    # --- P0 (highest urgency) ---
     if risk == "critical":
         return "P0"
     if risk == "high" and state in wide_confirmed_reported:
@@ -582,6 +634,7 @@ def derive_priority_rating(
 
 # ---------------------------------------------------------------------------
 # Input CSV
+# Tolerates analyst-exported spreadsheets (headers, BOM, alternate delimiters).
 # ---------------------------------------------------------------------------
 
 
@@ -593,6 +646,8 @@ def load_cve_list(path: Path) -> list[str]:
       - Single-column file (header optional): CVE / cve_id / cveid / id
       - Multi-column file with a column named CVE, cve, cve_id, cveid, or id
       - Headerless single column of CVE values
+
+    Returns a de-duplicated list in file order (first occurrence wins).
     """
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {path}")
@@ -600,6 +655,7 @@ def load_cve_list(path: Path) -> list[str]:
     cves: list[str] = []
     seen: set[str] = set()
 
+    # utf-8-sig strips a BOM that Excel often writes on Windows exports
     with path.open(newline="", encoding="utf-8-sig") as fh:
         sample = fh.read(4096)
         fh.seek(0)
@@ -608,7 +664,7 @@ def load_cve_list(path: Path) -> list[str]:
         except csv.Error:
             dialect = csv.excel
 
-        # Detect header
+        # Header vs data: first cell looks like a label, not a CVE ID
         fh.seek(0)
         first_line = fh.readline()
         fh.seek(0)
@@ -619,7 +675,7 @@ def load_cve_list(path: Path) -> list[str]:
 
         if has_header:
             reader = csv.DictReader(fh, dialect=dialect)
-            # Normalize header keys
+            # Map lowercased header names back to original field names
             field_map = { (f or "").strip().lower(): f for f in (reader.fieldnames or []) }
             col = None
             for candidate in ("cve", "cve_id", "cveid", "cve-id", "id", "identifier", "vulnerability"):
@@ -627,7 +683,7 @@ def load_cve_list(path: Path) -> list[str]:
                     col = field_map[candidate]
                     break
             if col is None:
-                # Fall back to first column
+                # Unknown schema — use the leftmost column rather than failing
                 if reader.fieldnames:
                     col = reader.fieldnames[0]
                 else:
@@ -643,6 +699,7 @@ def load_cve_list(path: Path) -> list[str]:
                 elif not cve:
                     logging.warning("Skipping invalid CVE value: %r", raw)
         else:
+            # Headerless: treat column 0 as the CVE list
             reader = csv.reader(fh, dialect=dialect)
             for row in reader:
                 if not row:
@@ -662,6 +719,7 @@ def load_cve_list(path: Path) -> list[str]:
 
 # ---------------------------------------------------------------------------
 # API client
+# Session-level proxy + CA bundle + API key; per-request throttle and retries.
 # ---------------------------------------------------------------------------
 
 
@@ -680,6 +738,7 @@ class GTIClient:
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         delay: float = DEFAULT_DELAY,
     ) -> None:
+        # Defense in depth: placeholders should already be filtered by resolve_api_key
         if not api_key or api_key in {
             "INSERT_KEY_HERE",
             "your-api-key",
@@ -690,8 +749,8 @@ class GTIClient:
                 "API key missing or still a placeholder. "
                 "Set VIRUSTOTAL_API_KEY in .env (or VT_API_KEY) or pass --api-key."
             )
+        # Hard guard: never allow insecure TLS (corporate MITM must use a CA bundle).
         if verify is False:
-            # Hard guard: never allow insecure TLS (corporate MITM must use a CA bundle).
             raise ValueError(
                 "TLS verification cannot be disabled. Place the corporate root CA at "
                 f"{DEFAULT_CA_BUNDLE} or set CORPORATE_CA_BUNDLE in .env. See SETUP.md."
@@ -703,6 +762,7 @@ class GTIClient:
         self.delay = delay
         self._last_request_at = 0.0
 
+        # One Session reuses connections and carries proxy/verify for all GETs.
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -711,14 +771,16 @@ class GTIClient:
                 "User-Agent": "gti-cve-enricher/1.0",
             }
         )
-        # Proxies: prefer explicit session config from .env / CLI over ambient env alone
+        # Explicit proxies from .env/CLI so behavior is deterministic even if the
+        # process environment is incomplete (common on locked-down desktops).
         if proxies:
             self.session.proxies.update(proxies)
-        # verify=True (system/certifi) or path to corporate CA PEM for SSL inspection
+        # True = certifi/system trust; str path = corporate root CA for MITM inspection
         self.session.verify = verify
         logging.info("TLS verification: %s", describe_ssl_verify(verify))
 
     def _throttle(self) -> None:
+        """Sleep just enough to honor the configured inter-request delay."""
         if self.delay <= 0:
             return
         elapsed = time.monotonic() - self._last_request_at
@@ -743,6 +805,7 @@ class GTIClient:
                 resp = self.session.get(url, timeout=self.timeout)
                 self._last_request_at = time.monotonic()
             except requests.RequestException as exc:
+                # Network/proxy/SSL failures — backoff then retry
                 wait = self.backoff_base**attempt + random.uniform(0, 1)
                 logging.warning(
                     "Network error for %s (attempt %d): %s — retrying in %.1fs",
@@ -763,13 +826,14 @@ class GTIClient:
                     return None, "error", 200
 
             if resp.status_code == 404:
+                # CVE not in GTI collections (too new, unpublished, or out of coverage)
                 body_preview = _safe_error_body(resp)
                 logging.info("404 Not Found for %s — %s", cve, body_preview)
                 return None, "not_found", 404
 
             if resp.status_code in (401, 403):
+                # Almost always license/privilege rather than a bad CVE ID
                 body_preview = _safe_error_body(resp)
-                # Privilege / license messaging
                 msg = (
                     f"HTTP {resp.status_code}: access denied for {cve}. "
                     "Vulnerability Intelligence requires a Google Threat Intelligence "
@@ -780,7 +844,7 @@ class GTIClient:
                 return None, "forbidden", resp.status_code
 
             if resp.status_code == 429:
-                # Prefer Retry-After header when present
+                # Honor Retry-After when the API provides it; else exponential backoff
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
                     wait = float(retry_after) + random.uniform(0, 1)
@@ -798,7 +862,7 @@ class GTIClient:
                 time.sleep(wait)
                 continue
 
-            # Other 5xx / unexpected
+            # Transient server faults: retry; other 4xx: surface as error
             body_preview = _safe_error_body(resp)
             if resp.status_code >= 500 and attempt < self.max_retries:
                 wait = self.backoff_base**attempt + random.uniform(0, 1)
@@ -824,6 +888,7 @@ class GTIClient:
 
 
 def _safe_error_body(resp: requests.Response, limit: int = 300) -> str:
+    """Extract a short, log-safe preview of an API error body."""
     try:
         data = resp.json()
         if isinstance(data, dict):
@@ -835,11 +900,14 @@ def _safe_error_body(resp: requests.Response, limit: int = 300) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Field extraction (mapped to real GTI vulnerability object schema)
+# Field extraction
+# Maps the GTI vulnerability object schema into a flat CVERecord.
+# Uses tolerant key lookup because field names have varied across API revisions.
 # ---------------------------------------------------------------------------
 
 
 def _dig(d: Any, *keys: str, default: Any = None) -> Any:
+    """Safe nested dict walk: _dig(obj, 'a', 'b') == obj['a']['b'] or default."""
     cur = d
     for k in keys:
         if not isinstance(cur, dict):
@@ -851,6 +919,7 @@ def _dig(d: Any, *keys: str, default: Any = None) -> Any:
 
 
 def _first(*values: Any, default: Any = None) -> Any:
+    """Return the first non-empty value (handles alternate API field names)."""
     for v in values:
         if v is None:
             continue
@@ -879,7 +948,7 @@ def _format_cpes(cpes: Any) -> tuple[str, int]:
         vendor = _first(start.get("vendor"), end.get("vendor"), default="")
         product = _first(start.get("product"), end.get("product"), default="")
         if not vendor and not product:
-            # Fall back to URI
+            # Fall back to full CPE URI when vendor/product parts are absent
             uri = _first(start.get("uri"), end.get("uri"), default="")
             if uri:
                 lines.append(str(uri))
@@ -897,7 +966,7 @@ def _format_cpes(cpes: Any) -> tuple[str, int]:
         version_part = " and ".join(range_bits) if range_bits else "any"
         lines.append(f"{vendor} / {product} ({version_part})")
 
-    # Deduplicate while preserving order
+    # Deduplicate while preserving first-seen order
     unique: list[str] = []
     seen: set[str] = set()
     for line in lines:
@@ -920,10 +989,9 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
     if not isinstance(attrs, dict):
         attrs = {}
 
-    # --- CVSS ---
+    # --- CVSS (v2 / v3.x / v4.x; tolerate legacy key aliases) ---
     cvss = attrs.get("cvss") or {}
     # Documented keys: cvssv2_0, cvssv3_x, cvssv3_x_translated, cvssv4_x
-    # Also tolerate legacy/alternate shapes (v3, cvssv3, etc.)
     v3 = _first(
         cvss.get("cvssv3_x"),
         cvss.get("cvssv3_x_translated"),
@@ -952,7 +1020,7 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
     epss_score = _first(epss.get("score"))
     epss_pct = _first(epss.get("percentile"))
 
-    # --- Exploitation (top-level + nested dict) ---
+    # --- Exploitation (fields may sit at top level or under attributes.exploitation) ---
     exploitation = attrs.get("exploitation") if isinstance(attrs.get("exploitation"), dict) else {}
     exploitation_state = _first(
         attrs.get("exploitation_state"),
@@ -977,13 +1045,13 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         default=False,
     )
 
-    # Derive wild exploitation from state when boolean field absent
+    # Wide/Confirmed state implies real-world exploitation even when the bool is absent.
+    # We intentionally do not overwrite an explicit False from the API.
     if exploited_in_wild is False or exploited_in_wild is None:
         if _norm_label(str(exploitation_state)) in {"wide", "confirmed"}:
-            # Confirmed/Wide implies observed exploitation; keep explicit bool if present
             pass
 
-    # --- CISA KEV ---
+    # --- CISA KEV (presence of the object means "on the KEV list") ---
     kev = attrs.get("cisa_known_exploited")
     if isinstance(kev, dict) and kev:
         cisa_kev = True
@@ -997,11 +1065,11 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         cisa_ransom = "N/A"
 
     # --- Risk / priority ---
+    # API documents priority as boolean; the GTI UI shows P0–P4 — we derive that.
     risk_rating = na(attrs.get("risk_rating"))
     predicted = na(attrs.get("predicted_risk_rating"))
     risk_factors = na(attrs.get("risk_factors"))
     priority_raw = attrs.get("priority")
-    # API docs list priority as boolean; UI uses P0–P4 (derived)
     if isinstance(priority_raw, bool):
         priority_raw_str = "True" if priority_raw else "False"
     else:
@@ -1012,20 +1080,20 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         str(exploitation_state),
         str(exploit_availability),
     )
-    # If API ever returns an explicit P0–P4 string, prefer it
+    # Prefer an explicit P0–P4 string if the API ever supplies one
     if isinstance(priority_raw, str) and re.match(r"^P[0-4]$", priority_raw.strip(), re.I):
         priority_rating = priority_raw.strip().upper()
 
-    # --- Products ---
+    # --- Products (CPE ranges) ---
     products_str, products_count = _format_cpes(attrs.get("cpes"))
 
     # --- CWE ---
     cwe = attrs.get("cwe") if isinstance(attrs.get("cwe"), dict) else {}
 
-    # --- Counters ---
+    # --- Counters (IoCs, etc.) ---
     counters = attrs.get("counters") if isinstance(attrs.get("counters"), dict) else {}
 
-    # --- Description (truncate very long text for CSV usability; full in extra) ---
+    # --- Narrative fields ---
     description = na(attrs.get("description"))
     executive = na(attrs.get("executive_summary"))
     analysis = na(attrs.get("analysis"))
@@ -1081,7 +1149,7 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         vt_url=f"https://www.virustotal.com/gui/collection/{cve_api_id(cve)}",
     )
 
-    # Compact extra payload for advanced use (risk factors raw, tags, etc.)
+    # Compact raw fragments for advanced consumers (capped to keep CSV rows sane)
     extra = {
         "collection_id": data.get("id"),
         "collection_type": attrs.get("collection_type"),
@@ -1102,6 +1170,7 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
 
 
 def error_record(cve: str, status: str, message: str) -> CVERecord:
+    """Build a non-success CVERecord that still carries a deep-link to VirusTotal."""
     return CVERecord(
         cve=cve,
         status=status,
@@ -1112,17 +1181,19 @@ def error_record(cve: str, status: str, message: str) -> CVERecord:
 
 # ---------------------------------------------------------------------------
 # Output: CSV
+# Flat columns for Excel / SIEM / ticketing export.
 # ---------------------------------------------------------------------------
 
 
 def write_csv(records: Iterable[CVERecord], path: Path) -> None:
+    """Write enriched records using the stable CSV_COLUMNS order."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         for rec in records:
             row = asdict(rec)
-            # CSV-safe: collapse newlines in long text fields
+            # Collapse newlines so multi-line descriptions do not break CSV rows
             for key in ("description", "executive_summary", "analysis", "affected_products", "workarounds"):
                 if key in row and isinstance(row[key], str):
                     row[key] = row[key].replace("\r", " ").replace("\n", " ").strip()
@@ -1132,6 +1203,7 @@ def write_csv(records: Iterable[CVERecord], path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # Output: Rich terminal cards
+# Color-coded panels for interactive console review (optional via --no-rich).
 # ---------------------------------------------------------------------------
 
 
@@ -1169,7 +1241,12 @@ def _bool_badge(value: str, true_style: str = "bold red", false_style: str = "di
 
 
 def render_rich_card(rec: CVERecord) -> Panel:
-    """Build a color-coded Rich panel for one CVE."""
+    """
+    Build a color-coded Rich panel for one CVE.
+
+    Error statuses get a simple red panel; successes show scores, exploitation,
+    KEV, and a truncated summary suitable for terminal width.
+    """
     if rec.status != "ok":
         title = Text.assemble(
             (rec.cve, "bold"),
@@ -1183,6 +1260,7 @@ def render_rich_card(rec: CVERecord) -> Panel:
     risk = rec.risk_rating or "N/A"
     border = _priority_color(pri)
 
+    # Priority / risk header strip
     header = Table.grid(padding=(0, 2))
     header.add_column(style="bold")
     header.add_column()
@@ -1271,9 +1349,10 @@ def render_rich_card(rec: CVERecord) -> Panel:
 
 
 def print_rich_report(records: list[CVERecord]) -> None:
+    """Print a summary strip plus one Rich panel per CVE to the terminal."""
     console.print()
     console.rule("[bold]GTI CVE Enrichment Report[/bold]")
-    # Summary strip
+    # Aggregate priority / status counts for a one-line overview
     counts: dict[str, int] = {}
     for r in records:
         key = r.priority_rating if r.status == "ok" else r.status
@@ -1288,10 +1367,13 @@ def print_rich_report(records: list[CVERecord]) -> None:
 
 # ---------------------------------------------------------------------------
 # Output: HTML report
+# Self-contained (inline CSS) so it opens offline in any browser.
+# Invoked for success AND failure — operators always get a visual result.
 # ---------------------------------------------------------------------------
 
 
 def _html_risk_class(risk_or_priority: str) -> str:
+    """Map risk/priority labels to CSS badge class names."""
     v = (risk_or_priority or "").strip().upper()
     if v in {"CRITICAL", "P0"}:
         return "critical"
@@ -1305,10 +1387,12 @@ def _html_risk_class(risk_or_priority: str) -> str:
 
 
 def _html_escape(value: str) -> str:
+    """Escape text for safe embedding in HTML attributes and body content."""
     return html.escape(value or "", quote=True)
 
 
 def _html_bool(value: str) -> str:
+    """Render a boolean-ish string as a colored YES/no badge."""
     v = str(value).strip().lower()
     if v in {"true", "yes", "1"}:
         return '<span class="badge badge-danger">YES</span>'
@@ -1339,7 +1423,7 @@ def render_html_report(
         if r.status == "ok":
             pri_counts[r.priority_rating] = pri_counts.get(r.priority_rating, 0) + 1
 
-    # Run-level failure banner (missing key, SSL, network, uncaught exception, etc.)
+    # Run-level banner: config/SSL/network exceptions or "everything failed"
     fatal_section = ""
     if fatal_error:
         fatal_section = f"""
@@ -1383,6 +1467,7 @@ def render_html_report(
     </section>
 """
 
+    # Build one card per CVE (error cards for non-ok statuses)
     cards: list[str] = []
     for rec in records:
         if rec.status != "ok":
@@ -1409,7 +1494,7 @@ def render_html_report(
         products_html = ""
         if rec.affected_products != "N/A":
             items = [p.strip() for p in rec.affected_products.split("|") if p.strip()]
-            # Cap displayed products for readability
+            # Cap list length so huge CPE sets stay readable in the browser
             shown = items[:40]
             lis = "".join(f"<li>{_html_escape(i)}</li>" for i in shown)
             more = f"<li class='muted'>+{len(items) - 40} more…</li>" if len(items) > 40 else ""
@@ -1509,11 +1594,13 @@ def render_html_report(
 """
         )
 
+    # Priority distribution chips shown in the page header
     pri_chips = "".join(
         f'<span class="chip badge-{_html_risk_class(k)}">{_html_escape(k)}: {v}</span>'
         for k, v in sorted(pri_counts.items())
     )
 
+    # Full document is assembled as one string so the report has zero external deps.
     doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1763,6 +1850,8 @@ def open_report_in_browser(path: Path) -> None:
 
     Uses ``webbrowser`` first; on Windows falls back to ``os.startfile`` /
     ``cmd /c start`` if needed so the report still surfaces after a failed run.
+    Opening on failure is intentional: SSL/proxy/key errors are easier to
+    review (and share) as a formatted page than as console text alone.
     """
     resolved = path.resolve()
     if not resolved.is_file():
@@ -1773,14 +1862,14 @@ def open_report_in_browser(path: Path) -> None:
     logging.info("Opening HTML report in browser: %s", resolved)
 
     try:
-        # new=1 → try new window; autoraise brings it forward
+        # new=1 asks for a new window; autoraise brings the browser forward
         opened = webbrowser.open(uri, new=1, autoraise=True)
         if opened:
             return
     except Exception as exc:  # noqa: BLE001 — best-effort UI helper
         logging.debug("webbrowser.open failed: %s", exc)
 
-    # Windows-reliable fallbacks (force default handler / new process)
+    # Windows-reliable fallbacks when webbrowser is misconfigured or restricted
     if sys.platform == "win32":
         try:
             os.startfile(str(resolved))  # type: ignore[attr-defined]
@@ -1788,7 +1877,7 @@ def open_report_in_browser(path: Path) -> None:
         except Exception as exc:  # noqa: BLE001
             logging.debug("os.startfile failed: %s", exc)
         try:
-            # empty title arg after "start" is required when the path is quoted
+            # Empty title argument after "start" is required when the path is quoted
             subprocess.run(
                 ["cmd", "/c", "start", "", str(resolved)],
                 check=False,
@@ -1806,6 +1895,7 @@ def open_report_in_browser(path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # Orchestration
+# Wire config → client → enrich loop → CSV / Rich / always-on HTML.
 # ---------------------------------------------------------------------------
 
 
@@ -1817,7 +1907,8 @@ def build_proxies(
     Build a requests proxies dict from CLI flags and environment / ``.env``.
 
     Resolution order per scheme: CLI → VT_* alias → HTTP(S)_PROXY → lowercase.
-    Values typically come from the project ``.env`` (loaded at startup).
+    Values typically come from the project ``.env`` (loaded at startup) so
+    operators do not re-export proxies in every PowerShell session.
     """
     http_p = (
         http_proxy
@@ -1836,7 +1927,8 @@ def build_proxies(
         proxies["http"] = http_p.strip()
     if https_p:
         proxies["https"] = https_p.strip()
-    # If only one scheme is set, mirror it (common for corporate HTTP proxies)
+    # Corporate proxies are almost always one HTTP endpoint for both schemes;
+    # mirror a single configured value so HTTPS traffic is not sent direct.
     if "http" in proxies and "https" not in proxies:
         proxies["https"] = proxies["http"]
     elif "https" in proxies and "http" not in proxies:
@@ -1847,7 +1939,7 @@ def build_proxies(
 def _format_fatal_error(exc: BaseException) -> str:
     """Human-readable exception + short traceback for the HTML error panel."""
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    # Cap size so the HTML stays readable
+    # Cap size so the HTML stays readable in constrained browser windows
     if len(tb) > 8000:
         tb = tb[:8000] + "\n… [traceback truncated]"
     return f"{type(exc).__name__}: {exc}\n\n{tb}"
@@ -1859,6 +1951,12 @@ def enrich_cves(
     *,
     stop_on_forbidden: bool = True,
 ) -> list[CVERecord]:
+    """
+    Query each CVE and collect success or structured error records.
+
+    On 401/403, optionally stop early and mark remaining CVEs as skipped so
+    we do not burn rate budget against a key without VI privileges.
+    """
     records: list[CVERecord] = []
     total = len(cves)
 
@@ -1910,7 +2008,7 @@ def enrich_cves(
                         "Stopping early: API key lacks Vulnerability Intelligence privilege. "
                         "Remaining CVEs will not be queried."
                     )
-                    # Mark remaining as skipped
+                    # Mark remaining as skipped so the report is complete
                     for rest in cves[idx:]:
                         records.append(
                             error_record(
@@ -1943,6 +2041,7 @@ def enrich_cves(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Define CLI flags; defaults favor .env for secrets and network settings."""
     p = argparse.ArgumentParser(
         prog="cve_enricher.py",
         description=(
@@ -2036,10 +2135,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     and opened (unless ``--no-open``), even when the run fails with a missing
     key, SSL error, bad input, or unexpected exception.
     """
-    # Parse argv first so --env-file / -v are available before heavy work
+    # Parse CLI first so --env-file / -v apply before any other work.
     args = build_arg_parser().parse_args(argv)
     setup_logging(verbose=args.verbose)
 
+    # Load .env early: populates os.environ for key, proxy, and CA resolution.
     env_path = load_project_dotenv(Path(args.env_file) if args.env_file else None)
     if env_path:
         logging.info("Loaded configuration from %s", env_path)
@@ -2049,6 +2149,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             DEFAULT_ENV_FILE,
         )
 
+    # Shared state for the always-on report path (success or failure).
     html_path = Path(args.html)
     records: list[CVERecord] = []
     fatal_error: Optional[str] = None
@@ -2056,6 +2157,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_path = Path(args.output)
 
     try:
+        # --- Resolve secrets and inputs ---
         api_key = resolve_api_key(args.api_key)
         if not api_key:
             raise RuntimeError(
@@ -2074,9 +2176,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         logging.info("Loaded %d unique CVE(s) from %s", len(cves), input_path)
 
+        # --- Network: proxy + TLS trust ---
         proxies = build_proxies(args.http_proxy, args.https_proxy)
         if proxies:
-            # Avoid logging credentials if present in the proxy URL
+            # Redact user:password@ in logs if operators put creds in the proxy URL
             safe_proxies = {
                 k: re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", v)
                 for k, v in proxies.items()
@@ -2103,7 +2206,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
 
-        # Optional raw dump wrapper
+        # Optional: wrap the GET to persist raw JSON for offline debugging
         dump_dir = Path(args.dump_raw) if args.dump_raw else None
         if dump_dir:
             dump_dir.mkdir(parents=True, exist_ok=True)
@@ -2121,6 +2224,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             client.get_vulnerability = get_with_dump  # type: ignore[method-assign]
 
+        # --- Enrich + export ---
         records = enrich_cves(
             client,
             cves,
@@ -2132,6 +2236,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not args.no_rich:
             print_rich_report(records)
         else:
+            # Compact one-line summary when Rich panels are disabled
             for rec in records:
                 logging.info(
                     "%s | status=%s | priority=%s | risk=%s | epss=%s | kev=%s",
@@ -2152,6 +2257,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             output_path,
         )
 
+        # Exit semantics: 3 = privilege total failure; 1 = no successes; 0 = ok
         if any(r.status == "forbidden" for r in records) and ok == 0:
             exit_code = 3
         elif ok == 0:
@@ -2160,6 +2266,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             exit_code = 0
 
     except Exception as exc:  # noqa: BLE001 — capture for HTML failure report
+        # Do not re-raise: we still write/open the HTML report below.
         fatal_error = _format_fatal_error(exc)
         logging.error("%s", exc)
         if args.verbose:
@@ -2182,7 +2289,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             exit_code = 1
 
     # ------------------------------------------------------------------
-    # Always write + open HTML report (success, partial, or total failure)
+    # Always write + open HTML report (success, partial, or total failure).
+    # This block intentionally sits outside the main try so config/SSL/key
+    # failures still produce a browsable error page for the operator.
     # ------------------------------------------------------------------
     try:
         title = "GTI CVE Enrichment Report"
@@ -2206,4 +2315,5 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    # Standard CLI entry: propagate process exit code to the shell.
     sys.exit(main())
