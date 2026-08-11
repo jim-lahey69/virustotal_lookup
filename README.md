@@ -12,26 +12,54 @@ GET https://www.virustotal.com/api/v3/collections/vulnerability--{cve-lowercase}
 
 ## Quick start
 
+> **First-time install?** Follow **[SETUP.md](SETUP.md)** for API key, proxy, and corporate CA certificate setup.  
+> **Corporate Windows tip:** secrets and proxy live in `.env` — you do **not** need to set `$env:HTTP_PROXY` in every PowerShell window.
+
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Set API key (never hard-code secrets)
-# Windows PowerShell
-$env:VT_API_KEY = "your-api-key-here"
+# 2. Create local config (never commit .env)
+copy .env.example .env
+# Edit .env: set VIRUSTOTAL_API_KEY, proxies, and CORPORATE_CA_BUNDLE
 
-# Linux / macOS
-export VT_API_KEY="your-api-key-here"
+# 3. Place corporate root CA for SSL inspection (see SETUP.md / certs/README.md)
+#    → certs/corporate-ca.pem
 
-# Optional corporate proxy
-$env:HTTP_PROXY  = "http://proxy.example.com:"
-$env:HTTPS_PROXY = "http://proxy.example.com:"
-# If needed (not recommended):
-$env:VT_VERIFY_SSL = "false"
-
-# 3. Run
+# 4. Run (HTML report is always written and opened)
 python cve_enricher.py --input cve_list.csv --output cve_enriched.csv --html report.html
 ```
+
+### Configuration: `.env` is the single source of truth
+
+| Variable | Purpose |
+|----------|---------|
+| `VIRUSTOTAL_API_KEY` | GTI / VirusTotal API key (**required**) |
+| `HTTP_PROXY` / `HTTPS_PROXY` | Corporate proxy, e.g. `http://webproxy:8080` |
+| `CORPORATE_CA_BUNDLE` | Path to org root CA PEM for SSL inspection |
+
+The script loads `.env` with **python-dotenv** at startup and applies proxy + key + CA settings automatically. Keep `.env` **out of source control** (listed in `.gitignore`).
+
+CLI flags (`--api-key`, `--http-proxy`, `--ca-bundle`, …) still override when needed. Aliases `VT_API_KEY`, `VT_HTTP_PROXY`, and `VT_HTTPS_PROXY` are also accepted.
+
+### Corporate SSL inspection (no `verify=False`)
+
+TLS verification is **always enabled**. Behind a corporate MITM proxy:
+
+1. Export your org root CA (PEM/Base-64 CER) — steps in [SETUP.md](SETUP.md) and [certs/README.md](certs/README.md).
+2. Save it as `certs/corporate-ca.pem` **or** set `CORPORATE_CA_BUNDLE` in `.env`.
+3. `requests` uses that path via `session.verify = "<path>"`.
+
+Disabling verification is **not supported** and will raise an error if attempted.
+
+### HTML report always opens
+
+After every run — success, partial success, or complete failure (missing key, SSL error, network issues, etc.) — the tool:
+
+1. Writes a self-contained HTML report (default `report.html`)
+2. Opens it in the default browser (new window/tab when possible)
+
+Failure reports include a **prominent error banner** with the exception message and traceback summary. Use `--no-open` only if you must suppress the browser (CI); the file is still written.
 
 ### CLI options
 
@@ -39,11 +67,13 @@ python cve_enricher.py --input cve_list.csv --output cve_enriched.csv --html rep
 |------|-------------|
 | `-i / --input` | Input CSV (default `cve_list.csv`) |
 | `-o / --output` | Enriched CSV (default `cve_enriched.csv`) |
-| `--html PATH` | Self-contained HTML card report |
+| `--html PATH` | HTML report path (default `report.html`; always written) |
+| `--no-open` | Do not open the HTML report in a browser |
 | `--no-rich` | Skip Rich terminal cards |
-| `--api-key` | API key (prefer `VT_API_KEY` env) |
+| `--api-key` | API key (prefer `VIRUSTOTAL_API_KEY` in `.env`) |
 | `--http-proxy` / `--https-proxy` | Corporate proxy URLs |
-| `--verify-ssl true\|false` | TLS verification |
+| `--ca-bundle PATH` | Corporate root CA PEM/CRT |
+| `--env-file PATH` | Alternate `.env` path |
 | `--delay SECONDS` | Inter-request delay (default `1.0`) |
 | `--max-retries N` | Retries on 429 / 5xx / network errors |
 | `--continue-on-forbidden` | Do not stop after 401/403 |
@@ -102,7 +132,7 @@ Color-coded panels per CVE:
 
 ### 3. HTML report (`--html report.html`)
 
-Self-contained dark-theme card layout with the same hierarchy — open in any browser, no server required.
+Self-contained dark-theme card layout — always generated and opened after the run, including failure cases with a full error section.
 
 ---
 
@@ -159,8 +189,10 @@ Both the **derived** `priority_rating` and the **raw** API `priority` are writte
 - Default **1s** delay between requests (`--delay` / `VT_REQUEST_DELAY`).
 - HTTP **429**: exponential backoff with jitter; honors `Retry-After` when present.
 - **5xx** and network errors are retried (`--max-retries`).
-- Proxies via `HTTP_PROXY` / `HTTPS_PROXY` or `--http-proxy` / `--https-proxy`.
-- Optional SSL disable: `VT_VERIFY_SSL=false` or `--verify-ssl false`.
+- Proxies via `.env` (`HTTP_PROXY` / `HTTPS_PROXY`) or `--http-proxy` / `--https-proxy`.
+- TLS: always verified; use `CORPORATE_CA_BUNDLE` for corporate SSL inspection.
+
+Step-by-step key, proxy, and CA setup: **[SETUP.md](SETUP.md)**.
 
 ---
 
@@ -169,8 +201,8 @@ Both the **derived** `priority_rating` and the **raw** API `priority` are writte
 | Code | Meaning |
 |------|---------|
 | 0 | At least one CVE enriched successfully |
-| 1 | All CVEs failed / not found |
-| 2 | Usage / input / missing API key |
+| 1 | All CVEs failed / not found / runtime error |
+| 2 | Usage / input / missing API key / missing CA path |
 | 3 | Privilege error (401/403) and zero successes |
 
 ---
@@ -181,5 +213,9 @@ Both the **derived** `priority_rating` and the **raw** API `priority` are writte
 |------|---------|
 | `cve_enricher.py` | Main tool |
 | `cve_list.csv` | Example input |
-| `requirements.txt` | `requests`, `rich`, `urllib3` |
+| `.env.example` | Template for secrets / proxy / CA path |
+| `.env` | Local config (**gitignored** — do not commit) |
+| `certs/` | Place `corporate-ca.pem` here |
+| `requirements.txt` | `requests`, `rich`, `python-dotenv`, `urllib3` |
+| `SETUP.md` | First-time API key, proxy, and CA setup |
 | `README.md` | This document |

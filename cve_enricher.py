@@ -11,26 +11,38 @@ Vulnerability Intelligence collections endpoint:
 Requires a VirusTotal / GTI **Enterprise** or **Enterprise Plus** API key
 with Vulnerability Intelligence privileges.
 
+Configuration (preferred: project ``.env`` file — see ``.env.example``)
+-----------------------------------------------------------------------
+Copy ``.env.example`` to ``.env`` and fill in values. The script loads
+``.env`` via python-dotenv at startup so you do **not** need to set
+``$env:HTTP_PROXY`` / API key in every PowerShell session.
+
+    VIRUSTOTAL_API_KEY   VirusTotal / GTI API key (required)
+    VT_API_KEY           Alias for VIRUSTOTAL_API_KEY
+    HTTP_PROXY           HTTP proxy URL (e.g. http://webproxy:8080)
+    HTTPS_PROXY          HTTPS proxy URL (usually same as HTTP_PROXY)
+    VT_HTTP_PROXY        Alias for HTTP_PROXY
+    VT_HTTPS_PROXY       Alias for HTTPS_PROXY
+    CORPORATE_CA_BUNDLE  Path to corporate root CA PEM/CRT for SSL inspection
+    VT_REQUEST_DELAY     Inter-request delay in seconds (default: 1.0)
+
 Usage
 -----
-    export VT_API_KEY="your-api-key"
-    # Optional corporate proxy:
-    export HTTP_PROXY="http://proxy.example.com:8080"
-    export HTTPS_PROXY="http://proxy.example.com:8080"
-    # Optional: disable TLS verification (not recommended)
-    export VT_VERIFY_SSL="false"
-
+    # After creating .env with key, proxy, and optional CA path:
     python cve_enricher.py --input cve_list.csv --output cve_enriched.csv --html report.html
 
-Environment / config
---------------------
-    VT_API_KEY          VirusTotal / GTI API key (required)
-    HTTP_PROXY          HTTP proxy URL
-    HTTPS_PROXY         HTTPS proxy URL
-    VT_HTTP_PROXY       Alias for HTTP_PROXY (script-specific)
-    VT_HTTPS_PROXY      Alias for HTTPS_PROXY (script-specific)
-    VT_VERIFY_SSL       "true" (default) or "false"
-    VT_REQUEST_DELAY    Default inter-request delay in seconds (default: 1.0)
+Corporate SSL inspection
+------------------------
+Do **not** disable TLS verification. Place your org root CA at
+``./certs/corporate-ca.pem`` (or set ``CORPORATE_CA_BUNDLE``) so
+``requests`` can verify the MITM proxy chain. See SETUP.md / README.
+
+HTML report
+-----------
+An HTML report is always written (default ``report.html``) and opened in
+the default browser — including when enrichment fails (missing key, SSL
+errors, network issues). The failure report includes a prominent error
+section with the exception message.
 """
 
 from __future__ import annotations
@@ -43,15 +55,18 @@ import logging
 import os
 import random
 import re
+import subprocess
 import sys
 import time
+import traceback
+import webbrowser
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
 
 import requests
-import urllib3
+from dotenv import load_dotenv
 from rich import box
 from rich.console import Console, Group
 from rich.logging import RichHandler
@@ -61,13 +76,18 @@ from rich.table import Table
 from rich.text import Text
 
 # ---------------------------------------------------------------------------
-# Configuration (override via env vars or CLI; never hard-code secrets)
+# Configuration (override via .env / env vars / CLI; never hard-code secrets)
 # ---------------------------------------------------------------------------
+
+# Project root = directory containing this script (stable regardless of cwd)
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
+DEFAULT_CA_BUNDLE = PROJECT_ROOT / "certs" / "corporate-ca.pem"
 
 DEFAULT_API_BASE = "https://www.virustotal.com/api/v3"
 DEFAULT_INPUT = "cve_list.csv"
 DEFAULT_OUTPUT = "cve_enriched.csv"
-DEFAULT_DELAY = float(os.getenv("VT_REQUEST_DELAY", "1.0"))
+DEFAULT_HTML = "report.html"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BACKOFF_BASE = 2.0  # seconds; exponential: base^attempt + jitter
 
@@ -77,8 +97,157 @@ CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 # Exploit availability values observed in GTI docs / UI.
 NO_KNOWN_ALIASES = {"", "n/a", "none", "no known", "no_known", "unknown"}
 
+# Fallback delay; actual value is resolved after .env load (see resolve_request_delay).
+DEFAULT_DELAY = 1.0
+
 console = Console(stderr=False)
 log_console = Console(stderr=True)
+
+
+# ---------------------------------------------------------------------------
+# Environment / config loading
+# ---------------------------------------------------------------------------
+
+
+def load_project_dotenv(env_file: Optional[Path] = None) -> Optional[Path]:
+    """
+    Load secrets and proxy settings from a project ``.env`` file.
+
+    Looks for ``.env`` next to this script first, then the current working
+    directory. Existing process environment variables are **not** overridden
+    (``override=False``), so CI/session exports still win when intentionally set.
+
+    Returns the path that was loaded, or None if no ``.env`` was found.
+    """
+    candidates: list[Path] = []
+    if env_file is not None:
+        candidates.append(Path(env_file))
+    candidates.append(DEFAULT_ENV_FILE)
+    cwd_env = Path.cwd() / ".env"
+    if cwd_env.resolve() != DEFAULT_ENV_FILE.resolve():
+        candidates.append(cwd_env)
+
+    for path in candidates:
+        if path.is_file():
+            load_dotenv(dotenv_path=path, override=False)
+            return path.resolve()
+
+    # Still call load_dotenv so python-dotenv can find a parent .env if any
+    load_dotenv(override=False)
+    return None
+
+
+def resolve_request_delay(cli_value: Optional[float] = None) -> float:
+    """Resolve inter-request delay: CLI > VT_REQUEST_DELAY > default."""
+    if cli_value is not None:
+        return float(cli_value)
+    env_val = os.getenv("VT_REQUEST_DELAY")
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            logging.warning("Invalid VT_REQUEST_DELAY=%r; using %s", env_val, DEFAULT_DELAY)
+    return DEFAULT_DELAY
+
+
+_PLACEHOLDER_API_KEYS = frozenset(
+    {
+        "insert_key_here",
+        "your-api-key",
+        "your_key_here",
+        "your-api-key-here",
+        "changeme",
+        "api_key",
+        "apikey",
+    }
+)
+
+
+def resolve_api_key(cli_value: Optional[str] = None) -> Optional[str]:
+    """
+    Resolve API key: CLI > VIRUSTOTAL_API_KEY > VT_API_KEY.
+
+    ``VIRUSTOTAL_API_KEY`` is the preferred name in ``.env``.
+    Returns None when unset or still a documented placeholder value.
+    """
+    key = (
+        (cli_value or "").strip()
+        or (os.getenv("VIRUSTOTAL_API_KEY") or "").strip()
+        or (os.getenv("VT_API_KEY") or "").strip()
+    )
+    if not key:
+        return None
+    if key.lower() in _PLACEHOLDER_API_KEYS:
+        return None
+    return key
+
+
+def resolve_ssl_verify(
+    ca_bundle: Optional[str] = None,
+) -> Union[bool, str]:
+    """
+    Resolve TLS verification for ``requests``.
+
+    Always verifies certificates — never returns ``False``.
+
+    Resolution order:
+      1. Explicit CLI / argument path (``ca_bundle``)
+      2. ``CORPORATE_CA_BUNDLE`` from environment / ``.env``
+      3. ``REQUESTS_CA_BUNDLE`` / ``SSL_CERT_FILE`` (standard Python/requests)
+      4. Default path ``./certs/corporate-ca.pem`` if the file exists
+      5. ``True`` — use certifi / system trust store
+
+    Returns
+    -------
+    str
+        Absolute path to a CA bundle PEM/CRT file.
+    bool
+        Always ``True`` when no custom bundle is configured.
+    """
+    candidates: list[str] = []
+    if ca_bundle and str(ca_bundle).strip():
+        candidates.append(str(ca_bundle).strip())
+    env_ca = (os.getenv("CORPORATE_CA_BUNDLE") or "").strip()
+    if env_ca:
+        candidates.append(env_ca)
+    for env_name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        val = (os.getenv(env_name) or "").strip()
+        if val:
+            candidates.append(val)
+
+    for raw in candidates:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            # Resolve relative to project root first, then cwd
+            project_relative = (PROJECT_ROOT / path).resolve()
+            cwd_relative = (Path.cwd() / path).resolve()
+            if project_relative.is_file():
+                path = project_relative
+            elif cwd_relative.is_file():
+                path = cwd_relative
+            else:
+                path = project_relative
+        else:
+            path = path.resolve()
+        if path.is_file():
+            return str(path)
+        raise FileNotFoundError(
+            f"CA bundle not found: {raw!r} (resolved to {path}). "
+            "Export your corporate root CA to PEM/CRT and set CORPORATE_CA_BUNDLE, "
+            f"or place it at {DEFAULT_CA_BUNDLE}. See SETUP.md."
+        )
+
+    # Optional default location — use only if the operator placed a file there
+    if DEFAULT_CA_BUNDLE.is_file():
+        return str(DEFAULT_CA_BUNDLE.resolve())
+
+    return True
+
+
+def describe_ssl_verify(verify: Union[bool, str]) -> str:
+    if isinstance(verify, str):
+        return f"custom CA bundle → {verify}"
+    return "default trust store (certifi / system)"
 
 
 # ---------------------------------------------------------------------------
@@ -505,15 +674,27 @@ class GTIClient:
         *,
         base_url: str = DEFAULT_API_BASE,
         proxies: Optional[dict[str, str]] = None,
-        verify_ssl: bool = True,
+        verify: Union[bool, str] = True,
         timeout: float = 60.0,
         max_retries: int = DEFAULT_MAX_RETRIES,
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         delay: float = DEFAULT_DELAY,
     ) -> None:
-        if not api_key or api_key in {"INSERT_KEY_HERE", "your-api-key", "changeme"}:
+        if not api_key or api_key in {
+            "INSERT_KEY_HERE",
+            "your-api-key",
+            "your_key_here",
+            "changeme",
+        }:
             raise ValueError(
-                "API key missing. Set VT_API_KEY environment variable or pass --api-key."
+                "API key missing or still a placeholder. "
+                "Set VIRUSTOTAL_API_KEY in .env (or VT_API_KEY) or pass --api-key."
+            )
+        if verify is False:
+            # Hard guard: never allow insecure TLS (corporate MITM must use a CA bundle).
+            raise ValueError(
+                "TLS verification cannot be disabled. Place the corporate root CA at "
+                f"{DEFAULT_CA_BUNDLE} or set CORPORATE_CA_BUNDLE in .env. See SETUP.md."
             )
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -530,12 +711,12 @@ class GTIClient:
                 "User-Agent": "gti-cve-enricher/1.0",
             }
         )
+        # Proxies: prefer explicit session config from .env / CLI over ambient env alone
         if proxies:
             self.session.proxies.update(proxies)
-        self.session.verify = verify_ssl
-        if not verify_ssl:
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            logging.warning("TLS certificate verification is DISABLED (verify=False).")
+        # verify=True (system/certifi) or path to corporate CA PEM for SSL inspection
+        self.session.verify = verify
+        logging.info("TLS verification: %s", describe_ssl_verify(verify))
 
     def _throttle(self) -> None:
         if self.delay <= 0:
@@ -1136,14 +1317,71 @@ def _html_bool(value: str) -> str:
     return f'<span class="badge badge-muted">{_html_escape(str(value))}</span>'
 
 
-def render_html_report(records: list[CVERecord], path: Path, title: str = "GTI CVE Enrichment Report") -> None:
-    """Write a self-contained HTML report with card layout and risk badges."""
+def render_html_report(
+    records: list[CVERecord],
+    path: Path,
+    title: str = "GTI CVE Enrichment Report",
+    *,
+    fatal_error: Optional[str] = None,
+) -> None:
+    """
+    Write a self-contained HTML report with card layout and risk badges.
+
+    Always produces a professional report. When ``fatal_error`` is set (or all
+    records failed), a prominent run-level error section is included so the
+    operator can diagnose SSL, proxy, API key, or network failures in-browser.
+    """
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     ok = sum(1 for r in records if r.status == "ok")
+    failed = len(records) - ok
     pri_counts: dict[str, int] = {}
     for r in records:
         if r.status == "ok":
             pri_counts[r.priority_rating] = pri_counts.get(r.priority_rating, 0) + 1
+
+    # Run-level failure banner (missing key, SSL, network, uncaught exception, etc.)
+    fatal_section = ""
+    if fatal_error:
+        fatal_section = f"""
+    <section class="fatal-banner" role="alert">
+      <div class="fatal-title">Run failed</div>
+      <p class="fatal-lead">
+        Enrichment did not complete successfully. Details below. Partial CVE
+        results (if any) still appear further down the page.
+      </p>
+      <pre class="fatal-detail">{_html_escape(fatal_error)}</pre>
+    </section>
+"""
+    elif records and ok == 0:
+        # Aggregate per-CVE errors when nothing succeeded
+        sample_msgs = sorted(
+            {
+                (r.error_message or r.status).strip()
+                for r in records
+                if r.status != "ok" and (r.error_message or r.status)
+            }
+        )
+        summary_text = "\n".join(f"• {m}" for m in sample_msgs[:12])
+        if len(sample_msgs) > 12:
+            summary_text += f"\n• …and {len(sample_msgs) - 12} more distinct error(s)"
+        fatal_section = f"""
+    <section class="fatal-banner" role="alert">
+      <div class="fatal-title">No CVEs enriched successfully</div>
+      <p class="fatal-lead">
+        All {len(records)} CVE(s) failed or were skipped. Common causes: missing
+        GTI Enterprise privileges (401/403), corporate proxy/SSL misconfiguration,
+        or CVEs not present in GTI.
+      </p>
+      <pre class="fatal-detail">{_html_escape(summary_text or "See per-CVE cards below.")}</pre>
+    </section>
+"""
+    elif not records and not fatal_error:
+        fatal_section = """
+    <section class="fatal-banner" role="alert">
+      <div class="fatal-title">No results</div>
+      <p class="fatal-lead">No CVE records were produced for this run.</p>
+    </section>
+"""
 
     cards: list[str] = []
     for rec in records:
@@ -1446,6 +1684,41 @@ def render_html_report(records: list[CVERecord], path: Path, title: str = "GTI C
   a {{ color: var(--accent); text-decoration: none; }}
   a:hover {{ text-decoration: underline; }}
   .error-msg {{ color: #fca5a5; }}
+  .fatal-banner {{
+    background: linear-gradient(135deg, #3f0d0d 0%, #1c0a0a 60%, #121a2b 100%);
+    border: 1px solid #b91c1c;
+    border-left: 6px solid #ef4444;
+    border-radius: 16px;
+    padding: 1.25rem 1.35rem;
+    margin-bottom: 1.5rem;
+    box-shadow: 0 12px 32px rgba(185, 28, 28, 0.25);
+  }}
+  .fatal-title {{
+    font-size: 1.2rem;
+    font-weight: 800;
+    color: #fecaca;
+    margin-bottom: 0.4rem;
+    letter-spacing: -0.01em;
+  }}
+  .fatal-lead {{
+    color: #fca5a5;
+    margin: 0 0 0.85rem;
+    font-size: 0.95rem;
+  }}
+  .fatal-detail {{
+    margin: 0;
+    padding: 0.9rem 1rem;
+    background: #0b0f18;
+    border: 1px solid #7f1d1d;
+    border-radius: 10px;
+    color: #fee2e2;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 28rem;
+    overflow: auto;
+  }}
   footer.page {{
     margin-top: 2rem;
     color: var(--muted);
@@ -1461,15 +1734,19 @@ def render_html_report(records: list[CVERecord], path: Path, title: str = "GTI C
       <h1>{_html_escape(title)}</h1>
       <div class="meta">
         Generated {generated} · {len(records)} CVE(s) · {ok} enriched successfully
+        · {failed} failed/skipped
+        {" · <strong style='color:#fca5a5'>RUN ERROR</strong>" if fatal_error else ""}
       </div>
       <div class="chips">{pri_chips or '<span class="chip">No successful enrichments</span>'}</div>
     </header>
-    {"".join(cards)}
+    {fatal_section}
+    {"".join(cards) if cards else '<p class="muted">No per-CVE cards to display.</p>'}
     <footer class="page">
       Data source: Google Threat Intelligence / VirusTotal Vulnerability collections API
       (<code>/api/v3/collections/vulnerability--&lt;cve&gt;</code>).
       Priority (P0–P4) is derived from Risk Rating + Exploitation State + Exploit Availability
       per GTI vulnerability report guidance. Requires GTI Enterprise / Enterprise Plus.
+      This report is always generated and opened after each run, including failures.
     </footer>
   </div>
 </body>
@@ -1478,6 +1755,53 @@ def render_html_report(records: list[CVERecord], path: Path, title: str = "GTI C
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(doc, encoding="utf-8")
     logging.info("Wrote HTML report: %s", path)
+
+
+def open_report_in_browser(path: Path) -> None:
+    """
+    Open the HTML report in the default browser (prefer a new window/tab).
+
+    Uses ``webbrowser`` first; on Windows falls back to ``os.startfile`` /
+    ``cmd /c start`` if needed so the report still surfaces after a failed run.
+    """
+    resolved = path.resolve()
+    if not resolved.is_file():
+        logging.warning("Cannot open report — file missing: %s", resolved)
+        return
+
+    uri = resolved.as_uri()
+    logging.info("Opening HTML report in browser: %s", resolved)
+
+    try:
+        # new=1 → try new window; autoraise brings it forward
+        opened = webbrowser.open(uri, new=1, autoraise=True)
+        if opened:
+            return
+    except Exception as exc:  # noqa: BLE001 — best-effort UI helper
+        logging.debug("webbrowser.open failed: %s", exc)
+
+    # Windows-reliable fallbacks (force default handler / new process)
+    if sys.platform == "win32":
+        try:
+            os.startfile(str(resolved))  # type: ignore[attr-defined]
+            return
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("os.startfile failed: %s", exc)
+        try:
+            # empty title arg after "start" is required when the path is quoted
+            subprocess.run(
+                ["cmd", "/c", "start", "", str(resolved)],
+                check=False,
+                shell=False,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to open report via cmd start: %s", exc)
+            return
+
+    logging.warning(
+        "Could not open the report automatically. Open manually: %s", resolved
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1489,21 +1813,44 @@ def build_proxies(
     http_proxy: Optional[str],
     https_proxy: Optional[str],
 ) -> Optional[dict[str, str]]:
-    http_p = http_proxy or os.getenv("VT_HTTP_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-    https_p = https_proxy or os.getenv("VT_HTTPS_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
+    """
+    Build a requests proxies dict from CLI flags and environment / ``.env``.
+
+    Resolution order per scheme: CLI → VT_* alias → HTTP(S)_PROXY → lowercase.
+    Values typically come from the project ``.env`` (loaded at startup).
+    """
+    http_p = (
+        http_proxy
+        or os.getenv("VT_HTTP_PROXY")
+        or os.getenv("HTTP_PROXY")
+        or os.getenv("http_proxy")
+    )
+    https_p = (
+        https_proxy
+        or os.getenv("VT_HTTPS_PROXY")
+        or os.getenv("HTTPS_PROXY")
+        or os.getenv("https_proxy")
+    )
     proxies: dict[str, str] = {}
     if http_p:
-        proxies["http"] = http_p
+        proxies["http"] = http_p.strip()
     if https_p:
-        proxies["https"] = https_p
+        proxies["https"] = https_p.strip()
+    # If only one scheme is set, mirror it (common for corporate HTTP proxies)
+    if "http" in proxies and "https" not in proxies:
+        proxies["https"] = proxies["http"]
+    elif "https" in proxies and "http" not in proxies:
+        proxies["http"] = proxies["https"]
     return proxies or None
 
 
-def parse_verify_ssl(cli_value: Optional[str]) -> bool:
-    if cli_value is not None:
-        return cli_value.lower() in {"1", "true", "yes", "on"}
-    env = os.getenv("VT_VERIFY_SSL", "true").lower()
-    return env in {"1", "true", "yes", "on"}
+def _format_fatal_error(exc: BaseException) -> str:
+    """Human-readable exception + short traceback for the HTML error panel."""
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    # Cap size so the HTML stays readable
+    if len(tb) > 8000:
+        tb = tb[:8000] + "\n… [traceback truncated]"
+    return f"{type(exc).__name__}: {exc}\n\n{tb}"
 
 
 def enrich_cves(
@@ -1600,13 +1947,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="cve_enricher.py",
         description=(
             "Enrich CVE IDs via Google Threat Intelligence / VirusTotal "
-            "vulnerability collections (Enterprise required)."
+            "vulnerability collections (Enterprise required). "
+            "Config: project .env (API key, proxies, CORPORATE_CA_BUNDLE). "
+            "HTML report is always written and opened, including on failure."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-i", "--input", default=DEFAULT_INPUT, help="Input CSV of CVE IDs")
     p.add_argument("-o", "--output", default=DEFAULT_OUTPUT, help="Output enriched CSV path")
-    p.add_argument("--html", default=None, metavar="PATH", help="Write self-contained HTML report")
+    p.add_argument(
+        "--html",
+        default=DEFAULT_HTML,
+        metavar="PATH",
+        help="Self-contained HTML report path (always written and opened)",
+    )
+    p.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not open the HTML report in a browser (report is still written)",
+    )
     p.add_argument(
         "--no-rich",
         action="store_true",
@@ -1615,29 +1974,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--api-key",
         default=None,
-        help="VirusTotal/GTI API key (prefer VT_API_KEY env var)",
+        help="VirusTotal/GTI API key (prefer VIRUSTOTAL_API_KEY in .env)",
     )
     p.add_argument(
         "--http-proxy",
         default=None,
-        help="HTTP proxy URL (or set HTTP_PROXY / VT_HTTP_PROXY)",
+        help="HTTP proxy URL (or HTTP_PROXY / VT_HTTP_PROXY in .env)",
     )
     p.add_argument(
         "--https-proxy",
         default=None,
-        help="HTTPS proxy URL (or set HTTPS_PROXY / VT_HTTPS_PROXY)",
+        help="HTTPS proxy URL (or HTTPS_PROXY / VT_HTTPS_PROXY in .env)",
     )
     p.add_argument(
-        "--verify-ssl",
+        "--ca-bundle",
         default=None,
-        choices=["true", "false"],
-        help="Verify TLS certificates (default from VT_VERIFY_SSL or true)",
+        metavar="PATH",
+        help=(
+            "Corporate root CA PEM/CRT for SSL inspection "
+            f"(or CORPORATE_CA_BUNDLE; default file {DEFAULT_CA_BUNDLE.name} under certs/)"
+        ),
     )
     p.add_argument(
         "--delay",
         type=float,
-        default=DEFAULT_DELAY,
-        help="Seconds to wait between API requests",
+        default=None,
+        help=f"Seconds between API requests (default: VT_REQUEST_DELAY or {DEFAULT_DELAY})",
     )
     p.add_argument(
         "--max-retries",
@@ -1657,108 +2019,190 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional directory to save raw JSON responses per CVE",
     )
+    p.add_argument(
+        "--env-file",
+        default=None,
+        metavar="PATH",
+        help="Path to .env file (default: .env next to this script)",
+    )
     return p
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    """
+    Run enrichment end-to-end.
+
+    Guarantees: after parse + logging setup, an HTML report is always generated
+    and opened (unless ``--no-open``), even when the run fails with a missing
+    key, SSL error, bad input, or unexpected exception.
+    """
+    # Parse argv first so --env-file / -v are available before heavy work
     args = build_arg_parser().parse_args(argv)
     setup_logging(verbose=args.verbose)
 
-    api_key = args.api_key or os.getenv("VT_API_KEY") or os.getenv("VIRUSTOTAL_API_KEY")
-    if not api_key:
-        log_console.print(
-            "[bold red]Error:[/bold red] No API key. Set [cyan]VT_API_KEY[/cyan] "
-            "or pass [cyan]--api-key[/cyan]."
+    env_path = load_project_dotenv(Path(args.env_file) if args.env_file else None)
+    if env_path:
+        logging.info("Loaded configuration from %s", env_path)
+    else:
+        logging.info(
+            "No .env file found (looked for %s). Using process environment / CLI only.",
+            DEFAULT_ENV_FILE,
         )
-        return 2
 
-    input_path = Path(args.input)
+    html_path = Path(args.html)
+    records: list[CVERecord] = []
+    fatal_error: Optional[str] = None
+    exit_code = 0
     output_path = Path(args.output)
 
     try:
-        cves = load_cve_list(input_path)
-    except (OSError, ValueError) as exc:
-        logging.error("Failed to read input: %s", exc)
-        return 2
-
-    if not cves:
-        logging.error("No valid CVE IDs found in %s", input_path)
-        return 2
-
-    logging.info("Loaded %d unique CVE(s) from %s", len(cves), input_path)
-
-    proxies = build_proxies(args.http_proxy, args.https_proxy)
-    if proxies:
-        logging.info("Using proxies: %s", {k: v for k, v in proxies.items()})
-
-    verify_ssl = parse_verify_ssl(args.verify_ssl)
-
-    try:
-        client = GTIClient(
-            api_key=api_key,
-            proxies=proxies,
-            verify_ssl=verify_ssl,
-            delay=args.delay,
-            max_retries=args.max_retries,
-        )
-    except ValueError as exc:
-        logging.error("%s", exc)
-        return 2
-
-    # Optional raw dump wrapper
-    dump_dir = Path(args.dump_raw) if args.dump_raw else None
-    if dump_dir:
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        original_get = client.get_vulnerability
-
-        def get_with_dump(cve: str) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
-            body, err, status = original_get(cve)
-            if body is not None:
-                out = dump_dir / f"{cve.upper()}.json"
-                out.write_text(json.dumps(body, indent=2), encoding="utf-8")
-                logging.debug("Dumped raw JSON → %s", out)
-            return body, err, status
-
-        client.get_vulnerability = get_with_dump  # type: ignore[method-assign]
-
-    records = enrich_cves(
-        client,
-        cves,
-        stop_on_forbidden=not args.continue_on_forbidden,
-    )
-
-    write_csv(records, output_path)
-
-    if args.html:
-        render_html_report(records, Path(args.html))
-
-    if not args.no_rich:
-        print_rich_report(records)
-    else:
-        # Compact text summary
-        for rec in records:
-            logging.info(
-                "%s | status=%s | priority=%s | risk=%s | epss=%s | kev=%s",
-                rec.cve,
-                rec.status,
-                rec.priority_rating,
-                rec.risk_rating,
-                rec.epss_score,
-                rec.cisa_kev,
+        api_key = resolve_api_key(args.api_key)
+        if not api_key:
+            raise RuntimeError(
+                "No API key. Set VIRUSTOTAL_API_KEY (or VT_API_KEY) in the project "
+                ".env file, or pass --api-key. See .env.example and SETUP.md."
             )
 
-    ok = sum(1 for r in records if r.status == "ok")
-    failed = len(records) - ok
-    logging.info("Done. Enriched=%d  Failed/Skipped=%d  CSV=%s", ok, failed, output_path)
-    if args.html:
-        logging.info("HTML report: %s", args.html)
+        input_path = Path(args.input)
+        try:
+            cves = load_cve_list(input_path)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Failed to read input: {exc}") from exc
 
-    # Exit code: 0 if at least one success, 1 if all failed, 3 if privilege issue
-    if any(r.status == "forbidden" for r in records) and ok == 0:
-        return 3
-    if ok == 0:
-        return 1
-    return 0
+        if not cves:
+            raise RuntimeError(f"No valid CVE IDs found in {input_path}")
+
+        logging.info("Loaded %d unique CVE(s) from %s", len(cves), input_path)
+
+        proxies = build_proxies(args.http_proxy, args.https_proxy)
+        if proxies:
+            # Avoid logging credentials if present in the proxy URL
+            safe_proxies = {
+                k: re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", v)
+                for k, v in proxies.items()
+            }
+            logging.info("Using proxies: %s", safe_proxies)
+        else:
+            logging.info("No HTTP(S) proxy configured (direct connection).")
+
+        try:
+            verify = resolve_ssl_verify(args.ca_bundle)
+        except FileNotFoundError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        delay = resolve_request_delay(args.delay)
+
+        try:
+            client = GTIClient(
+                api_key=api_key,
+                proxies=proxies,
+                verify=verify,
+                delay=delay,
+                max_retries=args.max_retries,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        # Optional raw dump wrapper
+        dump_dir = Path(args.dump_raw) if args.dump_raw else None
+        if dump_dir:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            original_get = client.get_vulnerability
+
+            def get_with_dump(
+                cve: str,
+            ) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
+                body, err, status = original_get(cve)
+                if body is not None:
+                    out = dump_dir / f"{cve.upper()}.json"
+                    out.write_text(json.dumps(body, indent=2), encoding="utf-8")
+                    logging.debug("Dumped raw JSON → %s", out)
+                return body, err, status
+
+            client.get_vulnerability = get_with_dump  # type: ignore[method-assign]
+
+        records = enrich_cves(
+            client,
+            cves,
+            stop_on_forbidden=not args.continue_on_forbidden,
+        )
+
+        write_csv(records, output_path)
+
+        if not args.no_rich:
+            print_rich_report(records)
+        else:
+            for rec in records:
+                logging.info(
+                    "%s | status=%s | priority=%s | risk=%s | epss=%s | kev=%s",
+                    rec.cve,
+                    rec.status,
+                    rec.priority_rating,
+                    rec.risk_rating,
+                    rec.epss_score,
+                    rec.cisa_kev,
+                )
+
+        ok = sum(1 for r in records if r.status == "ok")
+        failed = len(records) - ok
+        logging.info(
+            "Done. Enriched=%d  Failed/Skipped=%d  CSV=%s",
+            ok,
+            failed,
+            output_path,
+        )
+
+        if any(r.status == "forbidden" for r in records) and ok == 0:
+            exit_code = 3
+        elif ok == 0:
+            exit_code = 1
+        else:
+            exit_code = 0
+
+    except Exception as exc:  # noqa: BLE001 — capture for HTML failure report
+        fatal_error = _format_fatal_error(exc)
+        logging.error("%s", exc)
+        if args.verbose:
+            logging.debug("%s", fatal_error)
+        log_console.print(f"[bold red]Error:[/bold red] {exc}")
+        # Prefer exit 2 for config/input problems; 1 for other runtime failures
+        msg = str(exc).lower()
+        if any(
+            needle in msg
+            for needle in (
+                "api key",
+                "no valid cve",
+                "failed to read input",
+                "ca bundle",
+                "placeholder",
+            )
+        ):
+            exit_code = 2
+        else:
+            exit_code = 1
+
+    # ------------------------------------------------------------------
+    # Always write + open HTML report (success, partial, or total failure)
+    # ------------------------------------------------------------------
+    try:
+        title = "GTI CVE Enrichment Report"
+        if fatal_error:
+            title = "GTI CVE Enrichment Report — FAILED"
+        render_html_report(
+            records,
+            html_path,
+            title=title,
+            fatal_error=fatal_error,
+        )
+        logging.info("HTML report: %s", html_path.resolve())
+        if not args.no_open:
+            open_report_in_browser(html_path)
+    except Exception as report_exc:  # noqa: BLE001
+        logging.error("Failed to write/open HTML report: %s", report_exc)
+        if exit_code == 0:
+            exit_code = 1
+
+    return exit_code
 
 
 if __name__ == "__main__":

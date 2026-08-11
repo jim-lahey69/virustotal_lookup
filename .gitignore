@@ -1,0 +1,35 @@
+# Secrets and local environment (single source of truth for keys / proxy)
+.env
+.env.local
+.env.*.local
+
+# Corporate CA material (never commit internal certs)
+certs/*.pem
+certs/*.crt
+certs/*.cer
+certs/*.der
+!certs/.gitkeep
+!certs/README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.vtenv/
+vtevn/
+.envrc
+
+# Tool outputs
+cve_enriched.csv
+report.html
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
