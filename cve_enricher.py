@@ -43,6 +43,21 @@ An HTML report is always written (default ``report.html``) and opened in
 the default browser — including when enrichment fails (missing key, SSL
 errors, network issues). The failure report includes a prominent error
 section with the exception message.
+
+Cleanup log (hygiene / documentation only — no functional change)
+-----------------------------------------------------------------
+Auditable notes from the maintainability pass. Runtime behavior of
+``.env`` loading, proxy construction, CA-bundle resolution, ``GTIClient``,
+HTML generation, and the always-open-report path is unchanged.
+
+- Removed unused ``dataclasses.field`` import.
+- Removed unused ``_dig()`` helper (never called; extraction uses ``_first``).
+- Removed a no-op ``exploited_in_the_wild`` inference block that only ``pass``-ed.
+- Removed an unreachable Critical→P0 branch in ``derive_priority_rating`` fallback
+  (P0 for Critical already returns earlier in the official table).
+- Deduplicated CVE-ID accumulation in ``load_cve_list`` via ``_accept_cve``.
+- Expanded educational comments on corporate proxy/TLS, GTI client wiring,
+  and why the HTML report is generated and launched even on failure.
 """
 
 from __future__ import annotations
@@ -67,7 +82,7 @@ import sys
 import time
 import traceback
 import webbrowser
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
@@ -88,14 +103,21 @@ from rich.text import Text
 
 # ---------------------------------------------------------------------------
 # Configuration defaults
+# ---------------------------------------------------------------------------
 # Values may be overridden by .env, process environment, or CLI flags.
 # Secrets are never hard-coded here — only safe defaults and path conventions.
+# Anchoring to the script directory (not cwd) means operators can invoke
+# ``python path\to\cve_enricher.py`` from any working directory and still
+# find ``.env`` and ``certs/`` next to this file.
 # ---------------------------------------------------------------------------
 
-# Anchor paths to the script directory so runs work regardless of the caller's cwd.
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
-# Preferred drop-location for the org root CA used during SSL inspection.
+# Conventional drop-location for the org SSL-inspection root CA.
+# Used automatically *only if the file exists*; otherwise certifi/system trust.
+# Operators who keep a personal bundle under their user profile
+# (e.g. %USERPROFILE%\certs\corporate_trust_bundle.pem) should set
+# CORPORATE_CA_BUNDLE in .env — that path is resolved via expanduser() below.
 DEFAULT_CA_BUNDLE = PROJECT_ROOT / "certs" / "corporate-ca.pem"
 
 DEFAULT_API_BASE = "https://www.virustotal.com/api/v3"
@@ -116,15 +138,23 @@ NO_KNOWN_ALIASES = {"", "n/a", "none", "no known", "no_known", "unknown"}
 # Fallback delay; actual value is resolved after .env load (see resolve_request_delay).
 DEFAULT_DELAY = 1.0
 
-# stdout for human-facing cards; stderr for logs so piping CSV/HTML stays clean.
+# stdout for human-facing Rich cards; stderr for logs + progress so piping
+# the process (or capturing stdout in a wrapper) does not mix log lines
+# into a redirected report.
 console = Console(stderr=False)
 log_console = Console(stderr=True)
 
 
 # ---------------------------------------------------------------------------
 # Environment / config loading
+# ---------------------------------------------------------------------------
 # All secrets and proxy URLs should come from .env (or explicit CLI overrides).
-# This avoids requiring $env:HTTP_PROXY / API key in every new PowerShell window.
+# Why a project .env instead of PowerShell session variables:
+#   - $env:HTTP_PROXY / $env:VIRUSTOTAL_API_KEY vanish when the window closes
+#   - Locked-down desktops often forbid user-level environment changes
+#   - .env is gitignored, lives with the project, and is loaded every run
+# python-dotenv writes into os.environ, which later resolvers (API key,
+# proxies, CA path, delay) all read. CLI flags still win over .env.
 # ---------------------------------------------------------------------------
 
 
@@ -138,7 +168,8 @@ def load_project_dotenv(env_file: Optional[Path] = None) -> Optional[Path]:
 
     Returns the path that was loaded, or None if no ``.env`` was found.
     """
-    # Build an ordered search list: explicit path, script-dir .env, then cwd .env.
+    # Search order: --env-file (if given), script-dir .env, then cwd .env
+    # (cwd is skipped when it is the same inode/path as the script-dir file).
     candidates: list[Path] = []
     if env_file is not None:
         candidates.append(Path(env_file))
@@ -149,17 +180,24 @@ def load_project_dotenv(env_file: Optional[Path] = None) -> Optional[Path]:
 
     for path in candidates:
         if path.is_file():
-            # override=False: pre-set env (e.g. CI secrets) takes precedence over .env.
+            # override=False: pre-set env (CI secrets, IT-pushed HTTP_PROXY)
+            # takes precedence over values sitting in the file on disk.
             load_dotenv(dotenv_path=path, override=False)
             return path.resolve()
 
-    # Fall back to python-dotenv's default discovery (parent dirs) if present.
+    # Last resort: python-dotenv walking parent directories (monorepo layouts).
     load_dotenv(override=False)
     return None
 
 
 def resolve_request_delay(cli_value: Optional[float] = None) -> float:
-    """Resolve inter-request delay: CLI > VT_REQUEST_DELAY > default."""
+    """
+    Resolve inter-request delay: CLI > ``VT_REQUEST_DELAY`` > default.
+
+    GTI rate-limits (HTTP 429) aggressively on Vulnerability Intelligence.
+    A 1.0s pause is conservative for interactive analyst runs; bulk jobs
+    can raise it via ``.env`` without touching the CLI.
+    """
     if cli_value is not None:
         return float(cli_value)
     env_val = os.getenv("VT_REQUEST_DELAY")
@@ -191,7 +229,12 @@ def resolve_api_key(cli_value: Optional[str] = None) -> Optional[str]:
     Resolve API key: CLI > VIRUSTOTAL_API_KEY > VT_API_KEY.
 
     ``VIRUSTOTAL_API_KEY`` is the preferred name in ``.env``.
-    Returns None when unset or still a documented placeholder value.
+    Returns None when unset or still a documented placeholder value so
+    ``main()`` can fail with a config error (exit 2 + HTML banner) instead
+    of sending a dummy key to VirusTotal and getting a confusing 401.
+
+    Prefer ``.env`` over ``--api-key`` on shared workstations: CLI arguments
+    persist in PowerShell history.
     """
     key = (
         (cli_value or "").strip()
@@ -213,13 +256,41 @@ def resolve_ssl_verify(
 
     Always verifies certificates — never returns ``False``.
 
-    Corporate SSL inspection (MITM) signs TLS with an internal root CA that is
-    not in Python's default certifi bundle. Passing the CA path as
-    ``session.verify = "<pem>"`` is the supported fix; disabling verification
-    is intentionally unsupported.
+    Why this exists (corporate SSL inspection)
+    ------------------------------------------
+    Most enterprise networks intercept HTTPS at a proxy (Zscaler, Netskope,
+    Blue Coat, Palo Alto, etc.). The proxy presents a certificate signed by
+    an **internal root CA** that is not in Python's certifi bundle. Without
+    that CA, ``requests`` raises ``SSLError`` / ``CERTIFICATE_VERIFY_FAILED``.
+
+    The supported fix is ``session.verify = "<path-to-pem>"``. Disabling
+    verification (``verify=False``) is intentionally **not** offered: this
+    tool talks to VirusTotal with an API key, and silently trusting any
+    MITM would be a security defect. ``GTIClient`` also refuses ``False``.
+
+    Why we prefer an explicit PEM (project or user-profile)
+    -------------------------------------------------------
+    - Reversible and auditable (does not mutate certifi).
+    - Works even when the Python build does not use the Windows trust store.
+    - ``Path.expanduser()`` maps ``~`` to the user profile (Windows:
+      ``%USERPROFILE%``), so a personal bundle such as
+      ``~/certs/corporate_trust_bundle.pem`` is a valid ``CORPORATE_CA_BUNDLE``.
+
+    What happens if the bundle is missing
+    -------------------------------------
+    - If a path was **explicitly** configured (CLI / ``CORPORATE_CA_BUNDLE`` /
+      ``REQUESTS_CA_BUNDLE`` / ``SSL_CERT_FILE``) and the file is not there,
+      we **fail loud** with ``FileNotFoundError``. Silently falling back to
+      certifi would just produce a harder-to-diagnose SSLError.
+    - If nothing was configured, we look for the conventional project file
+      ``certs/corporate-ca.pem`` and use it **only when it exists**.
+    - Otherwise we return ``True`` (certifi / system trust). That is *not*
+      "disable verification" — it is the default secure path for machines
+      that are not behind SSL inspection (or whose CA is already in the
+      system store). Operators can run without a corporate PEM on purpose.
 
     Resolution order:
-      1. Explicit CLI / argument path (``ca_bundle``)
+      1. Explicit CLI / argument path (``ca_bundle`` / ``--ca-bundle``)
       2. ``CORPORATE_CA_BUNDLE`` from environment / ``.env``
       3. ``REQUESTS_CA_BUNDLE`` / ``SSL_CERT_FILE`` (standard Python/requests)
       4. Default path ``./certs/corporate-ca.pem`` if the file exists
@@ -238,13 +309,15 @@ def resolve_ssl_verify(
     env_ca = (os.getenv("CORPORATE_CA_BUNDLE") or "").strip()
     if env_ca:
         candidates.append(env_ca)
-    # Honor standard Python/requests env vars used by many enterprise images.
+    # Honor standard Python/requests env vars used by many enterprise images
+    # (IT sometimes sets REQUESTS_CA_BUNDLE machine-wide).
     for env_name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
         val = (os.getenv(env_name) or "").strip()
         if val:
             candidates.append(val)
 
     for raw in candidates:
+        # expanduser(): "~" and "~/certs/..." → %USERPROFILE% on Windows.
         path = Path(raw).expanduser()
         if not path.is_absolute():
             # Prefer project-root relative paths (how README/.env document them),
@@ -256,6 +329,8 @@ def resolve_ssl_verify(
             elif cwd_relative.is_file():
                 path = cwd_relative
             else:
+                # Keep the project-root resolution in the error message so
+                # operators know where we looked.
                 path = project_relative
         else:
             path = path.resolve()
@@ -271,6 +346,8 @@ def resolve_ssl_verify(
         )
 
     # Convention path: use only when the operator has already dropped the file in.
+    # Absence is *not* an error — many analysts run this off-network or on
+    # machines whose Python already trusts the inspection CA via the OS store.
     if DEFAULT_CA_BUNDLE.is_file():
         return str(DEFAULT_CA_BUNDLE.resolve())
 
@@ -279,7 +356,11 @@ def resolve_ssl_verify(
 
 
 def describe_ssl_verify(verify: Union[bool, str]) -> str:
-    """Human-readable TLS mode for startup logs (never logs secret material)."""
+    """Human-readable TLS mode for startup logs (never logs secret material).
+
+    A path string means the corporate PEM is in use; ``True`` means we are
+    on certifi/system trust. ``False`` cannot appear — ``GTIClient`` rejects it.
+    """
     if isinstance(verify, str):
         return f"custom CA bundle → {verify}"
     return "default trust store (certifi / system)"
@@ -287,14 +368,23 @@ def describe_ssl_verify(verify: Union[bool, str]) -> str:
 
 # ---------------------------------------------------------------------------
 # Data model
-# One flat record per CVE so CSV, Rich, and HTML share the same fields.
-# Nested GTI JSON is normalized here for analyst-friendly consumption.
+# ---------------------------------------------------------------------------
+# One flat record per CVE so CSV, Rich terminal cards, and the HTML report
+# all share the same fields. Nested GTI JSON is normalized here so analysts
+# (and downstream SIEM/ticketing) never have to walk the collections schema.
+# String defaults are "N/A" / "False" so empty API fields still render
+# consistently in every output format.
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class CVERecord:
-    """Flattened, decision-ready CVE enrichment record."""
+    """Flattened, decision-ready CVE enrichment record.
+
+    ``status`` is ``ok`` on a successful fetch; otherwise a structured
+    error kind (``not_found``, ``forbidden``, ``rate_limited``, ``error``)
+    so the HTML/CSV still contain a row instead of dropping the CVE.
+    """
 
     cve: str
     # ok | not_found | error | rate_limited | forbidden
@@ -370,6 +460,7 @@ class CVERecord:
 
 
 # Stable CSV column order — keep in sync with CVERecord fields used in write_csv.
+# extra_json is intentionally omitted (it is a debug bag, not a spreadsheet column).
 CSV_COLUMNS: list[str] = [
     "cve",
     "status",
@@ -426,10 +517,18 @@ CSV_COLUMNS: list[str] = [
 # ---------------------------------------------------------------------------
 # Helpers — logging, display coercion, CVE ID normalization
 # ---------------------------------------------------------------------------
+# Small pure functions used by extraction, CSV, Rich, and HTML. Keeping
+# display coercion in one place prevents "None" vs "N/A" vs "" drift
+# across the three output formats.
+# ---------------------------------------------------------------------------
 
 
 def setup_logging(verbose: bool = False) -> None:
-    """Configure Rich-backed logging on stderr (keeps stdout free for piping)."""
+    """Configure Rich-backed logging on stderr (keeps stdout free for piping).
+
+    Must run before any resolver logs (``.env`` loaded, proxy used, TLS mode)
+    so operators can see those lines. ``-v`` flips DEBUG including dump-raw.
+    """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -440,7 +539,12 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 def na(value: Any, default: str = "N/A") -> str:
-    """Coerce API values to display-safe strings; treat None/empty as N/A."""
+    """Coerce API values to display-safe strings; treat None/empty as N/A.
+
+    Bools become ``True``/``False`` (not ``1``/``0``) so CSV consumers and
+    HTML badges share the same vocabulary. Lists are joined with ``; ``
+    to stay on one CSV cell.
+    """
     if value is None:
         return default
     if isinstance(value, bool):
@@ -457,7 +561,12 @@ def na(value: Any, default: str = "N/A") -> str:
 
 
 def fmt_ts(value: Any) -> str:
-    """Format UTC unix timestamp (int/float) or ISO-ish string to ISO-8601 date."""
+    """Format UTC unix timestamp (int/float) or ISO-ish string to ISO-8601 date.
+
+    GTI mixes seconds, milliseconds, and already-formatted date strings
+    (CISA KEV ``added_date``). The 10-billion heuristic treats large ints
+    as milliseconds. Failures fall back to ``na()`` rather than crashing.
+    """
     if value is None or value == "" or value is False:
         return "N/A"
     if isinstance(value, str):
@@ -474,7 +583,12 @@ def fmt_ts(value: Any) -> str:
 
 
 def normalize_cve(raw: str) -> Optional[str]:
-    """Normalize a CVE ID to canonical uppercase form; return None if invalid."""
+    """Normalize a CVE ID to canonical uppercase form; return None if invalid.
+
+    Accepts ``CVE-2021-44228``, ``cve-2021-44228``, ``CVE_2021_44228``, and
+    a bare ``2021-44228``. The API id builder lowercases again; we store
+    uppercase so CSV/HTML match how analysts write CVE IDs.
+    """
     if not raw:
         return None
     cleaned = raw.strip().upper().replace(" ", "")
@@ -493,9 +607,25 @@ def cve_api_id(cve: str) -> str:
     """
     Build the GTI collections object id.
 
-    API path requires lowercase: vulnerability--cve-yyyy-nnnnn
+    API path requires lowercase: ``vulnerability--cve-yyyy-nnnnn``.
+    The GUI URL uses the same object id, so HTML/CSV deep-links stay in sync
+    with the GET we just performed.
     """
     return f"vulnerability--{cve.lower()}"
+
+
+def _accept_cve(raw: str, cves: list[str], seen: set[str]) -> None:
+    """Normalize, de-duplicate, and append a CVE ID, or log a skip.
+
+    Shared by both headered and headerless CSV branches so first-seen
+    order and the invalid-ID warning stay identical.
+    """
+    cve = normalize_cve(raw)
+    if cve and cve not in seen:
+        seen.add(cve)
+        cves.append(cve)
+    elif not cve:
+        logging.warning("Skipping invalid CVE value: %r", raw)
 
 
 def _norm_label(value: str) -> str:
@@ -619,22 +749,25 @@ def derive_priority_rating(
     if risk == "low" and state == "no known" and avail in low_interest:
         return "P4"
 
-    # Fallback heuristics when official table does not match (e.g. Unrated)
+    # Fallback heuristics when official table does not match (e.g. Unrated).
+    # Critical already returned P0 above; it is not repeated here.
     if risk == "high":
         return "P1" if not _is_no_known(avail) or state in wide_confirmed_reported else "P2"
     if risk == "medium":
         return "P2"
     if risk == "low":
         return "P3"
-    if risk == "critical":
-        return "P0"
 
     return "N/A"
 
 
 # ---------------------------------------------------------------------------
 # Input CSV
-# Tolerates analyst-exported spreadsheets (headers, BOM, alternate delimiters).
+# ---------------------------------------------------------------------------
+# Tolerates analyst-exported spreadsheets: Excel BOM, ``;`` / tab delimiters,
+# optional headers, and a handful of common column names. Invalid IDs are
+# skipped (with a warning) rather than aborting the whole run — a 200-row
+# export with one bad cell should still enrich the rest.
 # ---------------------------------------------------------------------------
 
 
@@ -675,7 +808,8 @@ def load_cve_list(path: Path) -> list[str]:
 
         if has_header:
             reader = csv.DictReader(fh, dialect=dialect)
-            # Map lowercased header names back to original field names
+            # Map lowercased header names back to original field names so we
+            # can accept "CVE", "cve_id", etc. without being case-sensitive.
             field_map = { (f or "").strip().lower(): f for f in (reader.fieldnames or []) }
             col = None
             for candidate in ("cve", "cve_id", "cveid", "cve-id", "id", "identifier", "vulnerability"):
@@ -692,12 +826,7 @@ def load_cve_list(path: Path) -> list[str]:
                 raw = (row.get(col) or "").strip()
                 if not raw:
                     continue
-                cve = normalize_cve(raw)
-                if cve and cve not in seen:
-                    seen.add(cve)
-                    cves.append(cve)
-                elif not cve:
-                    logging.warning("Skipping invalid CVE value: %r", raw)
+                _accept_cve(raw, cves, seen)
         else:
             # Headerless: treat column 0 as the CVE list
             reader = csv.reader(fh, dialect=dialect)
@@ -707,19 +836,25 @@ def load_cve_list(path: Path) -> list[str]:
                 raw = (row[0] or "").strip()
                 if not raw or raw.lower() in {"cve", "cve_id", "id"}:
                     continue
-                cve = normalize_cve(raw)
-                if cve and cve not in seen:
-                    seen.add(cve)
-                    cves.append(cve)
-                elif not cve:
-                    logging.warning("Skipping invalid CVE value: %r", raw)
+                _accept_cve(raw, cves, seen)
 
     return cves
 
 
 # ---------------------------------------------------------------------------
 # API client
+# ---------------------------------------------------------------------------
 # Session-level proxy + CA bundle + API key; per-request throttle and retries.
+#
+# Construction contract (do not weaken):
+#   - ``verify`` is a PEM path or True — never False
+#   - proxies come from ``build_proxies()`` (``.env`` / CLI), applied on the
+#     Session so every GET uses the corporate path
+#   - the API key is sent as ``x-apikey`` (VirusTotal v3 convention)
+#
+# ``main()`` instantiates this *after* ``resolve_api_key`` / ``resolve_ssl_verify``
+# / ``build_proxies``. The constructor re-checks key + TLS as defense in depth
+# in case a future caller bypasses ``main()``.
 # ---------------------------------------------------------------------------
 
 
@@ -738,7 +873,11 @@ class GTIClient:
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         delay: float = DEFAULT_DELAY,
     ) -> None:
-        # Defense in depth: placeholders should already be filtered by resolve_api_key
+        """Bind API key, proxies, and TLS verify onto a shared ``requests.Session``."""
+        # Defense in depth: placeholders should already be filtered by resolve_api_key.
+        # Kept as an exact-match subset (not the lowercased frozenset) so this
+        # constructor's rejection set stays identical to the previously validated
+        # behavior if GTIClient is constructed outside main().
         if not api_key or api_key in {
             "INSERT_KEY_HERE",
             "your-api-key",
@@ -749,7 +888,8 @@ class GTIClient:
                 "API key missing or still a placeholder. "
                 "Set VIRUSTOTAL_API_KEY in .env (or VT_API_KEY) or pass --api-key."
             )
-        # Hard guard: never allow insecure TLS (corporate MITM must use a CA bundle).
+        # Hard guard: never allow insecure TLS. Corporate MITM must be handled
+        # with a CA bundle (resolve_ssl_verify), not by turning verification off.
         if verify is False:
             raise ValueError(
                 "TLS verification cannot be disabled. Place the corporate root CA at "
@@ -762,7 +902,8 @@ class GTIClient:
         self.delay = delay
         self._last_request_at = 0.0
 
-        # One Session reuses connections and carries proxy/verify for all GETs.
+        # One Session reuses TCP/TLS connections (important behind a proxy) and
+        # carries proxy + verify + headers for every GET in this run.
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -780,7 +921,11 @@ class GTIClient:
         logging.info("TLS verification: %s", describe_ssl_verify(verify))
 
     def _throttle(self) -> None:
-        """Sleep just enough to honor the configured inter-request delay."""
+        """Sleep just enough to honor the configured inter-request delay.
+
+        Uses monotonic time so clock adjustments cannot skip the pause.
+        ``delay <= 0`` disables throttling (tests / explicit operator choice).
+        """
         if self.delay <= 0:
             return
         elapsed = time.monotonic() - self._last_request_at
@@ -794,6 +939,12 @@ class GTIClient:
         Returns:
             (json_body | None, error_kind | None, http_status)
             error_kind in {None, 'not_found', 'forbidden', 'rate_limited', 'error'}
+
+        401/403 are *not* retried: they almost always mean the key lacks
+        Vulnerability Intelligence, and retrying would only burn quota.
+        429 / 5xx / network (proxy, SSL, DNS) errors *are* retried with
+        exponential backoff + jitter so concurrent analyst runs do not
+        thundering-herd the API.
         """
         object_id = cve_api_id(cve)
         url = f"{self.base_url}/collections/{object_id}"
@@ -888,7 +1039,12 @@ class GTIClient:
 
 
 def _safe_error_body(resp: requests.Response, limit: int = 300) -> str:
-    """Extract a short, log-safe preview of an API error body."""
+    """Extract a short, log-safe preview of an API error body.
+
+    Truncated so 401 HTML error pages (from a proxy captive portal) do not
+    flood the log. Never includes the API key (it is a request header, not
+    a response body).
+    """
     try:
         data = resp.json()
         if isinstance(data, dict):
@@ -901,25 +1057,22 @@ def _safe_error_body(resp: requests.Response, limit: int = 300) -> str:
 
 # ---------------------------------------------------------------------------
 # Field extraction
+# ---------------------------------------------------------------------------
 # Maps the GTI vulnerability object schema into a flat CVERecord.
-# Uses tolerant key lookup because field names have varied across API revisions.
+# Uses tolerant key lookup (``_first``) because field names have varied
+# across API revisions — e.g. ``cvssv3_x`` vs ``cvssv3``. Never assume a
+# nested key exists; a missing field becomes "N/A" rather than crashing
+# the whole report.
 # ---------------------------------------------------------------------------
 
 
-def _dig(d: Any, *keys: str, default: Any = None) -> Any:
-    """Safe nested dict walk: _dig(obj, 'a', 'b') == obj['a']['b'] or default."""
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(k, default)
-        if cur is default:
-            return default
-    return cur
-
-
 def _first(*values: Any, default: Any = None) -> Any:
-    """Return the first non-empty value (handles alternate API field names)."""
+    """Return the first non-empty value (handles alternate API field names).
+
+    Empty strings, empty lists/dicts, and None are skipped. Used throughout
+    ``extract_record`` because GTI has renamed CVSS/exploitation keys across
+    API revisions; we try documented names then legacy aliases.
+    """
     for v in values:
         if v is None:
             continue
@@ -932,7 +1085,11 @@ def _first(*values: Any, default: Any = None) -> Any:
 
 
 def _format_cpes(cpes: Any) -> tuple[str, int]:
-    """Flatten CPE ranges into readable 'vendor / product version-range' strings."""
+    """Flatten CPE ranges into readable 'vendor / product version-range' strings.
+
+    GTI stores affected products as start/end CPE objects with inclusive/
+    exclusive relation flags. HTML later splits the joined string on ``|``.
+    """
     if not isinstance(cpes, list) or not cpes:
         return "N/A", 0
 
@@ -980,7 +1137,12 @@ def _format_cpes(cpes: Any) -> tuple[str, int]:
 
 
 def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
-    """Map a GTI vulnerability collection response into a CVERecord."""
+    """Map a GTI vulnerability collection response into a CVERecord.
+
+    Called only on HTTP 200 with a JSON body. Malformed payloads still
+    return a structured ``status="error"`` record so the HTML/CSV row
+    exists and the always-open report is not empty for that CVE.
+    """
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, dict):
         return CVERecord(cve=cve, status="error", error_message="Malformed API response (no data)")
@@ -1045,11 +1207,9 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         default=False,
     )
 
-    # Wide/Confirmed state implies real-world exploitation even when the bool is absent.
-    # We intentionally do not overwrite an explicit False from the API.
-    if exploited_in_wild is False or exploited_in_wild is None:
-        if _norm_label(str(exploitation_state)) in {"wide", "confirmed"}:
-            pass
+    # We do **not** infer exploited_in_the_wild from Exploitation State.
+    # Wide/Confirmed often implies real-world use, but an explicit API
+    # False/absent must be preserved so the report does not contradict GTI.
 
     # --- CISA KEV (presence of the object means "on the KEV list") ---
     kev = attrs.get("cisa_known_exploited")
@@ -1170,7 +1330,12 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
 
 
 def error_record(cve: str, status: str, message: str) -> CVERecord:
-    """Build a non-success CVERecord that still carries a deep-link to VirusTotal."""
+    """Build a non-success CVERecord that still carries a deep-link to VirusTotal.
+
+    Used for 404 / 401 / 429 / network errors and for CVEs skipped after an
+    early-stop on forbidden. Keeping a row (instead of omitting the CVE)
+    is what lets the HTML report remain a complete record of the input list.
+    """
     return CVERecord(
         cve=cve,
         status=status,
@@ -1181,7 +1346,11 @@ def error_record(cve: str, status: str, message: str) -> CVERecord:
 
 # ---------------------------------------------------------------------------
 # Output: CSV
-# Flat columns for Excel / SIEM / ticketing export.
+# ---------------------------------------------------------------------------
+# Flat columns for Excel / SIEM / ticketing export. Newlines inside
+# narrative fields are collapsed so a description cannot split a row.
+# Written only on a successful walk of the input list (including all-error
+# rows). Config failures skip CSV and still produce HTML.
 # ---------------------------------------------------------------------------
 
 
@@ -1203,11 +1372,15 @@ def write_csv(records: Iterable[CVERecord], path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # Output: Rich terminal cards
+# ---------------------------------------------------------------------------
 # Color-coded panels for interactive console review (optional via --no-rich).
+# Priority colors mirror the HTML badges so an analyst who glances at the
+# terminal sees the same P0–P4 language as in the browser report.
 # ---------------------------------------------------------------------------
 
 
 def _risk_style(risk: str) -> str:
+    """Rich style for a risk rating or P0–P4 badge (aligned with HTML colors)."""
     r = _norm_label(risk)
     if r == "critical" or risk.upper() == "P0":
         return "bold white on dark_red"
@@ -1221,6 +1394,7 @@ def _risk_style(risk: str) -> str:
 
 
 def _priority_color(priority: str) -> str:
+    """Border/label color for a P0–P4 badge; grey if unknown."""
     p = priority.upper()
     return {
         "P0": "dark_red",
@@ -1232,6 +1406,7 @@ def _priority_color(priority: str) -> str:
 
 
 def _bool_badge(value: str, true_style: str = "bold red", false_style: str = "dim") -> Text:
+    """Render True/False-ish API strings as a compact YES/no Rich span."""
     v = str(value).strip().lower()
     if v in {"true", "yes", "1"}:
         return Text("YES", style=true_style)
@@ -1367,13 +1542,25 @@ def print_rich_report(records: list[CVERecord]) -> None:
 
 # ---------------------------------------------------------------------------
 # Output: HTML report
-# Self-contained (inline CSS) so it opens offline in any browser.
+# ---------------------------------------------------------------------------
+# Self-contained (inline CSS, no CDN) so it opens offline and behind
+# corporate proxies that block external stylesheets. Dark theme matches
+# the analyst-facing sample (e.g. CVE-2021-44228 Log4j).
+#
 # Invoked for success AND failure — operators always get a visual result.
+# SSL/proxy/key errors are easier to screenshot and share as a formatted
+# page than as a PowerShell traceback. See ``main()``: this renderer runs
+# *outside* the enrichment try/except so config failures still produce a
+# browsable page. ``--no-open`` skips the browser but still writes the file.
 # ---------------------------------------------------------------------------
 
 
 def _html_risk_class(risk_or_priority: str) -> str:
-    """Map risk/priority labels to CSS badge class names."""
+    """Map risk/priority labels to CSS badge class names.
+
+    Shared by header chips and per-CVE badges so P0 and Critical always
+    render with the same ``badge-critical`` color.
+    """
     v = (risk_or_priority or "").strip().upper()
     if v in {"CRITICAL", "P0"}:
         return "critical"
@@ -1414,6 +1601,10 @@ def render_html_report(
     Always produces a professional report. When ``fatal_error`` is set (or all
     records failed), a prominent run-level error section is included so the
     operator can diagnose SSL, proxy, API key, or network failures in-browser.
+
+    ``fatal_error`` is the formatted exception from ``main()``'s outer
+    handler (missing key, missing CA file, unreadable CSV, unexpected
+    crash). Per-CVE failures live on their own error cards below the banner.
     """
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     ok = sum(1 for r in records if r.status == "ok")
@@ -1600,7 +1791,8 @@ def render_html_report(
         for k, v in sorted(pri_counts.items())
     )
 
-    # Full document is assembled as one string so the report has zero external deps.
+    # Full document is assembled as one string so the report has zero external
+    # deps (no Google Fonts / CDN CSS — those often fail on corp networks).
     doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1850,8 +2042,17 @@ def open_report_in_browser(path: Path) -> None:
 
     Uses ``webbrowser`` first; on Windows falls back to ``os.startfile`` /
     ``cmd /c start`` if needed so the report still surfaces after a failed run.
-    Opening on failure is intentional: SSL/proxy/key errors are easier to
-    review (and share) as a formatted page than as console text alone.
+
+    Why we open even on failure
+    ---------------------------
+    Analysts running this from a locked-down Windows desktop often miss
+    stderr in a flashing console window. A browser tab is the reliable
+    place to read SSL/proxy/key errors, screenshot them, and attach them
+    to a ticket. ``--no-open`` exists only for CI/automation; the file is
+    still written by ``render_html_report``.
+
+    Failures here are logged, never raised — a browser-helper error must
+    not mask a successful enrichment (or replace the real exit code).
     """
     resolved = path.resolve()
     if not resolved.is_file():
@@ -1895,7 +2096,19 @@ def open_report_in_browser(path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # Orchestration
+# ---------------------------------------------------------------------------
 # Wire config → client → enrich loop → CSV / Rich / always-on HTML.
+#
+# Order in ``main()`` is load-bearing:
+#   1. argparse  (so --env-file / -v exist)
+#   2. logging
+#   3. load_project_dotenv  → os.environ
+#   4. resolve API key, input CSV, proxies, CA bundle
+#   5. GTIClient(...)  with those resolved values
+#   6. enrich + CSV + optional Rich
+#   7. ALWAYS render HTML and (unless --no-open) launch the browser
+# Step 7 lives outside the enrichment try so missing keys, missing CA
+# files, and SSL errors still produce a browsable failure page.
 # ---------------------------------------------------------------------------
 
 
@@ -1909,6 +2122,11 @@ def build_proxies(
     Resolution order per scheme: CLI → VT_* alias → HTTP(S)_PROXY → lowercase.
     Values typically come from the project ``.env`` (loaded at startup) so
     operators do not re-export proxies in every PowerShell session.
+
+    Corporate networks almost always require an HTTP proxy for outbound
+    HTTPS (the proxy URL itself uses ``http://``, even for HTTPS targets).
+    If only one scheme is configured we mirror it onto the other so
+    VirusTotal is not accidentally reached direct and blocked.
     """
     http_p = (
         http_proxy
@@ -1928,7 +2146,8 @@ def build_proxies(
     if https_p:
         proxies["https"] = https_p.strip()
     # Corporate proxies are almost always one HTTP endpoint for both schemes;
-    # mirror a single configured value so HTTPS traffic is not sent direct.
+    # mirror a single configured value so HTTPS traffic is not sent direct
+    # (direct would fail or bypass inspection and look like a policy violation).
     if "http" in proxies and "https" not in proxies:
         proxies["https"] = proxies["http"]
     elif "https" in proxies and "http" not in proxies:
@@ -1937,7 +2156,12 @@ def build_proxies(
 
 
 def _format_fatal_error(exc: BaseException) -> str:
-    """Human-readable exception + short traceback for the HTML error panel."""
+    """Human-readable exception + short traceback for the HTML error panel.
+
+    Kept off the console by default (full text is DEBUG / ``-v``) so a
+    missing CA file is one clear line in the terminal and the detail lives
+    in the report that we always open.
+    """
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     # Cap size so the HTML stays readable in constrained browser windows
     if len(tb) > 8000:
@@ -1956,6 +2180,11 @@ def enrich_cves(
 
     On 401/403, optionally stop early and mark remaining CVEs as skipped so
     we do not burn rate budget against a key without VI privileges.
+    Remaining IDs still get error rows so the HTML report is a complete
+    accounting of the input list, not a silent truncation.
+
+    Progress renders on stderr (``log_console``) so stdout stays usable
+    if an operator pipes the process.
     """
     records: list[CVERecord] = []
     total = len(cves)
@@ -2008,7 +2237,8 @@ def enrich_cves(
                         "Stopping early: API key lacks Vulnerability Intelligence privilege. "
                         "Remaining CVEs will not be queried."
                     )
-                    # Mark remaining as skipped so the report is complete
+                    # Mark remaining as skipped so the HTML/CSV still list every
+                    # input CVE (complete accounting) without further API calls.
                     for rest in cves[idx:]:
                         records.append(
                             error_record(
@@ -2041,7 +2271,13 @@ def enrich_cves(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Define CLI flags; defaults favor .env for secrets and network settings."""
+    """Define CLI flags; defaults favor .env for secrets and network settings.
+
+    Flags are overrides, not the primary config surface. ``--html`` always
+    has a path (default ``report.html``) because the report is always written.
+    ``--no-open`` is the only way to skip the browser, and it does not skip
+    the write.
+    """
     p = argparse.ArgumentParser(
         prog="cve_enricher.py",
         description=(
@@ -2134,12 +2370,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     Guarantees: after parse + logging setup, an HTML report is always generated
     and opened (unless ``--no-open``), even when the run fails with a missing
     key, SSL error, bad input, or unexpected exception.
+
+    Exit codes (unchanged): 0 = at least one success; 1 = no successes /
+    runtime error; 2 = config/input/CA; 3 = privilege (401/403) and zero
+    successes.
     """
     # Parse CLI first so --env-file / -v apply before any other work.
     args = build_arg_parser().parse_args(argv)
     setup_logging(verbose=args.verbose)
 
-    # Load .env early: populates os.environ for key, proxy, and CA resolution.
+    # Load .env early: populates os.environ for key, proxy, and CA resolution
+    # used by resolve_api_key / build_proxies / resolve_ssl_verify below.
     env_path = load_project_dotenv(Path(args.env_file) if args.env_file else None)
     if env_path:
         logging.info("Loaded configuration from %s", env_path)
@@ -2150,6 +2391,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
     # Shared state for the always-on report path (success or failure).
+    # Initialized *before* the try so the finally-equivalent HTML block
+    # can render an empty-records failure page if we never get that far.
     html_path = Path(args.html)
     records: list[CVERecord] = []
     fatal_error: Optional[str] = None
@@ -2177,9 +2420,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         logging.info("Loaded %d unique CVE(s) from %s", len(cves), input_path)
 
         # --- Network: proxy + TLS trust ---
+        # Proxies and CA bundle are applied on the Session inside GTIClient.
+        # Redact user:password@ in logs if operators put creds in the proxy URL.
         proxies = build_proxies(args.http_proxy, args.https_proxy)
         if proxies:
-            # Redact user:password@ in logs if operators put creds in the proxy URL
             safe_proxies = {
                 k: re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", v)
                 for k, v in proxies.items()
@@ -2188,6 +2432,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             logging.info("No HTTP(S) proxy configured (direct connection).")
 
+        # Wrap FileNotFoundError so the HTML banner and exit-code 2 matcher
+        # see a RuntimeError whose message still contains "CA bundle".
         try:
             verify = resolve_ssl_verify(args.ca_bundle)
         except FileNotFoundError as exc:
@@ -2195,6 +2441,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         delay = resolve_request_delay(args.delay)
 
+        # GTIClient re-validates key + verify=False; wrap ValueError the same
+        # way so the always-open HTML path (not a traceback-only crash) owns it.
         try:
             client = GTIClient(
                 api_key=api_key,
@@ -2207,6 +2455,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise RuntimeError(str(exc)) from exc
 
         # Optional: wrap the GET to persist raw JSON for offline debugging
+        # (schema drift, ticket attachments). Does not change enrichment
+        # results — dump happens after a successful parse of the body.
         dump_dir = Path(args.dump_raw) if args.dump_raw else None
         if dump_dir:
             dump_dir.mkdir(parents=True, exist_ok=True)
@@ -2267,6 +2517,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     except Exception as exc:  # noqa: BLE001 — capture for HTML failure report
         # Do not re-raise: we still write/open the HTML report below.
+        # That is the always-open guarantee — a missing key or SSL failure
+        # must not exit before the operator gets a browsable error page.
         fatal_error = _format_fatal_error(exc)
         logging.error("%s", exc)
         if args.verbose:
@@ -2290,8 +2542,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ------------------------------------------------------------------
     # Always write + open HTML report (success, partial, or total failure).
-    # This block intentionally sits outside the main try so config/SSL/key
-    # failures still produce a browsable error page for the operator.
+    #
+    # This block intentionally sits *outside* the main try so config/SSL/key
+    # failures still produce a browsable error page. ``records`` may be empty
+    # and ``fatal_error`` set; ``render_html_report`` handles both.
+    # ``--no-open`` skips the browser only — the file is still written.
+    # A failure *here* is logged and can flip a 0 exit to 1, but never
+    # swallows the original enrichment exit code if it was already non-zero.
     # ------------------------------------------------------------------
     try:
         title = "GTI CVE Enrichment Report"
