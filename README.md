@@ -40,7 +40,7 @@ It is built for **corporate Windows environments**: API key and proxy live in a 
 | Requirement | Notes |
 |-------------|--------|
 | **Python 3.10+** | Check with `python --version` |
-| **Network path to VirusTotal** | Usually via corporate proxy `http://webproxy:8080` (or your org’s proxy) |
+| **Network path to VirusTotal** | Usually via corporate proxy `http://webproxy:` (or your org’s proxy) |
 | **GTI API key** | Enterprise / Enterprise Plus + Vulnerability Intelligence |
 | **Corporate root CA** (if SSL inspection is enabled) | PEM/Base-64 CER exported from the Windows trust store |
 
@@ -65,7 +65,7 @@ From PowerShell (or any terminal), in the project directory:
 
 ```powershell
 # 1. Change to the project folder
-cd C:\Users\ejken\Grok\virustotal
+cd C:\Users\username\virustotal_lookup
 
 # 2. (Recommended) create and activate a virtual environment
 python -m venv .venv
@@ -105,8 +105,8 @@ notepad .env
 VIRUSTOTAL_API_KEY=your_actual_api_key_here
 
 # Corporate HTTP proxy (both schemes usually use http:// for the proxy URL)
-HTTP_PROXY=http://webproxy:8080
-HTTPS_PROXY=http://webproxy:8080
+HTTP_PROXY=http://webproxy:
+HTTPS_PROXY=http://webproxy:
 
 # Corporate root CA for SSL inspection (uncomment after the file exists)
 # CORPORATE_CA_BUNDLE=./certs/corporate-ca.pem
@@ -118,7 +118,7 @@ HTTPS_PROXY=http://webproxy:8080
 | Variable | Purpose |
 |----------|---------|
 | `VIRUSTOTAL_API_KEY` | GTI API key (**required**). Alias: `VT_API_KEY` |
-| `HTTP_PROXY` | Proxy for HTTP traffic (e.g. `http://webproxy:8080`) |
+| `HTTP_PROXY` | Proxy for HTTP traffic (e.g. `http://webproxy:`) |
 | `HTTPS_PROXY` | Proxy for HTTPS targets (usually the same URL as `HTTP_PROXY`) |
 | `CORPORATE_CA_BUNDLE` | Path to org root CA PEM/CRT |
 | `VT_REQUEST_DELAY` | Inter-request delay in seconds |
@@ -162,8 +162,8 @@ More export options (PowerShell, browser path): see [certs/README.md](certs/READ
 Many corporate networks require an HTTP proxy for outbound API traffic.
 
 ```env
-HTTP_PROXY=http://webproxy:8080
-HTTPS_PROXY=http://webproxy:8080
+HTTP_PROXY=http://webproxy:
+HTTPS_PROXY=http://webproxy:
 ```
 
 Notes:
@@ -198,7 +198,7 @@ Headers such as `CVE`, `cve_id`, `cve`, or `id` are accepted. Duplicates and inv
 **PowerShell (typical day-to-day—no session env vars needed once `.env` is set):**
 
 ```powershell
-cd C:\Users\ejken\Grok\virustotal
+cd C:\Users\username\virustotal_lookup
 python cve_enricher.py -i cve_list.csv -o cve_enriched.csv --html report.html
 ```
 
