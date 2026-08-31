@@ -1,0 +1,25 @@
+{
+  "data": [
+    {
+      "type": "file",
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "attributes": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "md5": "cccccccccccccccccccccccccccccccc",
+        "meaningful_name": "exploit.jar",
+        "type_description": "Java JAR"
+      }
+    },
+    {
+      "type": "file",
+      "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "attributes": {
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "names": ["poc.py"],
+        "type_tag": "python"
+      }
+    }
+  ],
+  "meta": {"count": 18}
+}

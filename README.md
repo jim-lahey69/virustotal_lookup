@@ -266,6 +266,22 @@ After **every** run—success, partial success, or complete failure—the tool:
 
 Use `--no-open` only for automation/CI; the file is still written so you can open it manually.
 
+### Report mapping notes
+
+These rules are implemented in `cve_enricher.py` (extraction + HTML template). They exist because the GTI GUI and the collections JSON do not always share a 1:1 field.
+
+**MVE identifier.** Mandiant/GTI `mve_id` is still parsed internally (CSV) but is **not** shown in the HTML or Rich report. CVE is the only identifier on the card. Context still includes CWE, disclosure/last-modified dates, products, risk factors, and the VirusTotal collection URL.
+
+**IoCs.** `counters.iocs` / `files_count` / etc. are counts only. When a count is greater than zero the client fetches relationship objects (`files`, `urls`, `domains`, `ip_addresses`) using the same proxy, corporate CA bundle, throttle, and retry path as the collection GET. The HTML **Indicators of Compromise** section lists them by type (empty types omitted). Lists are capped at 25 rows per type with “and N more”. If GTI returns no IoCs, the section shows a single muted line.
+
+**Exploitation State.** The value is shown with the existing color treatment plus an info icon. Tooltip text is the official definition (“Indicates our knowledge of the current exploitation landscape…”) and the level legend: 0 = No Known, 1 = Suspected, 2 = Reported, 3 = Confirmed, 4 = Wide. Missing or unrecognized API values render as **Unknown**, not “No Known”.
+
+**Priority visualization.** A dedicated block near the header shows the P0–P4 badge and the three GTI inputs: potential impact (risk / predicted risk / CVSS), exploit accessibility (exploit availability), and real-world use (exploitation state + exploited in the wild), with the official severity-visualization caption.
+
+**Exploited in the Wild.** GTI’s Vulnerability object does **not** document a reliable top-level `exploited_in_the_wild` field. The GUI Yes/No flag is **derived**. Yes if **any** of: an explicit true/yes wild field; `exploitation_state` in {Confirmed, Wide}; CISA KEV / “CISA Exploited”; collection tags such as “Observed In The Wild”. No only when none of those signals are present. Wide/Confirmed is never treated as No. Missing CISA KEV is not treated as No if GTI itself marks wild exploitation.
+
+Finding for **CVE-2026-34621**: the GUI showed Exploited in the Wild = Yes while an earlier report printed **no**, because the mapper defaulted a missing `attributes.exploited_in_the_wild` key to False and refused to infer from Exploitation State. Confirmed/Wide (and KEV/tags) now force Yes. A canned fixture in `tests/fixtures/cve-2026-34621.json` asserts the report field is Yes. CVE-2021-44228 (Wide + CISA KEV) is the same class of bug and is also asserted Yes. If an explicit false field disagrees with a positive derivation, the report shows a small “API derived / source fields” note instead of silently printing No. Exploitation key snapshots are DEBUG-log only — never dumped into the HTML body.
+
 ---
 
 ## Troubleshooting
@@ -334,6 +350,7 @@ virustotal/
 ├── certs/
 │   ├── .gitkeep
 │   └── README.md        # How to export and place corporate-ca.pem
+├── tests/               # Mapping fixtures (incl. CVE-2026-34621 in-the-wild)
 ├── README.md            # This document
 └── SETUP.md             # Extended first-time setup (API key, proxy, CA)
 ```

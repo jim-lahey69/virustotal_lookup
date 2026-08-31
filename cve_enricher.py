@@ -82,7 +82,7 @@ import sys
 import time
 import traceback
 import webbrowser
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
@@ -134,6 +134,45 @@ CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 # GTI priority derivation treats these labels as "no known exploit availability".
 # Values observed across GTI docs / UI wording variants.
 NO_KNOWN_ALIASES = {"", "n/a", "none", "no known", "no_known", "unknown"}
+
+# Official Exploitation State labels and numeric levels (GTI docs).
+# Missing / unrecognized API values display as "Unknown" — never coerced to "No Known".
+EXPLOITATION_STATE_LEVELS: dict[int, str] = {
+    0: "No Known",
+    1: "Suspected",
+    2: "Reported",
+    3: "Confirmed",
+    4: "Wide",
+}
+EXPLOITATION_STATE_ALIASES: dict[str, int] = {
+    "no known": 0,
+    "no_known": 0,
+    "no-known": 0,
+    "noknown": 0,
+    "suspected": 1,
+    "reported": 2,
+    "confirmed": 3,
+    "wide": 4,
+}
+WILD_EXPLOITATION_STATES = frozenset({"confirmed", "wide"})
+WILD_COLLECTION_TAGS = frozenset(
+    {
+        "observed in the wild",
+        "observed_in_the_wild",
+        "exploited in the wild",
+        "exploited_in_the_wild",
+        "in the wild",
+        "in_the_wild",
+        "cisa exploited",
+        "cisa_exploited",
+        "cisa kev",
+        "cisa_kev",
+    }
+)
+
+# Relationship IoCs: fetch/display cap per type so reports stay readable.
+IOC_DISPLAY_CAP = 25
+IOC_RELATIONSHIPS: tuple[str, ...] = ("files", "urls", "domains", "ip_addresses")
 
 # Fallback delay; actual value is resolved after .env load (see resolve_request_delay).
 DEFAULT_DELAY = 1.0
@@ -345,9 +384,14 @@ def resolve_ssl_verify(
             f"or place it at {DEFAULT_CA_BUNDLE}. See SETUP.md."
         )
 
-    # Convention path: use only when the operator has already dropped the file in.
+    # Convention paths: use only when the operator has already dropped the file in.
     # Absence is *not* an error — many analysts run this off-network or on
     # machines whose Python already trusts the inspection CA via the OS store.
+    # Corporate desktops often keep a personal bundle under the user profile
+    # (%USERPROFILE%\certs\corporate_trust_bundle.pem on Windows).
+    user_profile_bundle = Path.home() / "certs" / "corporate_trust_bundle.pem"
+    if user_profile_bundle.is_file():
+        return str(user_profile_bundle.resolve())
     if DEFAULT_CA_BUNDLE.is_file():
         return str(DEFAULT_CA_BUNDLE.resolve())
 
@@ -399,9 +443,12 @@ class CVERecord:
     risk_factors: str = "N/A"
 
     # Exploitation posture
-    exploitation_state: str = "N/A"
+    exploitation_state: str = "Unknown"
+    exploitation_state_level: str = "N/A"  # 0–4 or N/A when Unknown
     exploit_availability: str = "N/A"
     exploited_in_the_wild: str = "False"
+    exploited_in_the_wild_sources: str = ""  # debug: which signals fired (not shown unless conflict)
+    exploited_in_the_wild_explicit: str = "N/A"  # raw explicit field if present
     exploited_as_zero_day: str = "False"
     exploitation_consequence: str = "N/A"
     exploitation_vectors: str = "N/A"
@@ -454,6 +501,15 @@ class CVERecord:
     origin: str = "N/A"
     vt_url: str = "N/A"
     ioc_count: str = "N/A"
+    # Actual IoC objects (relationship fetch). Totals come from counters; lists are capped.
+    ioc_files_total: int = 0
+    ioc_urls_total: int = 0
+    ioc_domains_total: int = 0
+    ioc_ip_addresses_total: int = 0
+    ioc_files: list[dict[str, str]] = field(default_factory=list)
+    ioc_urls: list[dict[str, str]] = field(default_factory=list)
+    ioc_domains: list[dict[str, str]] = field(default_factory=list)
+    ioc_ip_addresses: list[dict[str, str]] = field(default_factory=list)
 
     # Truncated JSON bag for advanced consumers (SIEM, custom parsers)
     extra_json: str = ""
@@ -636,6 +692,403 @@ def _norm_label(value: str) -> str:
 def _is_no_known(value: str) -> bool:
     """True when exploit-availability wording means 'none / unknown'."""
     return _norm_label(value) in NO_KNOWN_ALIASES
+
+
+def _as_nonneg_int(value: Any, default: int = 0) -> int:
+    """Best-effort non-negative int for IoC counters (missing → default)."""
+    if value is None or value is False:
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_exploitation_state(value: Any) -> tuple[Optional[int], str]:
+    """Map GTI ``exploitation_state`` strings to ``(level, canonical label)``.
+
+    Official values and levels (GTI Vulnerability Intelligence docs)::
+
+        0 = No Known
+        1 = Suspected
+        2 = Reported
+        3 = Confirmed
+        4 = Wide
+
+    Unknown or missing values return ``(None, "Unknown")``. They are **not**
+    coerced to ``No Known`` — that label means GTI has assessed the landscape
+    and is unaware of exploitation, which is different from "field absent".
+    """
+    if value is None:
+        return None, "Unknown"
+    text = str(value).strip()
+    if not text:
+        return None, "Unknown"
+    key = _norm_label(text).replace("_", " ").replace("-", " ")
+    key_compact = key.replace(" ", "")
+    if key in EXPLOITATION_STATE_ALIASES:
+        level = EXPLOITATION_STATE_ALIASES[key]
+        return level, EXPLOITATION_STATE_LEVELS[level]
+    if key_compact in EXPLOITATION_STATE_ALIASES:
+        level = EXPLOITATION_STATE_ALIASES[key_compact]
+        return level, EXPLOITATION_STATE_LEVELS[level]
+    if key.isdigit():
+        num = int(key)
+        if num in EXPLOITATION_STATE_LEVELS:
+            return num, EXPLOITATION_STATE_LEVELS[num]
+    return None, "Unknown"
+
+
+def _truthy_flag(value: Any) -> bool:
+    """True for boolean/string values that mean yes/true."""
+    if value is True:
+        return True
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == 1
+    if isinstance(value, str):
+        return _norm_label(value) in {"true", "yes", "y", "1"}
+    return False
+
+
+def _falsey_flag(value: Any) -> bool:
+    """True for boolean/string values that mean no/false (explicit, not missing)."""
+    if value is False:
+        return True
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == 0
+    if isinstance(value, str):
+        return _norm_label(value) in {"false", "no", "n", "0"}
+    return False
+
+
+def _walk_wild_keys(obj: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    """Collect keys whose names look like in-the-wild / observed-wild flags."""
+    hits: list[tuple[str, Any]] = []
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            path = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
+            key_l = str(key).lower()
+            if "wild" in key_l or key_l in {
+                "observed_in_the_wild",
+                "exploited_in_the_wild",
+                "in_the_wild",
+            }:
+                hits.append((path, val))
+            if isinstance(val, (dict, list)):
+                hits.extend(_walk_wild_keys(val, path))
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj[:20]):
+            if isinstance(item, (dict, list)):
+                hits.extend(_walk_wild_keys(item, f"{prefix}[{idx}]"))
+    return hits
+
+
+def _tag_list(tags: Any) -> list[str]:
+    if isinstance(tags, str):
+        return [t.strip() for t in re.split(r"[;,]", tags) if t.strip()]
+    if isinstance(tags, (list, tuple)):
+        return [str(t).strip() for t in tags if t is not None and str(t).strip()]
+    return []
+
+
+def derive_exploited_in_the_wild(
+    attrs: dict[str, Any],
+    *,
+    exploitation: Optional[dict[str, Any]] = None,
+    exploitation_state: Any = None,
+    cisa_kev: bool = False,
+    tags: Any = None,
+) -> tuple[str, list[str], str]:
+    """Derive the GUI ``Exploited in the Wild`` Yes/No flag.
+
+    GTI's published Vulnerability object does **not** document a reliable
+    top-level ``attributes.exploited_in_the_wild`` field. The VirusTotal /
+    GTI GUI flag is a derived indicator. We therefore OR together every
+    documented positive signal rather than reading a single key.
+
+    Exploited in the Wild = **Yes** if ANY of the following are true:
+
+    1. An explicit boolean/string field meaning exploited/observed in the
+       wild is true/yes (top-level attributes, nested ``exploitation``, or
+       any key whose name contains ``wild``).
+    2. ``exploitation_state`` is ``Confirmed`` or ``Wide``.
+       Confirmed = GTI observed exploitation or credible reporting of
+       active exploitation. Wide = exploitation on a wide scale. Treating
+       either as "in the wild = no" contradicts the GUI.
+    3. CISA KEV membership (``cisa_known_exploited`` present) or an
+       equivalent "CISA Exploited" collection flag.
+    4. Collection tags / filters such as ``Observed In The Wild`` or
+       ``CISA Exploited``.
+
+    Exploited in the Wild = **No** only when none of those positive
+    signals are present. Missing CISA KEV is **not** proof of No if GTI
+    itself marks wild exploitation (state Confirmed/Wide, tags, etc.).
+
+    Returns
+    -------
+    (display, sources, explicit)
+        display: ``"True"`` / ``"False"`` (CSV/HTML YES/no mapping)
+        sources: labels of signals that fired (debug / conflict note)
+        explicit: raw explicit field value if one was present, else ``"N/A"``
+    """
+    exploitation = exploitation if isinstance(exploitation, dict) else {}
+    sources: list[str] = []
+    explicit_raw = "N/A"
+
+    explicit_candidates = [
+        ("attributes.exploited_in_the_wild", attrs.get("exploited_in_the_wild")),
+        ("attributes.observed_in_the_wild", attrs.get("observed_in_the_wild")),
+        ("attributes.exploited_in_wild", attrs.get("exploited_in_wild")),
+        ("exploitation.exploited_in_the_wild", exploitation.get("exploited_in_the_wild")),
+        ("exploitation.observed_in_the_wild", exploitation.get("observed_in_the_wild")),
+        ("exploitation.in_the_wild", exploitation.get("in_the_wild")),
+    ]
+    for label, val in explicit_candidates:
+        if val is None or val == "":
+            continue
+        if explicit_raw == "N/A":
+            explicit_raw = na(val)
+        if _truthy_flag(val):
+            sources.append(f"{label}={val!r}")
+
+    # Nested exploitation / attributes keys that mention "wild"
+    seen_paths = {s.split("=")[0] for s in sources}
+    for path, val in _walk_wild_keys({"attributes": attrs, "exploitation": exploitation}):
+        short = path
+        if short in seen_paths:
+            continue
+        if val is None or val == "":
+            continue
+        if explicit_raw == "N/A" and not isinstance(val, (dict, list)):
+            explicit_raw = na(val)
+        if _truthy_flag(val):
+            sources.append(f"{path}={val!r}")
+            seen_paths.add(short)
+
+    _, state_label = normalize_exploitation_state(exploitation_state)
+    if _norm_label(state_label) in WILD_EXPLOITATION_STATES:
+        sources.append(f"exploitation_state={state_label}")
+
+    if cisa_kev:
+        sources.append("cisa_known_exploited")
+
+    for tag in _tag_list(tags):
+        if _norm_label(tag) in WILD_COLLECTION_TAGS:
+            sources.append(f"tag={tag}")
+
+    display = "True" if sources else "False"
+    # Deduplicate while preserving order
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for item in sources:
+        if item not in seen:
+            seen.add(item)
+            uniq.append(item)
+    return display, uniq, explicit_raw
+
+
+def exploitation_debug_snapshot(attrs: dict[str, Any]) -> dict[str, Any]:
+    """Small dict of exploitation-related keys for DEBUG logs (never HTML)."""
+    exploitation = attrs.get("exploitation") if isinstance(attrs.get("exploitation"), dict) else {}
+    kev = attrs.get("cisa_known_exploited")
+    snap: dict[str, Any] = {
+        "exploitation_state": attrs.get("exploitation_state"),
+        "exploit_availability": attrs.get("exploit_availability"),
+        "exploitation_keys": sorted(exploitation.keys()) if exploitation else [],
+        "exploitation_nested": {
+            k: exploitation.get(k)
+            for k in (
+                "exploitation_state",
+                "exploit_availability",
+                "exploited_in_the_wild",
+                "observed_in_the_wild",
+                "in_the_wild",
+                "first_exploitation",
+                "exploit_release_date",
+            )
+            if k in exploitation
+        },
+        "explicit_exploited_in_the_wild": attrs.get("exploited_in_the_wild"),
+        "explicit_observed_in_the_wild": attrs.get("observed_in_the_wild"),
+        "cisa_known_exploited_present": bool(isinstance(kev, dict) and kev),
+        "tags": attrs.get("tags"),
+        "wild_key_hits": [
+            {"path": p, "value": v}
+            for p, v in _walk_wild_keys(attrs)
+            if not isinstance(v, (dict, list))
+        ],
+        "attr_keys_matching_exploit": sorted(
+            k for k in attrs.keys() if "exploit" in str(k).lower() or "wild" in str(k).lower()
+        ),
+    }
+    return snap
+
+
+def log_exploitation_debug(cve: str, attrs: dict[str, Any]) -> None:
+    """DEBUG-only dump of exploitation keys. Never written into the HTML report."""
+    if not logging.getLogger().isEnabledFor(logging.DEBUG):
+        return
+    try:
+        snap = exploitation_debug_snapshot(attrs)
+        logging.debug("Exploitation source keys for %s: %s", cve, json.dumps(snap, default=str)[:4000])
+    except (TypeError, ValueError):
+        logging.debug("Exploitation source keys for %s: <unserializable>", cve)
+
+
+# ---------------------------------------------------------------------------
+# IoC relationship parsing
+# ---------------------------------------------------------------------------
+# ``counters.iocs`` / ``files_count`` are *counts only*. Actual indicators
+# live on collection relationships: files, urls, domains, ip_addresses.
+# ---------------------------------------------------------------------------
+
+
+def parse_relationship_iocs(relationship: str, payload: Optional[dict[str, Any]]) -> list[dict[str, str]]:
+    """Flatten a GTI relationship response into display-ready IoC dicts."""
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return []
+    parsed: list[dict[str, str]] = []
+    for obj in rows:
+        if not isinstance(obj, dict) or obj.get("error"):
+            continue
+        item = _parse_one_ioc(relationship, obj)
+        if item:
+            parsed.append(item)
+        if len(parsed) >= IOC_DISPLAY_CAP:
+            break
+    return parsed
+
+
+def _parse_one_ioc(relationship: str, obj: dict[str, Any]) -> Optional[dict[str, str]]:
+    attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+    obj_id = str(obj.get("id") or "").strip()
+    rel = relationship.lower()
+    if rel == "files":
+        sha256 = str(attrs.get("sha256") or obj_id)
+        if not sha256:
+            return None
+        sha1 = str(attrs.get("sha1") or "")
+        md5 = str(attrs.get("md5") or "")
+        name = str(attrs.get("meaningful_name") or "")
+        if not name:
+            names = attrs.get("names") if isinstance(attrs.get("names"), list) else []
+            name = str(names[0]) if names else ""
+        ftype = str(attrs.get("type_description") or attrs.get("type_tag") or "")
+        return {
+            "id": sha256,
+            "sha256": sha256,
+            "sha1": sha1,
+            "md5": md5,
+            "name": name,
+            "type": ftype,
+            "display": sha256,
+            "vt_url": f"https://www.virustotal.com/gui/file/{sha256}",
+        }
+    if rel == "urls":
+        url = str(attrs.get("url") or attrs.get("last_final_url") or "")
+        display = url or obj_id
+        if not display:
+            return None
+        vt_id = obj_id
+        return {
+            "id": obj_id,
+            "url": url,
+            "display": display,
+            "vt_url": f"https://www.virustotal.com/gui/url/{vt_id}" if vt_id else "",
+        }
+    if rel == "domains":
+        domain = str(attrs.get("id") or obj_id)
+        if not domain:
+            return None
+        return {
+            "id": domain,
+            "display": domain,
+            "vt_url": f"https://www.virustotal.com/gui/domain/{domain}",
+        }
+    if rel in {"ip_addresses", "ip_address"}:
+        ip = str(attrs.get("ip_address") or attrs.get("id") or obj_id)
+        if not ip:
+            return None
+        return {
+            "id": ip,
+            "display": ip,
+            "vt_url": f"https://www.virustotal.com/gui/ip-address/{ip}",
+        }
+    return None
+
+
+def ioc_counter_breakdown(attrs: dict[str, Any]) -> dict[str, int]:
+    """Read per-type IoC totals from ``counters`` (preferred) or collection counts."""
+    counters = attrs.get("counters") if isinstance(attrs.get("counters"), dict) else {}
+    files_n = _as_nonneg_int(_first(counters.get("files"), attrs.get("files_count"), default=0))
+    urls_n = _as_nonneg_int(_first(counters.get("urls"), attrs.get("urls_count"), default=0))
+    domains_n = _as_nonneg_int(_first(counters.get("domains"), attrs.get("domains_count"), default=0))
+    ips_n = _as_nonneg_int(
+        _first(counters.get("ip_addresses"), attrs.get("ip_addresses_count"), default=0)
+    )
+    total = _as_nonneg_int(_first(counters.get("iocs"), default=files_n + urls_n + domains_n + ips_n))
+    return {
+        "files": files_n,
+        "urls": urls_n,
+        "domains": domains_n,
+        "ip_addresses": ips_n,
+        "iocs": total,
+    }
+
+
+def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) -> None:
+    """Fetch relationship IoCs when GTI reports a non-zero count.
+
+    Uses the same session (proxy, CA bundle, throttle, retries) as the
+    collection GET. Failures to list IoCs do not fail the CVE record —
+    the count still appears and the list is left empty.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    attrs = (data.get("attributes") if isinstance(data, dict) else None) or {}
+    if not isinstance(attrs, dict):
+        attrs = {}
+    counts = ioc_counter_breakdown(attrs)
+    rec.ioc_files_total = counts["files"]
+    rec.ioc_urls_total = counts["urls"]
+    rec.ioc_domains_total = counts["domains"]
+    rec.ioc_ip_addresses_total = counts["ip_addresses"]
+    if rec.ioc_count in {"N/A", ""} and counts["iocs"]:
+        rec.ioc_count = str(counts["iocs"])
+
+    wanted: list[str] = [rel for rel in IOC_RELATIONSHIPS if counts.get(rel, 0) > 0]
+    if not wanted and counts["iocs"] > 0:
+        # Breakdown missing; probe all types and omit empty results later.
+        wanted = list(IOC_RELATIONSHIPS)
+
+    field_by_rel = {
+        "files": "ioc_files",
+        "urls": "ioc_urls",
+        "domains": "ioc_domains",
+        "ip_addresses": "ioc_ip_addresses",
+    }
+    for rel in wanted:
+        body, err, status = client.get_relationship(rec.cve, rel, limit=IOC_DISPLAY_CAP)
+        if err or not isinstance(body, dict):
+            logging.warning(
+                "Could not list %s IoCs for %s (status=%s, err=%s)",
+                rel,
+                rec.cve,
+                status,
+                err,
+            )
+            continue
+        items = parse_relationship_iocs(rel, body)
+        setattr(rec, field_by_rel[rel], items)
+        meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+        meta_count = _as_nonneg_int(meta.get("count"))
+        total_attr = f"ioc_{rel}_total" if rel != "ip_addresses" else "ioc_ip_addresses_total"
+        current_total = getattr(rec, total_attr)
+        if meta_count > current_total:
+            setattr(rec, total_attr, meta_count)
+        logging.debug("Fetched %d %s IoC(s) for %s (total=%s)", len(items), rel, rec.cve, getattr(rec, total_attr))
 
 
 # ---------------------------------------------------------------------------
@@ -932,9 +1385,10 @@ class GTIClient:
         if elapsed < self.delay:
             time.sleep(self.delay - elapsed)
 
-    def get_vulnerability(self, cve: str) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
+    def _get_json(self, url: str, *, context: str) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
         """
-        Fetch vulnerability collection for a CVE.
+        GET ``url`` with the same throttle / retry / proxy / CA-bundle behavior
+        used for vulnerability collection fetches.
 
         Returns:
             (json_body | None, error_kind | None, http_status)
@@ -946,9 +1400,6 @@ class GTIClient:
         exponential backoff + jitter so concurrent analyst runs do not
         thundering-herd the API.
         """
-        object_id = cve_api_id(cve)
-        url = f"{self.base_url}/collections/{object_id}"
-
         for attempt in range(1, self.max_retries + 1):
             self._throttle()
             try:
@@ -960,7 +1411,7 @@ class GTIClient:
                 wait = self.backoff_base**attempt + random.uniform(0, 1)
                 logging.warning(
                     "Network error for %s (attempt %d): %s — retrying in %.1fs",
-                    cve,
+                    context,
                     attempt,
                     exc,
                     wait,
@@ -979,14 +1430,14 @@ class GTIClient:
             if resp.status_code == 404:
                 # CVE not in GTI collections (too new, unpublished, or out of coverage)
                 body_preview = _safe_error_body(resp)
-                logging.info("404 Not Found for %s — %s", cve, body_preview)
+                logging.info("404 Not Found for %s — %s", context, body_preview)
                 return None, "not_found", 404
 
             if resp.status_code in (401, 403):
                 # Almost always license/privilege rather than a bad CVE ID
                 body_preview = _safe_error_body(resp)
                 msg = (
-                    f"HTTP {resp.status_code}: access denied for {cve}. "
+                    f"HTTP {resp.status_code}: access denied for {context}. "
                     "Vulnerability Intelligence requires a Google Threat Intelligence "
                     "(GTI) Enterprise or Enterprise Plus license. "
                     f"API detail: {body_preview}"
@@ -1003,7 +1454,7 @@ class GTIClient:
                     wait = self.backoff_base**attempt + random.uniform(0, 2)
                 logging.warning(
                     "Rate limited (429) on %s — attempt %d/%d, sleeping %.1fs",
-                    cve,
+                    context,
                     attempt,
                     self.max_retries,
                     wait,
@@ -1020,7 +1471,7 @@ class GTIClient:
                 logging.warning(
                     "Server error %s for %s — retrying in %.1fs (%s)",
                     resp.status_code,
-                    cve,
+                    context,
                     wait,
                     body_preview,
                 )
@@ -1029,13 +1480,37 @@ class GTIClient:
 
             logging.error(
                 "Error fetching %s: HTTP %s — %s",
-                cve,
+                context,
                 resp.status_code,
                 body_preview,
             )
             return None, "error", resp.status_code
 
         return None, "error", 0
+
+    def get_vulnerability(self, cve: str) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
+        """Fetch the vulnerability collection object for a CVE."""
+        object_id = cve_api_id(cve)
+        url = f"{self.base_url}/collections/{object_id}"
+        return self._get_json(url, context=cve)
+
+    def get_relationship(
+        self,
+        cve: str,
+        relationship: str,
+        *,
+        limit: int = IOC_DISPLAY_CAP,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
+        """Fetch a collection relationship (files / urls / domains / ip_addresses).
+
+        Full related objects (not descriptors-only) so file names, hashes, and
+        URL strings are available for the HTML IoC section. Same TLS/proxy/
+        retry path as ``get_vulnerability``.
+        """
+        object_id = cve_api_id(cve)
+        rel = relationship.strip().strip("/")
+        url = f"{self.base_url}/collections/{object_id}/{rel}?limit={int(limit)}"
+        return self._get_json(url, context=f"{cve}/{rel}")
 
 
 def _safe_error_body(resp: requests.Response, limit: int = 300) -> str:
@@ -1184,21 +1659,16 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
 
     # --- Exploitation (fields may sit at top level or under attributes.exploitation) ---
     exploitation = attrs.get("exploitation") if isinstance(attrs.get("exploitation"), dict) else {}
-    exploitation_state = _first(
+    exploitation_state_raw = _first(
         attrs.get("exploitation_state"),
         exploitation.get("exploitation_state"),
-        default="N/A",
+        default=None,
     )
+    state_level, state_label = normalize_exploitation_state(exploitation_state_raw)
     exploit_availability = _first(
         attrs.get("exploit_availability"),
         exploitation.get("exploit_availability"),
         default="N/A",
-    )
-    exploited_in_wild = _first(
-        attrs.get("exploited_in_the_wild"),
-        attrs.get("observed_in_the_wild"),
-        exploitation.get("exploited_in_the_wild"),
-        default=False,
     )
     exploited_zero_day = _first(
         attrs.get("exploited_as_zero_day"),
@@ -1206,10 +1676,6 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         exploitation.get("exploited_as_zero_day"),
         default=False,
     )
-
-    # We do **not** infer exploited_in_the_wild from Exploitation State.
-    # Wide/Confirmed often implies real-world use, but an explicit API
-    # False/absent must be preserved so the report does not contradict GTI.
 
     # --- CISA KEV (presence of the object means "on the KEV list") ---
     kev = attrs.get("cisa_known_exploited")
@@ -1224,6 +1690,17 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         cisa_due = "N/A"
         cisa_ransom = "N/A"
 
+    # Exploited in the Wild is a GUI-derived flag, not a documented first-class
+    # Vulnerability attribute. See derive_exploited_in_the_wild() for the rule.
+    log_exploitation_debug(cve, attrs)
+    exploited_in_wild, wild_sources, wild_explicit = derive_exploited_in_the_wild(
+        attrs,
+        exploitation=exploitation,
+        exploitation_state=exploitation_state_raw,
+        cisa_kev=cisa_kev,
+        tags=attrs.get("tags"),
+    )
+
     # --- Risk / priority ---
     # API documents priority as boolean; the GTI UI shows P0–P4 — we derive that.
     risk_rating = na(attrs.get("risk_rating"))
@@ -1237,7 +1714,7 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
 
     priority_rating = derive_priority_rating(
         risk_rating,
-        str(exploitation_state),
+        str(exploitation_state_raw) if exploitation_state_raw is not None else "N/A",
         str(exploit_availability),
     )
     # Prefer an explicit P0–P4 string if the API ever supplies one
@@ -1250,8 +1727,8 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
     # --- CWE ---
     cwe = attrs.get("cwe") if isinstance(attrs.get("cwe"), dict) else {}
 
-    # --- Counters (IoCs, etc.) ---
-    counters = attrs.get("counters") if isinstance(attrs.get("counters"), dict) else {}
+    # --- Counters (IoCs, etc.) — counts only; objects come from relationships ---
+    ioc_counts = ioc_counter_breakdown(attrs)
 
     # --- Narrative fields ---
     description = na(attrs.get("description"))
@@ -1266,9 +1743,12 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         risk_rating=risk_rating,
         predicted_risk_rating=predicted,
         risk_factors=risk_factors,
-        exploitation_state=na(exploitation_state),
+        exploitation_state=state_label,
+        exploitation_state_level="N/A" if state_level is None else str(state_level),
         exploit_availability=na(exploit_availability),
-        exploited_in_the_wild=na(exploited_in_wild, default="False"),
+        exploited_in_the_wild=exploited_in_wild,
+        exploited_in_the_wild_sources="; ".join(wild_sources),
+        exploited_in_the_wild_explicit=wild_explicit,
         exploited_as_zero_day=na(exploited_zero_day, default="False"),
         exploitation_consequence=na(attrs.get("exploitation_consequence")),
         exploitation_vectors=na(attrs.get("exploitation_vectors")),
@@ -1305,7 +1785,11 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         creation_date=fmt_ts(attrs.get("creation_date")),
         last_modification_date=fmt_ts(attrs.get("last_modification_date")),
         origin=na(attrs.get("origin")),
-        ioc_count=na(counters.get("iocs")),
+        ioc_count=na(ioc_counts["iocs"]),
+        ioc_files_total=ioc_counts["files"],
+        ioc_urls_total=ioc_counts["urls"],
+        ioc_domains_total=ioc_counts["domains"],
+        ioc_ip_addresses_total=ioc_counts["ip_addresses"],
         vt_url=f"https://www.virustotal.com/gui/collection/{cve_api_id(cve)}",
     )
 
@@ -1320,6 +1804,8 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         "epss_raw": epss,
         "cisa_known_exploited_raw": kev if isinstance(kev, dict) else None,
         "exploitation_raw": exploitation,
+        "exploited_in_the_wild_derived": exploited_in_wild,
+        "exploited_in_the_wild_sources": wild_sources,
     }
     try:
         rec.extra_json = json.dumps(extra, default=str)[:4000]
@@ -1481,7 +1967,6 @@ def render_rich_card(rec: CVERecord) -> Panel:
     meta = Table(box=box.SIMPLE, show_header=False, expand=True)
     meta.add_column("K", style="bold")
     meta.add_column("V")
-    meta.add_row("MVE ID", rec.mve_id)
     meta.add_row("CWE", f"{rec.cwe_id} — {rec.cwe_title}" if rec.cwe_id != "N/A" else "N/A")
     meta.add_row("Disclosure", rec.date_of_disclosure)
     meta.add_row("Last Modified", rec.last_modification_date)
@@ -1586,6 +2071,207 @@ def _html_bool(value: str) -> str:
     if v in {"false", "no", "0"}:
         return '<span class="badge badge-muted">no</span>'
     return f'<span class="badge badge-muted">{_html_escape(str(value))}</span>'
+
+
+EXPLOITATION_STATE_DEFINITION = (
+    "Indicates our knowledge of the current exploitation landscape, and whether "
+    "a vulnerability is known or suspected to be exploited."
+)
+EXPLOITATION_STATE_LEGEND = (
+    "0 = No Known\n"
+    "1 = Suspected\n"
+    "2 = Reported\n"
+    "3 = Confirmed\n"
+    "4 = Wide"
+)
+PRIORITY_VIZ_CAPTION = (
+    "Vulnerability severity visualization is based on (1) its potential impact, "
+    "(2) whether a functional exploit exists and is accessible to potential attackers, "
+    "(3) whether it is being actively used by attackers in real-world attacks."
+)
+
+
+def _html_info_icon(tooltip_text: str, *, aria_label: str) -> str:
+    """Self-contained info icon with title + CSS hover/focus tooltip (no JS framework)."""
+    title = _html_escape(tooltip_text)
+    # Preserve line breaks inside the CSS tooltip bubble.
+    body = "<br/>".join(_html_escape(line) if line else "&nbsp;" for line in tooltip_text.split("\n"))
+    return (
+        f'<span class="info-tip" tabindex="0" title="{title}" '
+        f'role="img" aria-label="{_html_escape(aria_label)}">'
+        f'<span class="info-tip-mark" aria-hidden="true">i</span>'
+        f'<span class="info-tip-bubble">{body}</span>'
+        f"</span>"
+    )
+
+
+def _html_exploit_state_class(state: str) -> str:
+    key = _norm_label(state).replace(" ", "")
+    return {
+        "wide": "wide",
+        "confirmed": "confirmed",
+        "reported": "reported",
+        "suspected": "suspected",
+        "noknown": "noknown",
+        "unknown": "unknown",
+    }.get(key, "unknown")
+
+
+def _html_priority_viz(rec: CVERecord) -> str:
+    """P0–P4 visualization plus the three GTI inputs (impact, exploit access, real-world use)."""
+    pri_cls = _html_risk_class(rec.priority_rating)
+    cvss_bits = []
+    if rec.cvss_v3_base != "N/A":
+        cvss_bits.append(f"CVSSv3.1 {_html_escape(rec.cvss_v3_base)}")
+    if rec.cvss_v4_score != "N/A":
+        cvss_bits.append(f"CVSSv4 {_html_escape(rec.cvss_v4_score)}")
+    cvss_line = " · ".join(cvss_bits) if cvss_bits else "N/A"
+    tip = _html_info_icon(PRIORITY_VIZ_CAPTION, aria_label="Priority visualization criteria")
+    return f"""
+  <section class="priority-viz" aria-label="Priority visualization">
+    <div class="priority-viz-head">
+      <h3>Priority visualization {tip}</h3>
+      <span class="badge badge-{pri_cls} badge-lg">{_html_escape(rec.priority_rating)}</span>
+    </div>
+    <p class="priority-viz-caption">{_html_escape(PRIORITY_VIZ_CAPTION)}</p>
+    <div class="priority-inputs">
+      <div class="priority-input">
+        <div class="metric-label">1 · Potential impact</div>
+        <div class="metric-value-sm">{_html_escape(rec.risk_rating)}</div>
+        <div class="metric-sub">Risk rating {_html_escape(rec.risk_rating)}
+          · Predicted {_html_escape(rec.predicted_risk_rating)}
+          · {cvss_line}</div>
+      </div>
+      <div class="priority-input">
+        <div class="metric-label">2 · Exploit accessibility</div>
+        <div class="metric-value-sm">{_html_escape(rec.exploit_availability)}</div>
+        <div class="metric-sub">Whether a functional exploit exists and is accessible to attackers</div>
+      </div>
+      <div class="priority-input">
+        <div class="metric-label">3 · Real-world use</div>
+        <div class="metric-value-sm">{_html_escape(rec.exploitation_state)}
+          · {_html_bool(rec.exploited_in_the_wild)}</div>
+        <div class="metric-sub">Exploitation state + exploited in the wild</div>
+      </div>
+    </div>
+  </section>
+"""
+
+
+def _html_wild_conflict_note(rec: CVERecord) -> str:
+    """Surface explicit-vs-derived disagreement instead of silently showing No."""
+    explicit = (rec.exploited_in_the_wild_explicit or "N/A").strip()
+    derived = rec.exploited_in_the_wild
+    if explicit in {"N/A", ""}:
+        return ""
+    explicit_yes = explicit.lower() in {"true", "yes", "1"}
+    derived_yes = str(derived).lower() in {"true", "yes", "1"}
+    if explicit_yes == derived_yes:
+        return ""
+    sources = rec.exploited_in_the_wild_sources or "(none)"
+    return (
+        f'<div class="debug-note">API derived: {"Yes" if derived_yes else "No"} · '
+        f"explicit field: {_html_escape(explicit)} · source fields: {_html_escape(sources)}</div>"
+    )
+
+
+def _html_ioc_link(item: dict[str, str]) -> str:
+    display = _html_escape(item.get("display") or item.get("id") or "")
+    href = (item.get("vt_url") or "").strip()
+    if href:
+        return f'<a class="mono" href="{_html_escape(href)}" target="_blank" rel="noopener">{display}</a>'
+    return f'<span class="mono">{display}</span>'
+
+
+def _html_ioc_table(
+    title: str,
+    items: list[dict[str, str]],
+    total: int,
+    *,
+    kind: str,
+) -> str:
+    if not items and total <= 0:
+        return ""
+    shown = items[:IOC_DISPLAY_CAP]
+    more = max(0, total - len(shown)) if total else 0
+    if not shown:
+        return (
+            f"<h4>{_html_escape(title)} <span class='muted'>({total})</span></h4>"
+            f"<p class='muted'>Count reported by GTI, but no objects were returned for this type.</p>"
+        )
+    if kind == "files":
+        head = "<tr><th>SHA256</th><th>SHA1 / MD5</th><th>Name / type</th></tr>"
+        body_rows = []
+        for it in shown:
+            hashes = " / ".join(h for h in (it.get("sha1") or "", it.get("md5") or "") if h)
+            name = it.get("name") or ""
+            ftype = it.get("type") or ""
+            name_type = " · ".join(p for p in (name, ftype) if p) or "—"
+            body_rows.append(
+                "<tr>"
+                f"<td>{_html_ioc_link(it)}</td>"
+                f"<td class='mono muted'>{_html_escape(hashes) if hashes else '—'}</td>"
+                f"<td>{_html_escape(name_type)}</td>"
+                "</tr>"
+            )
+        body = "".join(body_rows)
+    else:
+        head = "<tr><th>Indicator</th></tr>"
+        body = "".join(f"<tr><td>{_html_ioc_link(it)}</td></tr>" for it in shown)
+    more_line = ""
+    if more > 0:
+        more_line = (
+            f"<p class='muted ioc-more'>and {more} more "
+            f"(showing {len(shown)} of {total})</p>"
+        )
+    return f"""
+    <h4>{_html_escape(title)} <span class="muted">({total or len(shown)})</span></h4>
+    <div class="ioc-wrap">
+      <table class="ioc">{head}{body}</table>
+    </div>
+    {more_line}
+"""
+
+
+def _html_ioc_section(rec: CVERecord) -> str:
+    """Render associated IoCs by type; omit empty subtypes and the section if none."""
+    blocks = [
+        _html_ioc_table("Files", rec.ioc_files, rec.ioc_files_total, kind="files"),
+        _html_ioc_table("URLs", rec.ioc_urls, rec.ioc_urls_total, kind="urls"),
+        _html_ioc_table("Domains", rec.ioc_domains, rec.ioc_domains_total, kind="domains"),
+        _html_ioc_table(
+            "IP addresses", rec.ioc_ip_addresses, rec.ioc_ip_addresses_total, kind="ips"
+        ),
+    ]
+    nonempty = [b for b in blocks if b]
+    total_label = rec.ioc_count if rec.ioc_count not in {"N/A", ""} else ""
+    if nonempty:
+        count_bit = f' <span class="muted">({_html_escape(str(total_label))})</span>' if total_label else ""
+        return f"""
+  <section class="iocs">
+    <h3>Indicators of Compromise{count_bit}</h3>
+    {"".join(nonempty)}
+  </section>
+"""
+    reported = rec.ioc_files_total + rec.ioc_urls_total + rec.ioc_domains_total + rec.ioc_ip_addresses_total
+    if reported <= 0:
+        try:
+            reported = int(rec.ioc_count) if rec.ioc_count not in {"N/A", ""} else 0
+        except (TypeError, ValueError):
+            reported = 0
+    if reported > 0:
+        return f"""
+  <section class="iocs">
+    <h3>Indicators of Compromise <span class="muted">({_html_escape(str(reported))})</span></h3>
+    <p class="muted">GTI reports {reported} associated IoC(s), but no relationship objects were returned.</p>
+  </section>
+"""
+    return """
+  <section class="iocs">
+    <h3>Indicators of Compromise</h3>
+    <p class="muted">No associated IoCs returned by GTI.</p>
+  </section>
+"""
 
 
 def render_html_report(
@@ -1699,6 +2385,21 @@ def render_html_report(
             else "<li class='muted'>N/A</li>"
         )
 
+        state_tip_text = f"{EXPLOITATION_STATE_DEFINITION}\n\n{EXPLOITATION_STATE_LEGEND}"
+        state_icon = _html_info_icon(
+            state_tip_text,
+            aria_label=EXPLOITATION_STATE_DEFINITION,
+        )
+        state_cls = _html_exploit_state_class(rec.exploitation_state)
+        level_bit = (
+            f'<span class="muted"> (level { _html_escape(rec.exploitation_state_level)})</span>'
+            if rec.exploitation_state_level not in {"N/A", ""}
+            else ""
+        )
+        wild_note = _html_wild_conflict_note(rec)
+        ioc_section = _html_ioc_section(rec)
+        priority_viz = _html_priority_viz(rec)
+
         cards.append(
             f"""
 <article class="card risk-{risk_cls}">
@@ -1712,6 +2413,8 @@ def render_html_report(
       <span class="badge badge-{risk_cls}">{_html_escape(rec.risk_rating)}</span>
     </div>
   </header>
+
+  {priority_viz}
 
   <section class="grid-3">
     <div class="metric">
@@ -1735,9 +2438,12 @@ def render_html_report(
     <div>
       <h3>Exploitation</h3>
       <table class="kv">
-        <tr><th>State</th><td><strong>{_html_escape(rec.exploitation_state)}</strong></td></tr>
-        <tr><th>Availability</th><td>{_html_escape(rec.exploit_availability)}</td></tr>
-        <tr><th>In the Wild</th><td>{_html_bool(rec.exploited_in_the_wild)}</td></tr>
+        <tr>
+          <th>Exploitation State {state_icon}</th>
+          <td><strong class="exploit-state exploit-{state_cls}">{_html_escape(rec.exploitation_state)}</strong>{level_bit}</td>
+        </tr>
+        <tr><th>Exploit Availability</th><td>{_html_escape(rec.exploit_availability)}</td></tr>
+        <tr><th>Exploited in the Wild</th><td>{_html_bool(rec.exploited_in_the_wild)}{wild_note}</td></tr>
         <tr><th>Zero Day</th><td>{_html_bool(rec.exploited_as_zero_day)}</td></tr>
         <tr><th>Consequence</th><td>{_html_escape(rec.exploitation_consequence)}</td></tr>
         <tr><th>Vectors</th><td>{_html_escape(rec.exploitation_vectors)}</td></tr>
@@ -1752,12 +2458,12 @@ def render_html_report(
         <tr><th>KEV Added</th><td>{_html_escape(rec.cisa_added_date)}</td></tr>
         <tr><th>KEV Due</th><td>{_html_escape(rec.cisa_due_date)}</td></tr>
         <tr><th>Ransomware</th><td>{_html_escape(rec.cisa_ransomware_use)}</td></tr>
-        <tr><th>MVE ID</th><td>{_html_escape(rec.mve_id)}</td></tr>
         <tr><th>CWE</th><td>{_html_escape(rec.cwe_id)} — {_html_escape(rec.cwe_title)}</td></tr>
         <tr><th>Disclosure</th><td>{_html_escape(rec.date_of_disclosure)}</td></tr>
         <tr><th>Last Modified</th><td>{_html_escape(rec.last_modification_date)}</td></tr>
         <tr><th>IoCs</th><td>{_html_escape(rec.ioc_count)}</td></tr>
         <tr><th>API priority</th><td>{_html_escape(rec.priority_raw)}</td></tr>
+        <tr><th>VT collection</th><td><a href="{_html_escape(rec.vt_url)}" target="_blank" rel="noopener">Open in VirusTotal</a></td></tr>
       </table>
     </div>
   </section>
@@ -1776,6 +2482,8 @@ def render_html_report(
     <h3>Affected Products <span class="muted">({rec.affected_products_count})</span></h3>
     {products_html}
   </section>
+
+  {ioc_section}
 
   <footer class="card-footer">
     <a href="{_html_escape(rec.vt_url)}" target="_blank" rel="noopener">Open in VirusTotal / GTI ↗</a>
@@ -2005,6 +2713,138 @@ def render_html_report(
     border-top: 1px solid var(--border);
     padding-top: 1rem;
   }}
+  .info-tip {{
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.05rem;
+    height: 1.05rem;
+    margin-left: 0.25rem;
+    vertical-align: middle;
+    cursor: help;
+    outline: none;
+  }}
+  .info-tip-mark {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.05rem;
+    height: 1.05rem;
+    border-radius: 50%;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-size: 0.68rem;
+    font-weight: 800;
+    font-style: italic;
+    line-height: 1;
+    background: #0c1929;
+  }}
+  .info-tip-bubble {{
+    display: none;
+    position: absolute;
+    z-index: 30;
+    left: 0;
+    top: calc(100% + 8px);
+    width: 22rem;
+    max-width: min(22rem, 75vw);
+    padding: 0.7rem 0.85rem;
+    background: #0b0f18;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 0.78rem;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    line-height: 1.45;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+    white-space: normal;
+  }}
+  .info-tip:hover .info-tip-bubble,
+  .info-tip:focus .info-tip-bubble,
+  .info-tip:focus-within .info-tip-bubble {{
+    display: block;
+  }}
+  .exploit-state.exploit-wide {{ color: #f87171; }}
+  .exploit-state.exploit-confirmed {{ color: #fb923c; }}
+  .exploit-state.exploit-reported {{ color: #fbbf24; }}
+  .exploit-state.exploit-suspected {{ color: #93c5fd; }}
+  .exploit-state.exploit-noknown,
+  .exploit-state.exploit-unknown {{ color: var(--muted); }}
+  .priority-viz {{
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0.85rem 1rem 1rem;
+    margin-bottom: 1rem;
+  }}
+  .priority-viz-head {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+  }}
+  .priority-viz-head h3 {{ margin: 0; }}
+  .priority-viz-caption {{
+    color: var(--muted);
+    font-size: 0.82rem;
+    margin: 0.55rem 0 0.8rem;
+  }}
+  .priority-inputs {{
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.65rem;
+  }}
+  .priority-input {{
+    background: #0f172a;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.65rem 0.75rem;
+  }}
+  .metric-value-sm {{
+    font-size: 1.02rem;
+    font-weight: 700;
+    margin-top: 0.2rem;
+  }}
+  @media (max-width: 800px) {{
+    .priority-inputs {{ grid-template-columns: 1fr; }}
+  }}
+  .debug-note {{
+    margin-top: 0.35rem;
+    font-size: 0.75rem;
+    color: #fcd34d;
+  }}
+  table.ioc {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }}
+  table.ioc th {{
+    text-align: left;
+    color: var(--muted);
+    font-weight: 600;
+    padding: 0.35rem 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }}
+  table.ioc td {{
+    padding: 0.35rem 0.5rem;
+    border-bottom: 1px solid #1e293b;
+    vertical-align: top;
+    word-break: break-all;
+  }}
+  .ioc-wrap {{
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #0f172a;
+  }}
+  h4 {{
+    margin: 0.85rem 0 0.4rem;
+    font-size: 0.88rem;
+    color: var(--text);
+  }}
+  .ioc-more {{ margin: 0.4rem 0 0.2rem; font-size: 0.8rem; }}
 </style>
 </head>
 <body>
@@ -2205,6 +3045,10 @@ def enrich_cves(
             body, err, status = client.get_vulnerability(cve)
             if err is None and body is not None:
                 rec = extract_record(cve, body)
+                try:
+                    attach_iocs(client, rec, body)
+                except Exception as ioc_exc:  # noqa: BLE001 — IoC list is optional
+                    logging.warning("IoC relationship fetch failed for %s: %s", cve, ioc_exc)
                 records.append(rec)
                 logging.info(
                     "  → %s | risk=%s | priority=%s | EPSS=%s | KEV=%s",
