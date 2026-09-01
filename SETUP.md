@@ -192,7 +192,7 @@ If a configured path does not exist, the run fails with a clear message (and sti
 From the project directory, with `.env` filled in and the CA file in place:
 
 ```powershell
-python cve_enricher.py --input cve_list.csv --output cve_enriched.csv --html report.html
+python cve_enricher.py -i cve_list.csv --output cve_enriched.csv --html report.html
 ```
 
 What you should see:

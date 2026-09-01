@@ -214,11 +214,18 @@ python cve_enricher.py
 python cve_enricher.py -i cve_list.csv -o cve_enriched.csv --html report.html -v
 ```
 
+**Single CVE (`--input` wins over the CSV from `-i`):**
+
+```powershell
+python cve_enricher.py --input CVE-2026-12345
+```
+
 ### Command-line arguments
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-i` / `--input` | Input CSV of CVE IDs | `cve_list.csv` |
+| `--input CVE` | Single CVE identifier to enrich (example: `CVE-2026-12345`). When set, this ID is the sole target and the CSV from `-i` is ignored. | none |
+| `-i FILE` | Input CSV of CVE IDs (ignored when `--input` is set) | `cve_list.csv` |
 | `-o` / `--output` | Enriched CSV path | `cve_enriched.csv` |
 | `--html PATH` | HTML report path (always written) | `report.html` |
 | `--no-open` | Write HTML but do not open a browser | off |
@@ -270,17 +277,17 @@ Use `--no-open` only for automation/CI; the file is still written so you can ope
 
 These rules are implemented in `cve_enricher.py` (extraction + HTML template). They exist because the GTI GUI and the collections JSON do not always share a 1:1 field.
 
-**MVE identifier.** Mandiant/GTI `mve_id` is still parsed internally (CSV) but is **not** shown in the HTML or Rich report. CVE is the only identifier on the card. Context still includes CWE, disclosure/last-modified dates, products, risk factors, and the VirusTotal collection URL.
+**CVE identifier.** CVE is the canonical vulnerability identifier in the API mapping, internal record, CSV, terminal output, and HTML report. Context still includes CWE, disclosure/last-modified dates, products, risk factors, and the VirusTotal collection URL.
 
-**IoCs.** `counters.iocs` / `files_count` / etc. are counts only. When a count is greater than zero the client fetches relationship objects (`files`, `urls`, `domains`, `ip_addresses`) using the same proxy, corporate CA bundle, throttle, and retry path as the collection GET. The HTML **Indicators of Compromise** section lists them by type (empty types omitted). Lists are capped at 25 rows per type with “and N more”. If GTI returns no IoCs, the section shows a single muted line.
+**IOCs.** `counters.iocs` / `files_count` / etc. are counts only. When a count is greater than zero the client fetches relationship objects (`files`, `urls`, `domains`, `ip_addresses`) using the same proxy, corporate CA bundle, throttle, and retry path as the collection GET. The HTML **Indicators of Compromise** section lists them by type (empty types omitted). Lists are capped at 25 rows per type with “and N more”. Explicit zero, absent counters, request failure, and response-parsing failure are retained as distinct statuses so an error is never reported as “no associated IOCs.”
 
 **Exploitation State.** The value is shown with the existing color treatment plus an info icon. Tooltip text is the official definition (“Indicates our knowledge of the current exploitation landscape…”) and the level legend: 0 = No Known, 1 = Suspected, 2 = Reported, 3 = Confirmed, 4 = Wide. Missing or unrecognized API values render as **Unknown**, not “No Known”.
 
 **Priority visualization.** A dedicated block near the header shows the P0–P4 badge and the three GTI inputs: potential impact (risk / predicted risk / CVSS), exploit accessibility (exploit availability), and real-world use (exploitation state + exploited in the wild), with the official severity-visualization caption.
 
-**Exploited in the Wild.** GTI’s Vulnerability object does **not** document a reliable top-level `exploited_in_the_wild` field. The GUI Yes/No flag is **derived**. Yes if **any** of: an explicit true/yes wild field; `exploitation_state` in {Confirmed, Wide}; CISA KEV / “CISA Exploited”; collection tags such as “Observed In The Wild”. No only when none of those signals are present. Wide/Confirmed is never treated as No. Missing CISA KEV is not treated as No if GTI itself marks wild exploitation.
+**Exploited in the Wild.** GTI’s Vulnerability object does not document a top-level `exploited_in_the_wild` attribute. The client therefore queries the documented `vulnerability_filter:"Observed In The Wild"` search filter for the exact CVE. A successful match maps to **Yes**, a successful empty result maps to **No**, and request/parsing failure maps to **Unknown**. Exploitation State, CISA KEV, and exploit availability remain independent metrics and are not substituted for this filter.
 
-Finding for **CVE-2026-34621**: the GUI showed Exploited in the Wild = Yes while an earlier report printed **no**, because the mapper defaulted a missing `attributes.exploited_in_the_wild` key to False and refused to infer from Exploitation State. Confirmed/Wide (and KEV/tags) now force Yes. A canned fixture in `tests/fixtures/cve-2026-34621.json` asserts the report field is Yes. CVE-2021-44228 (Wide + CISA KEV) is the same class of bug and is also asserted Yes. If an explicit false field disagrees with a positive derivation, the report shows a small “API derived / source fields” note instead of silently printing No. Exploitation key snapshots are DEBUG-log only — never dumped into the HTML body.
+Finding for **CVE-2026-34621**: the GUI showed Exploited in the Wild = Yes while an earlier report printed **no** because the mapper read an undocumented, absent object key with `default=False`. The corrected path is `Observed In The Wild filtered search -> exact CVE membership -> normalized three-state field -> HTML badge`. Sanitized vulnerability and filter-response fixtures cover the regression without a CVE-specific code path. Exploitation key snapshots are DEBUG-log only and never dumped into the HTML body.
 
 ---
 

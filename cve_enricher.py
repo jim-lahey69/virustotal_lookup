@@ -29,7 +29,8 @@ Copy ``.env.example`` to ``.env`` and fill in values. The script loads
 Usage
 -----
     # After creating .env with key, proxy, and optional CA path:
-    python cve_enricher.py --input cve_list.csv --output cve_enriched.csv --html report.html
+    python cve_enricher.py --input CVE-2026-12345
+    python cve_enricher.py -i cve_list.csv --output cve_enriched.csv --html report.html
 
 Corporate SSL inspection
 ------------------------
@@ -81,6 +82,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 import webbrowser
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -133,7 +135,7 @@ CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 
 # GTI priority derivation treats these labels as "no known exploit availability".
 # Values observed across GTI docs / UI wording variants.
-NO_KNOWN_ALIASES = {"", "n/a", "none", "no known", "no_known", "unknown"}
+NO_KNOWN_ALIASES = {"no known", "no_known", "no-known", "noknown"}
 
 # Official Exploitation State labels and numeric levels (GTI docs).
 # Missing / unrecognized API values display as "Unknown" — never coerced to "No Known".
@@ -154,7 +156,6 @@ EXPLOITATION_STATE_ALIASES: dict[str, int] = {
     "confirmed": 3,
     "wide": 4,
 }
-WILD_EXPLOITATION_STATES = frozenset({"confirmed", "wide"})
 WILD_COLLECTION_TAGS = frozenset(
     {
         "observed in the wild",
@@ -416,7 +417,7 @@ def describe_ssl_verify(verify: Union[bool, str]) -> str:
 # One flat record per CVE so CSV, Rich terminal cards, and the HTML report
 # all share the same fields. Nested GTI JSON is normalized here so analysts
 # (and downstream SIEM/ticketing) never have to walk the collections schema.
-# String defaults are "N/A" / "False" so empty API fields still render
+# String defaults are "N/A" / "Unknown" so empty API fields still render
 # consistently in every output format.
 # ---------------------------------------------------------------------------
 
@@ -446,10 +447,11 @@ class CVERecord:
     exploitation_state: str = "Unknown"
     exploitation_state_level: str = "N/A"  # 0–4 or N/A when Unknown
     exploit_availability: str = "N/A"
-    exploited_in_the_wild: str = "False"
-    exploited_in_the_wild_sources: str = ""  # debug: which signals fired (not shown unless conflict)
+    exploited_in_the_wild: str = "Unknown"
+    exploited_in_the_wild_status: str = "not_returned"
+    exploited_in_the_wild_sources: str = ""  # debug: authoritative field/filter source
     exploited_in_the_wild_explicit: str = "N/A"  # raw explicit field if present
-    exploited_as_zero_day: str = "False"
+    exploited_as_zero_day: str = "Unknown"
     exploitation_consequence: str = "N/A"
     exploitation_vectors: str = "N/A"
     first_exploitation: str = "N/A"
@@ -485,7 +487,6 @@ class CVERecord:
     affected_products_count: int = 0
 
     # Supporting context for triage notes and reports
-    mve_id: str = "N/A"
     name: str = "N/A"
     description: str = "N/A"
     executive_summary: str = "N/A"
@@ -501,6 +502,8 @@ class CVERecord:
     origin: str = "N/A"
     vt_url: str = "N/A"
     ioc_count: str = "N/A"
+    ioc_status: str = "not_returned"
+    ioc_error: str = ""
     # Actual IoC objects (relationship fetch). Totals come from counters; lists are capped.
     ioc_files_total: int = 0
     ioc_urls_total: int = 0
@@ -529,6 +532,7 @@ CSV_COLUMNS: list[str] = [
     "exploitation_state",
     "exploit_availability",
     "exploited_in_the_wild",
+    "exploited_in_the_wild_status",
     "exploited_as_zero_day",
     "exploitation_consequence",
     "exploitation_vectors",
@@ -551,7 +555,6 @@ CSV_COLUMNS: list[str] = [
     "cvss_v2_vector",
     "affected_products_count",
     "affected_products",
-    "mve_id",
     "name",
     "description",
     "executive_summary",
@@ -566,6 +569,8 @@ CSV_COLUMNS: list[str] = [
     "last_modification_date",
     "origin",
     "ioc_count",
+    "ioc_status",
+    "ioc_error",
     "vt_url",
 ]
 
@@ -657,6 +662,23 @@ def normalize_cve(raw: str) -> Optional[str]:
     if not CVE_PATTERN.match(cleaned):
         return None
     return cleaned
+
+
+def validate_input_cve(raw: str) -> str:
+    """Normalize and validate a single ``--input`` CVE identifier.
+
+    Strips surrounding whitespace, uppercases, then requires ``CVE_PATTERN``.
+    Unlike ``normalize_cve()``, this does not promote bare ``YYYY-NNNN`` IDs
+    or rewrite underscores — ``--input`` is a strict one-CVE entry point.
+    """
+    normalized = (raw or "").strip().upper()
+    if "," in (raw or "") or not CVE_PATTERN.match(normalized):
+        raise ValueError(
+            f"Invalid CVE identifier for --input: {raw!r}. "
+            "Provide exactly one ID matching CVE-YYYY-NNNN "
+            "(example: CVE-2026-12345)."
+        )
+    return normalized
 
 
 def cve_api_id(cve: str) -> str:
@@ -795,44 +817,34 @@ def derive_exploited_in_the_wild(
     attrs: dict[str, Any],
     *,
     exploitation: Optional[dict[str, Any]] = None,
-    exploitation_state: Any = None,
-    cisa_kev: bool = False,
     tags: Any = None,
 ) -> tuple[str, list[str], str]:
-    """Derive the GUI ``Exploited in the Wild`` Yes/No flag.
+    """Normalize an explicit in-the-wild value from a vulnerability object.
 
-    GTI's published Vulnerability object does **not** document a reliable
-    top-level ``attributes.exploited_in_the_wild`` field. The VirusTotal /
-    GTI GUI flag is a derived indicator. We therefore OR together every
-    documented positive signal rather than reading a single key.
+    The published Vulnerability object does not document an
+    ``exploited_in_the_wild`` attribute. The documented API representation of
+    the GUI flag is membership in the ``Observed In The Wild`` vulnerability
+    filter, queried separately by :meth:`GTIClient.get_observed_in_the_wild`.
 
-    Exploited in the Wild = **Yes** if ANY of the following are true:
+    This helper accepts explicit fields if an API revision supplies one and an
+    exact ``Observed In The Wild`` tag if it is present in the object. It does
+    **not** infer the flag from Exploitation State, CISA KEV, exploit
+    availability, or any other semantically related metric.
 
-    1. An explicit boolean/string field meaning exploited/observed in the
-       wild is true/yes (top-level attributes, nested ``exploitation``, or
-       any key whose name contains ``wild``).
-    2. ``exploitation_state`` is ``Confirmed`` or ``Wide``.
-       Confirmed = GTI observed exploitation or credible reporting of
-       active exploitation. Wide = exploitation on a wide scale. Treating
-       either as "in the wild = no" contradicts the GUI.
-    3. CISA KEV membership (``cisa_known_exploited`` present) or an
-       equivalent "CISA Exploited" collection flag.
-    4. Collection tags / filters such as ``Observed In The Wild`` or
-       ``CISA Exploited``.
-
-    Exploited in the Wild = **No** only when none of those positive
-    signals are present. Missing CISA KEV is **not** proof of No if GTI
-    itself marks wild exploitation (state Confirmed/Wide, tags, etc.).
+    When no explicit value is present, the result is ``"Unknown"`` rather
+    than ``"False"``. Absence of an undocumented property is not evidence of
+    a negative result.
 
     Returns
     -------
     (display, sources, explicit)
-        display: ``"True"`` / ``"False"`` (CSV/HTML YES/no mapping)
-        sources: labels of signals that fired (debug / conflict note)
+        display: ``"True"`` / ``"False"`` / ``"Unknown"``
+        sources: labels of explicit values that determined the result
         explicit: raw explicit field value if one was present, else ``"N/A"``
     """
     exploitation = exploitation if isinstance(exploitation, dict) else {}
-    sources: list[str] = []
+    positive_sources: list[str] = []
+    negative_sources: list[str] = []
     explicit_raw = "N/A"
 
     explicit_candidates = [
@@ -849,10 +861,15 @@ def derive_exploited_in_the_wild(
         if explicit_raw == "N/A":
             explicit_raw = na(val)
         if _truthy_flag(val):
-            sources.append(f"{label}={val!r}")
+            positive_sources.append(f"{label}={val!r}")
+        elif _falsey_flag(val):
+            negative_sources.append(f"{label}={val!r}")
 
     # Nested exploitation / attributes keys that mention "wild"
-    seen_paths = {s.split("=")[0] for s in sources}
+    seen_paths = {
+        s.split("=")[0]
+        for s in positive_sources + negative_sources
+    }
     for path, val in _walk_wild_keys({"attributes": attrs, "exploitation": exploitation}):
         short = path
         if short in seen_paths:
@@ -862,21 +879,26 @@ def derive_exploited_in_the_wild(
         if explicit_raw == "N/A" and not isinstance(val, (dict, list)):
             explicit_raw = na(val)
         if _truthy_flag(val):
-            sources.append(f"{path}={val!r}")
+            positive_sources.append(f"{path}={val!r}")
             seen_paths.add(short)
-
-    _, state_label = normalize_exploitation_state(exploitation_state)
-    if _norm_label(state_label) in WILD_EXPLOITATION_STATES:
-        sources.append(f"exploitation_state={state_label}")
-
-    if cisa_kev:
-        sources.append("cisa_known_exploited")
+        elif _falsey_flag(val):
+            negative_sources.append(f"{path}={val!r}")
+            seen_paths.add(short)
 
     for tag in _tag_list(tags):
         if _norm_label(tag) in WILD_COLLECTION_TAGS:
-            sources.append(f"tag={tag}")
+            positive_sources.append(f"tag={tag}")
 
-    display = "True" if sources else "False"
+    if positive_sources:
+        display = "True"
+        sources = positive_sources
+    elif negative_sources:
+        display = "False"
+        sources = negative_sources
+    else:
+        display = "Unknown"
+        sources = []
+
     # Deduplicate while preserving order
     uniq: list[str] = []
     seen: set[str] = set()
@@ -885,6 +907,56 @@ def derive_exploited_in_the_wild(
             seen.add(item)
             uniq.append(item)
     return display, uniq, explicit_raw
+
+
+def parse_observed_in_the_wild_response(cve: str, payload: dict[str, Any]) -> bool:
+    """Return exact CVE membership from an Observed In The Wild filter response.
+
+    A successful empty list is an authoritative negative. A malformed response
+    raises ``ValueError`` so callers can preserve ``Unknown`` rather than
+    silently converting a parsing problem into ``False``.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise ValueError("Observed In The Wild response has no data list")
+
+    expected_id = cve_api_id(cve).lower()
+    expected_cve = cve.upper()
+    for item in payload["data"]:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id") or "").lower() == expected_id:
+            return True
+        attrs = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}
+        if str(attrs.get("cve_id") or "").upper() == expected_cve:
+            return True
+    return False
+
+
+def apply_observed_in_the_wild_result(
+    rec: CVERecord,
+    value: Optional[bool],
+    *,
+    error: Optional[str] = None,
+    http_status: int = 0,
+) -> None:
+    """Apply the authoritative filter result without collapsing errors to No."""
+    if error is not None or value is None:
+        rec.exploited_in_the_wild_status = "lookup_failed"
+        if rec.exploited_in_the_wild not in {"True", "False"}:
+            rec.exploited_in_the_wild = "Unknown"
+        logging.warning(
+            "Observed In The Wild lookup unavailable for %s (status=%s, err=%s)",
+            rec.cve,
+            http_status,
+            error or "unknown",
+        )
+        return
+
+    rec.exploited_in_the_wild = "True" if value else "False"
+    rec.exploited_in_the_wild_status = "filter_returned"
+    filter_source = f'vulnerability_filter="Observed In The Wild"={value}'
+    existing = [s for s in rec.exploited_in_the_wild_sources.split("; ") if s]
+    rec.exploited_in_the_wild_sources = "; ".join([filter_source, *existing])
 
 
 def exploitation_debug_snapshot(attrs: dict[str, Any]) -> dict[str, Any]:
@@ -943,13 +1015,19 @@ def log_exploitation_debug(cve: str, attrs: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def parse_relationship_iocs(relationship: str, payload: Optional[dict[str, Any]]) -> list[dict[str, str]]:
-    """Flatten a GTI relationship response into display-ready IoC dicts."""
+def parse_relationship_iocs(
+    relationship: str,
+    payload: Optional[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Flatten a GTI relationship response into display-ready IOC dictionaries.
+
+    Malformed top-level data is a parsing failure, not an empty IOC result.
+    """
     if not isinstance(payload, dict):
-        return []
+        raise ValueError(f"{relationship} relationship response is not an object")
     rows = payload.get("data")
     if not isinstance(rows, list):
-        return []
+        raise ValueError(f"{relationship} relationship response has no data list")
     parsed: list[dict[str, str]] = []
     for obj in rows:
         if not isinstance(obj, dict) or obj.get("error"):
@@ -1039,12 +1117,28 @@ def ioc_counter_breakdown(attrs: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def ioc_counter_status(attrs: dict[str, Any], counts: dict[str, int]) -> str:
+    """Classify IOC counters as pending, explicit none, or not returned."""
+    counters = attrs.get("counters") if isinstance(attrs.get("counters"), dict) else {}
+    current_keys = {"iocs", "files", "urls", "domains", "ip_addresses"}
+    legacy_keys = {"files_count", "urls_count", "domains_count", "ip_addresses_count"}
+    counters_returned = bool(current_keys.intersection(counters)) or bool(
+        legacy_keys.intersection(attrs)
+    )
+    if not counters_returned:
+        return "not_returned"
+    if counts["iocs"] == 0 and not any(counts[key] for key in IOC_RELATIONSHIPS):
+        return "none"
+    return "pending"
+
+
 def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) -> None:
     """Fetch relationship IoCs when GTI reports a non-zero count.
 
     Uses the same session (proxy, CA bundle, throttle, retries) as the
-    collection GET. Failures to list IoCs do not fail the CVE record —
-    the count still appears and the list is left empty.
+    collection GET. Relationship failures do not fail the CVE record, but are
+    retained in ``ioc_status`` / ``ioc_error`` and rendered distinctly from an
+    explicit zero count.
     """
     data = payload.get("data") if isinstance(payload, dict) else None
     attrs = (data.get("attributes") if isinstance(data, dict) else None) or {}
@@ -1055,8 +1149,15 @@ def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) ->
     rec.ioc_urls_total = counts["urls"]
     rec.ioc_domains_total = counts["domains"]
     rec.ioc_ip_addresses_total = counts["ip_addresses"]
-    if rec.ioc_count in {"N/A", ""} and counts["iocs"]:
+    counter_status = ioc_counter_status(attrs, counts)
+    if counter_status == "not_returned":
+        rec.ioc_status = "not_returned"
+        return
+    if rec.ioc_count in {"N/A", ""}:
         rec.ioc_count = str(counts["iocs"])
+    if counter_status == "none":
+        rec.ioc_status = "none"
+        return
 
     wanted: list[str] = [rel for rel in IOC_RELATIONSHIPS if counts.get(rel, 0) > 0]
     if not wanted and counts["iocs"] > 0:
@@ -1069,6 +1170,8 @@ def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) ->
         "domains": "ioc_domains",
         "ip_addresses": "ioc_ip_addresses",
     }
+    failures: list[str] = []
+    successes = 0
     for rel in wanted:
         body, err, status = client.get_relationship(rec.cve, rel, limit=IOC_DISPLAY_CAP)
         if err or not isinstance(body, dict):
@@ -1079,8 +1182,15 @@ def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) ->
                 status,
                 err,
             )
+            failures.append(f"{rel}: request failed (HTTP {status or 'n/a'}, {err or 'error'})")
             continue
-        items = parse_relationship_iocs(rel, body)
+        try:
+            items = parse_relationship_iocs(rel, body)
+        except (TypeError, ValueError) as exc:
+            logging.warning("Could not parse %s IOCs for %s: %s", rel, rec.cve, exc)
+            failures.append(f"{rel}: response parsing failed")
+            continue
+        successes += 1
         setattr(rec, field_by_rel[rel], items)
         meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
         meta_count = _as_nonneg_int(meta.get("count"))
@@ -1089,6 +1199,12 @@ def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) ->
         if meta_count > current_total:
             setattr(rec, total_attr, meta_count)
         logging.debug("Fetched %d %s IoC(s) for %s (total=%s)", len(items), rel, rec.cve, getattr(rec, total_attr))
+
+    if failures:
+        rec.ioc_status = "partial" if successes else "error"
+        rec.ioc_error = "; ".join(failures)
+    else:
+        rec.ioc_status = "complete"
 
 
 # ---------------------------------------------------------------------------
@@ -1145,10 +1261,10 @@ def derive_priority_rating(
     # Collapse missing / synonym labels so the decision table stays small
     if risk in {"n/a", "none", "unrated", ""}:
         risk = "unrated"
-    if state in {"n/a", "none", ""}:
-        state = "no known"
+    if state in {"n/a", "none", "unknown", ""}:
+        state = "unknown"
     if avail in {"n/a", "none", "unknown", ""}:
-        avail = "no known"
+        avail = "unknown"
 
     # Older filter wording "Known" ≈ publicly available exploit code
     if avail == "known":
@@ -1171,25 +1287,34 @@ def derive_priority_rating(
     # --- P0 (highest urgency) ---
     if risk == "critical":
         return "P0"
+    # Every remaining published P0-P4 rule requires a known Exploitation State.
+    # Do not convert a missing field into the semantically different "No Known".
+    if state == "unknown":
+        return "N/A"
     if risk == "high" and state in wide_confirmed_reported:
         return "P0"
     if risk == "medium" and state == "wide":
         return "P0"
 
-    # --- P1 ---
-    if risk == "high" and state in suspected_no_known and not _is_no_known(avail):
-        return "P1"
+    # These rules do not depend on exploit availability and remain valid when
+    # that separate API field is absent.
     if risk == "medium" and state in confirmed_reported_suspected:
         return "P1"
     if risk == "low" and state in wide_confirmed:
+        return "P1"
+    if risk == "low" and state in reported_suspected:
+        return "P2"
+    if avail == "unknown":
+        return "N/A"
+
+    # --- P1 ---
+    if risk == "high" and state in suspected_no_known and not _is_no_known(avail):
         return "P1"
 
     # --- P2 ---
     if risk == "high" and state == "no known" and _is_no_known(avail):
         return "P2"
     if risk == "medium" and state == "no known" and avail in exploit_code_present:
-        return "P2"
-    if risk == "low" and state in reported_suspected:
         return "P2"
 
     # --- P3 ---
@@ -1494,6 +1619,34 @@ class GTIClient:
         url = f"{self.base_url}/collections/{object_id}"
         return self._get_json(url, context=cve)
 
+    def get_observed_in_the_wild(
+        self,
+        cve: str,
+    ) -> tuple[Optional[bool], Optional[str], int]:
+        """Query the API's documented ``Observed In The Wild`` filter.
+
+        The GUI field is not a documented Vulnerability object attribute. An
+        exact filtered search supplies an authoritative boolean while keeping
+        a request or parsing failure distinguishable as ``None``.
+        """
+        filter_text = (
+            f'collection_type:vulnerability name:{cve} '
+            'vulnerability_filter:"Observed In The Wild"'
+        )
+        query = urllib.parse.urlencode({"filter": filter_text, "limit": 1})
+        url = f"{self.base_url}/collections?{query}"
+        body, err, status = self._get_json(
+            url,
+            context=f"{cve} Observed In The Wild filter",
+        )
+        if err is not None or body is None:
+            return None, err or "error", status
+        try:
+            return parse_observed_in_the_wild_response(cve, body), None, status
+        except (TypeError, ValueError) as exc:
+            logging.warning("Could not parse Observed In The Wild result for %s: %s", cve, exc)
+            return None, "parse_error", status
+
     def get_relationship(
         self,
         cve: str,
@@ -1674,7 +1827,7 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         attrs.get("exploited_as_zero_day"),
         attrs.get("zero_day"),
         exploitation.get("exploited_as_zero_day"),
-        default=False,
+        default=None,
     )
 
     # --- CISA KEV (presence of the object means "on the KEV list") ---
@@ -1690,16 +1843,16 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         cisa_due = "N/A"
         cisa_ransom = "N/A"
 
-    # Exploited in the Wild is a GUI-derived flag, not a documented first-class
-    # Vulnerability attribute. See derive_exploited_in_the_wild() for the rule.
+    # The documented API source for the GUI flag is a separate vulnerability
+    # filter query. Preserve any explicit object value here, otherwise Unknown;
+    # enrich_cves() applies the authoritative filter result afterward.
     log_exploitation_debug(cve, attrs)
     exploited_in_wild, wild_sources, wild_explicit = derive_exploited_in_the_wild(
         attrs,
         exploitation=exploitation,
-        exploitation_state=exploitation_state_raw,
-        cisa_kev=cisa_kev,
         tags=attrs.get("tags"),
     )
+    wild_status = "object_returned" if wild_sources else "not_returned"
 
     # --- Risk / priority ---
     # API documents priority as boolean; the GTI UI shows P0–P4 — we derive that.
@@ -1729,6 +1882,7 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
 
     # --- Counters (IoCs, etc.) — counts only; objects come from relationships ---
     ioc_counts = ioc_counter_breakdown(attrs)
+    ioc_status = ioc_counter_status(attrs, ioc_counts)
 
     # --- Narrative fields ---
     description = na(attrs.get("description"))
@@ -1747,9 +1901,10 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         exploitation_state_level="N/A" if state_level is None else str(state_level),
         exploit_availability=na(exploit_availability),
         exploited_in_the_wild=exploited_in_wild,
+        exploited_in_the_wild_status=wild_status,
         exploited_in_the_wild_sources="; ".join(wild_sources),
         exploited_in_the_wild_explicit=wild_explicit,
-        exploited_as_zero_day=na(exploited_zero_day, default="False"),
+        exploited_as_zero_day=na(exploited_zero_day, default="Unknown"),
         exploitation_consequence=na(attrs.get("exploitation_consequence")),
         exploitation_vectors=na(attrs.get("exploitation_vectors")),
         first_exploitation=fmt_ts(exploitation.get("first_exploitation")),
@@ -1771,7 +1926,6 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         cvss_v2_vector=na(v2_vector),
         affected_products=products_str,
         affected_products_count=products_count,
-        mve_id=na(attrs.get("mve_id")),
         name=na(attrs.get("name"), default=cve),
         description=description,
         executive_summary=executive,
@@ -1785,7 +1939,8 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         creation_date=fmt_ts(attrs.get("creation_date")),
         last_modification_date=fmt_ts(attrs.get("last_modification_date")),
         origin=na(attrs.get("origin")),
-        ioc_count=na(ioc_counts["iocs"]),
+        ioc_count="N/A" if ioc_status == "not_returned" else str(ioc_counts["iocs"]),
+        ioc_status=ioc_status,
         ioc_files_total=ioc_counts["files"],
         ioc_urls_total=ioc_counts["urls"],
         ioc_domains_total=ioc_counts["domains"],
@@ -1804,8 +1959,10 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         "epss_raw": epss,
         "cisa_known_exploited_raw": kev if isinstance(kev, dict) else None,
         "exploitation_raw": exploitation,
-        "exploited_in_the_wild_derived": exploited_in_wild,
+        "exploited_in_the_wild_normalized": exploited_in_wild,
+        "exploited_in_the_wild_status": wild_status,
         "exploited_in_the_wild_sources": wild_sources,
+        "ioc_status": ioc_status,
     }
     try:
         rec.extra_json = json.dumps(extra, default=str)[:4000]
@@ -2078,11 +2235,7 @@ EXPLOITATION_STATE_DEFINITION = (
     "a vulnerability is known or suspected to be exploited."
 )
 EXPLOITATION_STATE_LEGEND = (
-    "0 = No Known\n"
-    "1 = Suspected\n"
-    "2 = Reported\n"
-    "3 = Confirmed\n"
-    "4 = Wide"
+    "0 = No known | 1 = Suspected | 2 = Reported | 3 = Confirmed | 4 = Wide"
 )
 PRIORITY_VIZ_CAPTION = (
     "Vulnerability severity visualization is based on (1) its potential impact, "
@@ -2158,19 +2311,30 @@ def _html_priority_viz(rec: CVERecord) -> str:
 """
 
 
-def _html_wild_conflict_note(rec: CVERecord) -> str:
-    """Surface explicit-vs-derived disagreement instead of silently showing No."""
+def _html_wild_status_note(rec: CVERecord) -> str:
+    """Explain unavailable lookups and any object/filter disagreement."""
+    if rec.exploited_in_the_wild_status == "lookup_failed":
+        return (
+            '<div class="debug-note">Observed In The Wild lookup failed; '
+            "the result remains Unknown unless an explicit object value was returned.</div>"
+        )
+    if rec.exploited_in_the_wild_status == "not_returned":
+        return (
+            '<div class="debug-note">Not returned by the vulnerability object; '
+            "the Observed In The Wild filter was not queried.</div>"
+        )
+
     explicit = (rec.exploited_in_the_wild_explicit or "N/A").strip()
-    derived = rec.exploited_in_the_wild
-    if explicit in {"N/A", ""}:
+    filtered = rec.exploited_in_the_wild
+    if rec.exploited_in_the_wild_status != "filter_returned" or explicit in {"N/A", ""}:
         return ""
     explicit_yes = explicit.lower() in {"true", "yes", "1"}
-    derived_yes = str(derived).lower() in {"true", "yes", "1"}
-    if explicit_yes == derived_yes:
+    filtered_yes = str(filtered).lower() in {"true", "yes", "1"}
+    if explicit_yes == filtered_yes:
         return ""
     sources = rec.exploited_in_the_wild_sources or "(none)"
     return (
-        f'<div class="debug-note">API derived: {"Yes" if derived_yes else "No"} · '
+        f'<div class="debug-note">Observed In The Wild filter: {"Yes" if filtered_yes else "No"} · '
         f"explicit field: {_html_escape(explicit)} · source fields: {_html_escape(sources)}</div>"
     )
 
@@ -2234,7 +2398,7 @@ def _html_ioc_table(
 
 
 def _html_ioc_section(rec: CVERecord) -> str:
-    """Render associated IoCs by type; omit empty subtypes and the section if none."""
+    """Render IOC objects while preserving none/absent/error distinctions."""
     blocks = [
         _html_ioc_table("Files", rec.ioc_files, rec.ioc_files_total, kind="files"),
         _html_ioc_table("URLs", rec.ioc_urls, rec.ioc_urls_total, kind="urls"),
@@ -2245,12 +2409,34 @@ def _html_ioc_section(rec: CVERecord) -> str:
     ]
     nonempty = [b for b in blocks if b]
     total_label = rec.ioc_count if rec.ioc_count not in {"N/A", ""} else ""
+    status_note = ""
+    if rec.ioc_status in {"partial", "error"}:
+        detail = rec.ioc_error or "VirusTotal did not return the requested IOC relationships."
+        status_note = (
+            '<p class="ioc-error" role="alert">IOC retrieval failed or was incomplete: '
+            f"{_html_escape(detail)}</p>"
+        )
     if nonempty:
         count_bit = f' <span class="muted">({_html_escape(str(total_label))})</span>' if total_label else ""
         return f"""
   <section class="iocs">
     <h3>Indicators of Compromise{count_bit}</h3>
+    {status_note}
     {"".join(nonempty)}
+  </section>
+"""
+    if rec.ioc_status in {"partial", "error"}:
+        return f"""
+  <section class="iocs">
+    <h3>Indicators of Compromise</h3>
+    {status_note}
+  </section>
+"""
+    if rec.ioc_status == "not_returned":
+        return """
+  <section class="iocs">
+    <h3>Indicators of Compromise</h3>
+    <p class="muted">IOC availability was not returned by VirusTotal.</p>
   </section>
 """
     reported = rec.ioc_files_total + rec.ioc_urls_total + rec.ioc_domains_total + rec.ioc_ip_addresses_total
@@ -2263,13 +2449,13 @@ def _html_ioc_section(rec: CVERecord) -> str:
         return f"""
   <section class="iocs">
     <h3>Indicators of Compromise <span class="muted">({_html_escape(str(reported))})</span></h3>
-    <p class="muted">GTI reports {reported} associated IoC(s), but no relationship objects were returned.</p>
+    <p class="muted">VirusTotal reports {reported} associated IOC(s), but no relationship objects were returned.</p>
   </section>
 """
     return """
   <section class="iocs">
     <h3>Indicators of Compromise</h3>
-    <p class="muted">No associated IoCs returned by GTI.</p>
+    <p class="muted">No associated IOCs returned by VirusTotal.</p>
   </section>
 """
 
@@ -2396,7 +2582,7 @@ def render_html_report(
             if rec.exploitation_state_level not in {"N/A", ""}
             else ""
         )
-        wild_note = _html_wild_conflict_note(rec)
+        wild_note = _html_wild_status_note(rec)
         ioc_section = _html_ioc_section(rec)
         priority_viz = _html_priority_viz(rec)
 
@@ -2440,7 +2626,10 @@ def render_html_report(
       <table class="kv">
         <tr>
           <th>Exploitation State {state_icon}</th>
-          <td><strong class="exploit-state exploit-{state_cls}">{_html_escape(rec.exploitation_state)}</strong>{level_bit}</td>
+          <td>
+            <strong class="exploit-state exploit-{state_cls}">{_html_escape(rec.exploitation_state)}</strong>{level_bit}
+            <div class="metric-sub">{_html_escape(EXPLOITATION_STATE_LEGEND)}</div>
+          </td>
         </tr>
         <tr><th>Exploit Availability</th><td>{_html_escape(rec.exploit_availability)}</td></tr>
         <tr><th>Exploited in the Wild</th><td>{_html_bool(rec.exploited_in_the_wild)}{wild_note}</td></tr>
@@ -2845,6 +3034,13 @@ def render_html_report(
     color: var(--text);
   }}
   .ioc-more {{ margin: 0.4rem 0 0.2rem; font-size: 0.8rem; }}
+  .ioc-error {{
+    color: #fecaca;
+    background: #3f0d0d;
+    border: 1px solid #7f1d1d;
+    border-radius: 8px;
+    padding: 0.55rem 0.7rem;
+  }}
 </style>
 </head>
 <body>
@@ -2943,7 +3139,7 @@ def open_report_in_browser(path: Path) -> None:
 #   1. argparse  (so --env-file / -v exist)
 #   2. logging
 #   3. load_project_dotenv  → os.environ
-#   4. resolve API key, input CSV, proxies, CA bundle
+#   4. resolve API key, --input CVE or input CSV, proxies, CA bundle
 #   5. GTIClient(...)  with those resolved values
 #   6. enrich + CSV + optional Rich
 #   7. ALWAYS render HTML and (unless --no-open) launch the browser
@@ -3045,10 +3241,23 @@ def enrich_cves(
             body, err, status = client.get_vulnerability(cve)
             if err is None and body is not None:
                 rec = extract_record(cve, body)
+                observed, wild_err, wild_http_status = client.get_observed_in_the_wild(cve)
+                apply_observed_in_the_wild_result(
+                    rec,
+                    observed,
+                    error=wild_err,
+                    http_status=wild_http_status,
+                )
                 try:
                     attach_iocs(client, rec, body)
                 except Exception as ioc_exc:  # noqa: BLE001 — IoC list is optional
-                    logging.warning("IoC relationship fetch failed for %s: %s", cve, ioc_exc)
+                    rec.ioc_status = "error"
+                    rec.ioc_error = "Unexpected IOC processing failure"
+                    logging.warning(
+                        "IOC processing failed for %s (%s)",
+                        cve,
+                        type(ioc_exc).__name__,
+                    )
                 records.append(rec)
                 logging.info(
                     "  → %s | risk=%s | priority=%s | EPSS=%s | KEV=%s",
@@ -3132,7 +3341,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("-i", "--input", default=DEFAULT_INPUT, help="Input CSV of CVE IDs")
+    # --input is the supported single-CVE entry point for local and agent/CLI use.
+    p.add_argument(
+        "--input",
+        default=None,
+        metavar="CVE",
+        help="Single CVE identifier to enrich (example: CVE-2026-12345)",
+    )
+    p.add_argument(
+        "-i",
+        dest="cve_file",
+        default=DEFAULT_INPUT,
+        metavar="FILE",
+        help="Input CSV of CVE IDs (ignored when --input is set)",
+    )
     p.add_argument("-o", "--output", default=DEFAULT_OUTPUT, help="Output enriched CSV path")
     p.add_argument(
         "--html",
@@ -3244,24 +3466,35 @@ def main(argv: Optional[list[str]] = None) -> int:
     output_path = Path(args.output)
 
     try:
-        # --- Resolve secrets and inputs ---
+        # --- Resolve CVE targets, then secrets ---
+        # --input (single CVE) wins over the CSV from -i / default cve_list.csv.
+        if args.input is not None:
+            try:
+                cves = [validate_input_cve(args.input)]
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+            logging.info(
+                "Using --input CVE %s (CSV from -i ignored)",
+                cves[0],
+            )
+        else:
+            input_path = Path(args.cve_file)
+            try:
+                cves = load_cve_list(input_path)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Failed to read input: {exc}") from exc
+
+            if not cves:
+                raise RuntimeError(f"No valid CVE IDs found in {input_path}")
+
+            logging.info("Loaded %d unique CVE(s) from %s", len(cves), input_path)
+
         api_key = resolve_api_key(args.api_key)
         if not api_key:
             raise RuntimeError(
                 "No API key. Set VIRUSTOTAL_API_KEY (or VT_API_KEY) in the project "
                 ".env file, or pass --api-key. See .env.example and SETUP.md."
             )
-
-        input_path = Path(args.input)
-        try:
-            cves = load_cve_list(input_path)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"Failed to read input: {exc}") from exc
-
-        if not cves:
-            raise RuntimeError(f"No valid CVE IDs found in {input_path}")
-
-        logging.info("Loaded %d unique CVE(s) from %s", len(cves), input_path)
 
         # --- Network: proxy + TLS trust ---
         # Proxies and CA bundle are applied on the Session inside GTIClient.
@@ -3375,6 +3608,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             for needle in (
                 "api key",
                 "no valid cve",
+                "invalid cve",
                 "failed to read input",
                 "ca bundle",
                 "placeholder",

@@ -460,7 +460,6 @@ class CveEnrichment(BaseModel):
     date_of_disclosure: Optional[str] = None
     last_modification_date: Optional[str] = None
     origin: Optional[str] = None
-    mve_id: Optional[str] = None
     ioc_count: Optional[int] = None
 
     summary: Optional[str] = None                # executive_summary, else description
