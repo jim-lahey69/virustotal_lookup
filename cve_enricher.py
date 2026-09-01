@@ -1517,7 +1517,9 @@ class GTIClient:
 
         Returns:
             (json_body | None, error_kind | None, http_status)
-            error_kind in {None, 'not_found', 'forbidden', 'rate_limited', 'error'}
+            error_kind in {None, 'not_found', 'forbidden', 'rate_limited',
+            'proxy_error', 'tls_error', 'timeout', 'network_error',
+            'parse_error', 'error'}
 
         401/403 are *not* retried: they almost always mean the key lacks
         Vulnerability Intelligence, and retrying would only burn quota.
@@ -1533,6 +1535,22 @@ class GTIClient:
                 self._last_request_at = time.monotonic()
             except requests.RequestException as exc:
                 # Network/proxy/SSL failures — backoff then retry
+                if isinstance(exc, requests.exceptions.ProxyError):
+                    error_kind = "proxy_error"
+                elif isinstance(exc, requests.exceptions.SSLError):
+                    error_kind = "tls_error"
+                elif isinstance(exc, requests.exceptions.Timeout):
+                    error_kind = "timeout"
+                else:
+                    error_kind = "network_error"
+                if attempt >= self.max_retries:
+                    logging.error(
+                        "Network error for %s after %d attempt(s): %s",
+                        context,
+                        attempt,
+                        exc,
+                    )
+                    return None, error_kind, 0
                 wait = self.backoff_base**attempt + random.uniform(0, 1)
                 logging.warning(
                     "Network error for %s (attempt %d): %s — retrying in %.1fs",
@@ -1541,8 +1559,6 @@ class GTIClient:
                     exc,
                     wait,
                 )
-                if attempt >= self.max_retries:
-                    return None, "error", 0
                 time.sleep(wait)
                 continue
 
@@ -1550,7 +1566,7 @@ class GTIClient:
                 try:
                     return resp.json(), None, 200
                 except ValueError:
-                    return None, "error", 200
+                    return None, "parse_error", 200
 
             if resp.status_code == 404:
                 # CVE not in GTI collections (too new, unpublished, or out of coverage)
@@ -1572,6 +1588,13 @@ class GTIClient:
 
             if resp.status_code == 429:
                 # Honor Retry-After when the API provides it; else exponential backoff
+                if attempt >= self.max_retries:
+                    logging.error(
+                        "Rate limit persisted for %s after %d attempt(s)",
+                        context,
+                        attempt,
+                    )
+                    return None, "rate_limited", 429
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
                     wait = float(retry_after) + random.uniform(0, 1)
@@ -1584,8 +1607,6 @@ class GTIClient:
                     self.max_retries,
                     wait,
                 )
-                if attempt >= self.max_retries:
-                    return None, "rate_limited", 429
                 time.sleep(wait)
                 continue
 
@@ -3310,17 +3331,77 @@ def enrich_cves(
                         "Exceeded rate limit after retries (HTTP 429). Try a higher --delay.",
                     )
                 )
+            elif err == "proxy_error":
+                records.append(
+                    error_record(
+                        cve,
+                        "proxy_error",
+                        "Proxy connection failed after retries. Verify the configured "
+                        "HTTP(S) proxy URL and credentials.",
+                    )
+                )
+            elif err == "tls_error":
+                records.append(
+                    error_record(
+                        cve,
+                        "tls_error",
+                        "TLS verification failed after retries. Configure the corporate "
+                        "CA bundle; TLS verification cannot be disabled.",
+                    )
+                )
+            elif err == "timeout":
+                records.append(
+                    error_record(
+                        cve,
+                        "timeout",
+                        "VirusTotal request timed out after retries. Check network and "
+                        "proxy connectivity.",
+                    )
+                )
+            elif err == "network_error":
+                records.append(
+                    error_record(
+                        cve,
+                        "network_error",
+                        "Network error after retries. Check DNS, firewall, and proxy "
+                        "connectivity.",
+                    )
+                )
+            elif err == "parse_error":
+                records.append(
+                    error_record(
+                        cve,
+                        "parse_error",
+                        f"VirusTotal returned an unreadable JSON response "
+                        f"(HTTP {status or 'n/a'}).",
+                    )
+                )
             else:
                 records.append(
                     error_record(
                         cve,
                         "error",
-                        f"Request failed (HTTP {status or 'n/a'}).",
+                        f"VirusTotal API request failed (HTTP {status or 'n/a'}).",
                     )
                 )
             progress.advance(task)
 
     return records
+
+
+class _StoreOnceAction(argparse.Action):
+    """Store one option value and reject ambiguous duplicate occurrences."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Optional[str] = None,
+    ) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{option_string or self.dest} may only be specified once")
+        setattr(namespace, self.dest, values)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -3344,6 +3425,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # --input is the supported single-CVE entry point for local and agent/CLI use.
     p.add_argument(
         "--input",
+        action=_StoreOnceAction,
         default=None,
         metavar="CVE",
         help="Single CVE identifier to enrich (example: CVE-2026-12345)",
