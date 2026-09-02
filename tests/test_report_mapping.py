@@ -157,6 +157,26 @@ class ExploitedInTheWildTests(unittest.TestCase):
         self.assertEqual(rec.exploited_in_the_wild, "Unknown")
         self.assertEqual(rec.exploited_in_the_wild_status, "not_returned")
 
+    def test_cisa_kev_tags_are_not_treated_as_in_the_wild(self) -> None:
+        rec = ce.extract_record(
+            "CVE-1900-0013",
+            {
+                "data": {
+                    "attributes": {
+                        "tags": ["cisa_kev", "cisa kev", "cisa exploited"],
+                        "cisa_known_exploited": {"added_date": 1},
+                    }
+                }
+            },
+        )
+        self.assertEqual(rec.exploited_in_the_wild, "Unknown")
+        display, sources, _raw = ce.derive_exploited_in_the_wild(
+            {},
+            tags=["cisa_kev", "cisa kev"],
+        )
+        self.assertEqual(display, "Unknown")
+        self.assertEqual(sources, [])
+
     def test_explicit_boolean_values_are_preserved(self) -> None:
         yes, yes_sources, yes_raw = ce.derive_exploited_in_the_wild(
             {"exploited_in_the_wild": True}

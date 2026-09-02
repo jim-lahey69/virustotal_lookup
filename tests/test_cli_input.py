@@ -122,6 +122,8 @@ class ClientErrorClassificationTests(unittest.TestCase):
     def test_invalid_success_response_json_is_a_parse_error(self) -> None:
         class InvalidJsonResponse:
             status_code = 200
+            is_redirect = False
+            headers: dict[str, str] = {}
 
             @staticmethod
             def json():
@@ -134,6 +136,62 @@ class ClientErrorClassificationTests(unittest.TestCase):
         self.assertIsNone(body)
         self.assertEqual(error_kind, "parse_error")
         self.assertEqual(status, 200)
+
+    def test_invalid_cve_is_rejected_before_http(self) -> None:
+        client = ce.GTIClient("test-api-key", delay=0.0, max_retries=1)
+        with patch.object(client.session, "get") as get:
+            body, error_kind, status = client.get_vulnerability("../evil")
+        get.assert_not_called()
+        self.assertIsNone(body)
+        self.assertEqual(error_kind, "error")
+        self.assertEqual(status, 0)
+
+    def test_http_get_disables_redirects_and_sets_timeout(self) -> None:
+        client = ce.GTIClient("test-api-key", delay=0.0, max_retries=1)
+        captured: dict[str, object] = {}
+
+        class Resp:
+            status_code = 200
+            is_redirect = False
+            headers: dict[str, str] = {}
+
+            @staticmethod
+            def json():
+                return {"data": {"id": "vulnerability--cve-2026-12345", "attributes": {}}}
+
+        def fake_get(*_args, **kwargs):
+            captured.update(kwargs)
+            return Resp()
+
+        with patch.object(client.session, "get", side_effect=fake_get):
+            body, error_kind, status = client.get_vulnerability("CVE-2026-12345")
+
+        self.assertEqual((error_kind, status), (None, 200))
+        self.assertIsNotNone(body)
+        self.assertEqual(captured.get("allow_redirects"), False)
+        self.assertEqual(captured.get("timeout"), ce.DEFAULT_HTTP_TIMEOUT)
+
+    def test_unsupported_relationship_is_rejected_before_http(self) -> None:
+        client = ce.GTIClient("test-api-key", delay=0.0, max_retries=1)
+        with patch.object(client.session, "get") as get:
+            body, error_kind, status = client.get_relationship(
+                "CVE-2026-12345", "../files"
+            )
+        get.assert_not_called()
+        self.assertIsNone(body)
+        self.assertEqual(error_kind, "error")
+        self.assertEqual(status, 0)
+
+
+class SecretRedactionTests(unittest.TestCase):
+    def test_proxy_password_and_api_key_are_redacted(self) -> None:
+        proxy = "http://user:hunter2@webproxy:8080"
+        self.assertNotIn("hunter2", ce.redact_secrets(proxy))
+        self.assertIn("user:***@", ce.redact_secrets(proxy))
+        self.assertNotIn("secret-key", ce.redact_secrets("x-apikey: secret-key"))
+        html = ce._format_fatal_error(RuntimeError("proxy http://u:p@host:1 failed"))
+        self.assertNotIn("u:p@", html)
+        self.assertIn("u:***@", html)
 
 
 class ReportSelectionTests(unittest.TestCase):

@@ -69,6 +69,7 @@ import ipaddress
 import json
 import logging
 import os
+import posixpath
 import random
 import re
 import subprocess
@@ -123,6 +124,10 @@ DEFAULT_HTML = "report.html"
 DEFAULT_IOC_HTML = "ioc_report.html"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BACKOFF_BASE = 2.0  # seconds; exponential: base^attempt + jitter
+DEFAULT_HTTP_TIMEOUT = 60.0
+MAX_REDIRECTS = 5
+# Relationship page size is 40; cap pages so a hostile/broken next-link cannot loop forever.
+MAX_IOC_PAGES = 50
 
 # Canonical CVE ID shape used for validation after normalization.
 CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
@@ -193,6 +198,7 @@ EXPLOIT_AVAILABILITY_ALIASES: dict[str, int] = {
     # the official graphic has no level above 4, so both occupy its endpoint.
     "trivial": 4,
 }
+# Tags that mean the GUI "Exploited in the Wild" flag, not CISA KEV / other metrics.
 WILD_COLLECTION_TAGS = frozenset(
     {
         "observed in the wild",
@@ -201,10 +207,6 @@ WILD_COLLECTION_TAGS = frozenset(
         "exploited_in_the_wild",
         "in the wild",
         "in_the_wild",
-        "cisa exploited",
-        "cisa_exploited",
-        "cisa kev",
-        "cisa_kev",
     }
 )
 
@@ -212,9 +214,8 @@ WILD_COLLECTION_TAGS = frozenset(
 # Every object returned on that page is retained and rendered in the separate
 # IOC report; nothing is truncated again by the presentation layer.
 IOC_PAGE_SIZE = 40
-# Compatibility alias for external callers that imported the old name.
-IOC_DISPLAY_CAP = IOC_PAGE_SIZE
 IOC_RELATIONSHIPS: tuple[str, ...] = ("files", "urls", "domains", "ip_addresses")
+IOC_RELATIONSHIP_SET = frozenset(IOC_RELATIONSHIPS)
 
 # Fallback delay; actual value is resolved after .env load (see resolve_request_delay).
 DEFAULT_DELAY = 1.0
@@ -248,23 +249,28 @@ def load_project_dotenv(env_file: Optional[Path] = None) -> Optional[Path]:
     (``override=False``), so CI/session exports still win when intentionally set.
 
     Returns the path that was loaded, or None if no ``.env`` was found.
+    An explicit ``env_file`` that is missing or unreadable raises.
     """
     # Search order: --env-file (if given), script-dir .env, then cwd .env
     # (cwd is skipped when it is the same inode/path as the script-dir file).
     candidates: list[Path] = []
     if env_file is not None:
-        candidates.append(Path(env_file))
+        candidates.append(Path(env_file).expanduser())
     candidates.append(DEFAULT_ENV_FILE)
     cwd_env = Path.cwd() / ".env"
     if cwd_env.resolve() != DEFAULT_ENV_FILE.resolve():
         candidates.append(cwd_env)
 
     for path in candidates:
-        if path.is_file():
-            # override=False: pre-set env (CI secrets, IT-pushed HTTP_PROXY)
-            # takes precedence over values sitting in the file on disk.
+        if not path.is_file():
+            if env_file is not None and path == candidates[0]:
+                raise FileNotFoundError(f"Env file not found: {path}")
+            continue
+        try:
             load_dotenv(dotenv_path=path, override=False)
-            return path.resolve()
+        except OSError as exc:
+            raise OSError(f"Unreadable .env file: {path}") from exc
+        return path.resolve()
 
     # Last resort: python-dotenv walking parent directories (monorepo layouts).
     load_dotenv(override=False)
@@ -724,6 +730,42 @@ def validate_input_cve(raw: str) -> str:
     return normalized
 
 
+def _canonical_cve(cve: str) -> Optional[str]:
+    """Return a CVE-YYYY-NNNN+ id, or None if the value is not a CVE."""
+    text = (cve or "").strip().upper()
+    return text if CVE_PATTERN.match(text) else None
+
+
+_PROXY_CREDS_RE = re.compile(r"(://[^:/?#\s]+):([^@/\s]+)@")
+_ASSIGNED_SECRET_RE = re.compile(
+    r"(?i)(x-apikey|api[_-]?key|apikey|authorization|bearer|token)\s*[:=]\s*([^\s,;]+)"
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Strip proxy passwords and API-key-like assignments from log/HTML text."""
+    if not text:
+        return text
+    redacted = _PROXY_CREDS_RE.sub(r"\1:***@", text)
+    return _ASSIGNED_SECRET_RE.sub(r"\1=***", redacted)
+
+
+def _safe_child_path(directory: Path, filename: str) -> Path:
+    """Resolve ``directory/filename`` and refuse writes outside ``directory``."""
+    directory = directory.resolve()
+    name = Path(filename).name
+    if name != filename or not name or name in {".", ".."}:
+        raise ValueError(f"Unsafe filename: {filename!r}")
+    out = (directory / name).resolve()
+    if out.parent != directory:
+        raise ValueError(f"Refusing to write outside {directory}")
+    return out
+
+
+def _normalized_posix_path(path: str) -> str:
+    return posixpath.normpath(path or "/")
+
+
 def cve_api_id(cve: str) -> str:
     """
     Build the GTI collections object id.
@@ -920,15 +962,20 @@ def derive_exploited_in_the_wild(
 ) -> tuple[str, list[str], str]:
     """Normalize an explicit in-the-wild value from a vulnerability object.
 
-    The published Vulnerability object does not document an
-    ``exploited_in_the_wild`` attribute. The documented API representation of
-    the GUI flag is membership in the ``Observed In The Wild`` vulnerability
-    filter, queried separately by :meth:`GTIClient.get_observed_in_the_wild`.
+    Source fields (do not invent a top-level GUI boolean):
 
-    This helper accepts explicit fields if an API revision supplies one and an
-    exact ``Observed In The Wild`` tag if it is present in the object. It does
-    **not** infer the flag from Exploitation State, CISA KEV, exploit
-    availability, or any other semantically related metric.
+    * ``attributes.exploited_in_the_wild`` / ``observed_in_the_wild`` if present
+    * nested ``attributes.exploitation.*`` keys with the same names
+    * collection tags in ``WILD_COLLECTION_TAGS`` (Observed/Exploited in the Wild)
+
+    The documented API representation of the GUI flag is membership in the
+    ``Observed In The Wild`` vulnerability filter, queried separately by
+    :meth:`GTIClient.get_observed_in_the_wild`. Official docs do **not** list
+    ``exploited_in_the_wild`` as a reliable top-level field.
+
+    This helper does **not** infer the flag from Exploitation State, CISA KEV,
+    exploit availability, or relationship IoC counts. Missing → ``"Unknown"``,
+    never ``"False"``/``"no"``.
 
     When no explicit value is present, the result is ``"Unknown"`` rather
     than ``"False"``. Absence of an undocumented property is not evidence of
@@ -1572,7 +1619,7 @@ class GTIClient:
         base_url: str = DEFAULT_API_BASE,
         proxies: Optional[dict[str, str]] = None,
         verify: Union[bool, str] = True,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_HTTP_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         delay: float = DEFAULT_DELAY,
@@ -1605,6 +1652,7 @@ class GTIClient:
         self.backoff_base = backoff_base
         self.delay = delay
         self._last_request_at = 0.0
+        self._response_cache: dict[str, tuple[Optional[dict[str, Any]], Optional[str], int]] = {}
 
         # One Session reuses TCP/TLS connections (important behind a proxy) and
         # carries proxy + verify + headers for every GET in this run.
@@ -1636,6 +1684,52 @@ class GTIClient:
         if elapsed < self.delay:
             time.sleep(self.delay - elapsed)
 
+    def _is_allowed_api_url(self, url: str) -> bool:
+        """True when ``url`` stays on the configured API origin and base path."""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            base = urllib.parse.urlparse(self.base_url)
+        except ValueError:
+            return False
+        if parsed.scheme.casefold() != base.scheme.casefold():
+            return False
+        if parsed.netloc.casefold() != base.netloc.casefold():
+            return False
+        base_path = _normalized_posix_path(base.path)
+        path = _normalized_posix_path(parsed.path)
+        return path == base_path or path.startswith(base_path.rstrip("/") + "/")
+
+    def _request_get(self, url: str) -> requests.Response:
+        """GET ``url`` with timeout; follow only same-origin API redirects."""
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            if not self._is_allowed_api_url(current):
+                raise requests.exceptions.InvalidURL(
+                    "Refusing request outside the configured VirusTotal API origin"
+                )
+            resp = self.session.get(
+                current,
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+            if not getattr(resp, "is_redirect", False):
+                return resp
+            headers = getattr(resp, "headers", None) or {}
+            location = (headers.get("Location") or headers.get("location") or "").strip()
+            if not location:
+                return resp
+            nxt = urllib.parse.urljoin(current, location)
+            if not self._is_allowed_api_url(nxt):
+                logging.warning(
+                    "Refusing cross-origin API redirect (status %s)",
+                    resp.status_code,
+                )
+                return resp
+            current = nxt
+        raise requests.exceptions.TooManyRedirects(
+            f"Exceeded {MAX_REDIRECTS} redirects for API request"
+        )
+
     def _get_json(self, url: str, *, context: str) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
         """
         GET ``url`` with the same throttle / retry / proxy / CA-bundle behavior
@@ -1653,11 +1747,16 @@ class GTIClient:
         exponential backoff + jitter so concurrent analyst runs do not
         thundering-herd the API.
         """
+        cached = self._response_cache.get(url)
+        if cached is not None:
+            logging.debug("Cache hit for %s", context)
+            return cached
+
         for attempt in range(1, self.max_retries + 1):
             self._throttle()
             try:
                 logging.debug("GET %s (attempt %d/%d)", url, attempt, self.max_retries)
-                resp = self.session.get(url, timeout=self.timeout)
+                resp = self._request_get(url)
                 self._last_request_at = time.monotonic()
             except requests.RequestException as exc:
                 # Network/proxy/SSL failures — backoff then retry
@@ -1669,12 +1768,13 @@ class GTIClient:
                     error_kind = "timeout"
                 else:
                     error_kind = "network_error"
+                detail = redact_secrets(str(exc))
                 if attempt >= self.max_retries:
                     logging.error(
                         "Network error for %s after %d attempt(s): %s",
                         context,
                         attempt,
-                        exc,
+                        detail,
                     )
                     return None, error_kind, 0
                 wait = self.backoff_base**attempt + random.uniform(0, 1)
@@ -1682,7 +1782,7 @@ class GTIClient:
                     "Network error for %s (attempt %d): %s — retrying in %.1fs",
                     context,
                     attempt,
-                    exc,
+                    detail,
                     wait,
                 )
                 time.sleep(wait)
@@ -1690,9 +1790,14 @@ class GTIClient:
 
             if resp.status_code == 200:
                 try:
-                    return resp.json(), None, 200
+                    payload = resp.json()
                 except ValueError:
                     return None, "parse_error", 200
+                if not isinstance(payload, dict):
+                    return None, "parse_error", 200
+                result = (payload, None, 200)
+                self._response_cache[url] = result
+                return result
 
             if resp.status_code == 404:
                 # CVE not in GTI collections (too new, unpublished, or out of coverage)
@@ -1762,9 +1867,13 @@ class GTIClient:
 
     def get_vulnerability(self, cve: str) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
         """Fetch the vulnerability collection object for a CVE."""
-        object_id = cve_api_id(cve)
+        canonical = _canonical_cve(cve)
+        if canonical is None:
+            logging.error("Refusing invalid CVE identifier %r", (cve or "")[:64])
+            return None, "error", 0
+        object_id = cve_api_id(canonical)
         url = f"{self.base_url}/collections/{object_id}"
-        return self._get_json(url, context=cve)
+        return self._get_json(url, context=canonical)
 
     def get_observed_in_the_wild(
         self,
@@ -1776,22 +1885,30 @@ class GTIClient:
         exact filtered search supplies an authoritative boolean while keeping
         a request or parsing failure distinguishable as ``None``.
         """
+        canonical = _canonical_cve(cve)
+        if canonical is None:
+            logging.error("Refusing invalid CVE identifier %r", (cve or "")[:64])
+            return None, "error", 0
         filter_text = (
-            f'collection_type:vulnerability name:{cve} '
+            f'collection_type:vulnerability name:{canonical} '
             'vulnerability_filter:"Observed In The Wild"'
         )
         query = urllib.parse.urlencode({"filter": filter_text, "limit": 1})
         url = f"{self.base_url}/collections?{query}"
         body, err, status = self._get_json(
             url,
-            context=f"{cve} Observed In The Wild filter",
+            context=f"{canonical} Observed In The Wild filter",
         )
         if err is not None or body is None:
             return None, err or "error", status
         try:
-            return parse_observed_in_the_wild_response(cve, body), None, status
+            return parse_observed_in_the_wild_response(canonical, body), None, status
         except (TypeError, ValueError) as exc:
-            logging.warning("Could not parse Observed In The Wild result for %s: %s", cve, exc)
+            logging.warning(
+                "Could not parse Observed In The Wild result for %s: %s",
+                canonical,
+                exc,
+            )
             return None, "parse_error", status
 
     def get_relationship(
@@ -1808,16 +1925,33 @@ class GTIClient:
         pagination is followed so all returned objects are retained. Every page
         uses the same TLS/proxy/retry path as ``get_vulnerability``.
         """
-        object_id = cve_api_id(cve)
-        rel = relationship.strip().strip("/")
-        url = f"{self.base_url}/collections/{object_id}/{rel}?limit={int(limit)}"
+        canonical = _canonical_cve(cve)
+        if canonical is None:
+            logging.error("Refusing invalid CVE identifier %r", (cve or "")[:64])
+            return None, "error", 0
+        rel = relationship.strip().strip("/").lower()
+        if rel not in IOC_RELATIONSHIP_SET:
+            logging.error("Refusing unsupported relationship %r", relationship)
+            return None, "error", 0
+        page_size = min(max(1, int(limit)), IOC_PAGE_SIZE)
+        object_id = cve_api_id(canonical)
+        url = f"{self.base_url}/collections/{object_id}/{rel}?limit={page_size}"
         expected = urllib.parse.urlparse(url)
+        expected_path = _normalized_posix_path(expected.path)
         rows: list[Any] = []
         total = 0
         seen_urls: set[str] = set()
         next_url: Optional[str] = url
 
         while next_url:
+            if len(seen_urls) >= MAX_IOC_PAGES:
+                return {
+                    "data": rows,
+                    "meta": {"count": max(total, len(rows))},
+                    "_pagination_error": (
+                        f"pagination exceeded cap of {MAX_IOC_PAGES} pages"
+                    ),
+                }, None, 200
             if next_url in seen_urls:
                 return {
                     "data": rows,
@@ -1826,7 +1960,7 @@ class GTIClient:
                 }, None, 200
             seen_urls.add(next_url)
 
-            body, err, status = self._get_json(next_url, context=f"{cve}/{rel}")
+            body, err, status = self._get_json(next_url, context=f"{canonical}/{rel}")
             if err or not isinstance(body, dict):
                 if rows:
                     return {
@@ -1863,7 +1997,7 @@ class GTIClient:
             if (
                 parsed.scheme.casefold() != expected.scheme.casefold()
                 or parsed.netloc.casefold() != expected.netloc.casefold()
-                or parsed.path != expected.path
+                or _normalized_posix_path(parsed.path) != expected_path
             ):
                 return {
                     "data": rows,
@@ -1886,10 +2020,12 @@ def _safe_error_body(resp: requests.Response, limit: int = 300) -> str:
         data = resp.json()
         if isinstance(data, dict):
             err = data.get("error") or data
-            return json.dumps(err)[:limit]
-        return str(data)[:limit]
-    except Exception:
-        return (resp.text or "")[:limit]
+            preview = json.dumps(err)[:limit]
+        else:
+            preview = str(data)[:limit]
+    except (ValueError, TypeError, AttributeError, OSError):
+        preview = (resp.text or "")[:limit]
+    return redact_secrets(preview)
 
 
 # ---------------------------------------------------------------------------
@@ -2055,9 +2191,10 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         cisa_due = "N/A"
         cisa_ransom = "N/A"
 
-    # The documented API source for the GUI flag is a separate vulnerability
-    # filter query. Preserve any explicit object value here, otherwise Unknown;
-    # enrich_cves() applies the authoritative filter result afterward.
+    # GUI "Exploited in the Wild" is not a documented top-level attribute
+    # (do not default missing keys to False). Preserve any explicit object
+    # value here; enrich_cves() then applies vulnerability_filter:
+    # "Observed In The Wild" as the authoritative source.
     log_exploitation_debug(cve, attrs)
     exploited_in_wild, wild_sources, wild_explicit = derive_exploited_in_the_wild(
         attrs,
@@ -2689,16 +2826,34 @@ def _html_wild_status_note(rec: CVERecord) -> str:
     )
 
 
+_VT_HTTPS_HOSTS = frozenset({"virustotal.com", "www.virustotal.com"})
+
+
+def _is_vt_https_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse((url or "").strip())
+    host = (parsed.hostname or "").casefold()
+    return parsed.scheme == "https" and host in _VT_HTTPS_HOSTS
+
+
+def _html_vt_anchor(url: str, label: str) -> str:
+    text = _html_escape(label)
+    href = (url or "").strip()
+    if not _is_vt_https_url(href):
+        return text
+    return (
+        f'<a href="{_html_escape(href)}" target="_blank" '
+        f'rel="noopener noreferrer">{text}</a>'
+    )
+
+
 def _html_ioc_link(item: dict[str, str]) -> str:
     display = _html_escape(item.get("display") or item.get("id") or "")
     href = (item.get("vt_url") or "").strip()
-    parsed = urllib.parse.urlparse(href)
-    if (
-        parsed.scheme == "https"
-        and parsed.hostname
-        and parsed.hostname.casefold() in {"virustotal.com", "www.virustotal.com"}
-    ):
-        return f'<a class="mono" href="{_html_escape(href)}" target="_blank" rel="noopener noreferrer">{display}</a>'
+    if _is_vt_https_url(href):
+        return (
+            f'<a class="mono" href="{_html_escape(href)}" target="_blank" '
+            f'rel="noopener noreferrer">{display}</a>'
+        )
     return f'<span class="mono">{display}</span>'
 
 
@@ -3103,7 +3258,7 @@ def render_html_report(
     <span class="badge badge-unknown">{_html_escape(rec.status.upper())}</span>
   </header>
   <p class="error-msg">{_html_escape(rec.error_message or "No data")}</p>
-  <p class="meta"><a href="{_html_escape(rec.vt_url)}" target="_blank" rel="noopener">VirusTotal</a></p>
+  <p class="meta">{_html_vt_anchor(rec.vt_url, "VirusTotal")}</p>
   {_html_ioc_summary(rec, ioc_report_href)}
 </article>
 """
@@ -3214,7 +3369,7 @@ def render_html_report(
         <tr><th>Last Modified</th><td>{_html_escape(rec.last_modification_date)}</td></tr>
         <tr><th>IoCs</th><td>{_html_escape(rec.ioc_count)}</td></tr>
         <tr><th>API priority</th><td>{_html_escape(rec.priority_raw)}</td></tr>
-        <tr><th>VT collection</th><td><a href="{_html_escape(rec.vt_url)}" target="_blank" rel="noopener">Open in VirusTotal</a></td></tr>
+        <tr><th>VT collection</th><td>{_html_vt_anchor(rec.vt_url, "Open in VirusTotal")}</td></tr>
       </table>
     </div>
   </section>
@@ -3237,7 +3392,7 @@ def render_html_report(
   {ioc_section}
 
   <footer class="card-footer">
-    <a href="{_html_escape(rec.vt_url)}" target="_blank" rel="noopener">Open in VirusTotal / GTI ↗</a>
+    {_html_vt_anchor(rec.vt_url, "Open in VirusTotal / GTI ↗")}
     <span class="muted">Mitigations: {_html_escape(rec.available_mitigation)}</span>
   </footer>
 </article>
@@ -3838,7 +3993,7 @@ def _format_fatal_error(exc: BaseException) -> str:
     # Cap size so the HTML stays readable in constrained browser windows
     if len(tb) > 8000:
         tb = tb[:8000] + "\n… [traceback truncated]"
-    return f"{type(exc).__name__}: {exc}\n\n{tb}"
+    return redact_secrets(f"{type(exc).__name__}: {exc}\n\n{tb}")
 
 
 def enrich_cves(
@@ -3886,7 +4041,7 @@ def enrich_cves(
                 )
                 try:
                     attach_iocs(client, rec, body)
-                except Exception as ioc_exc:  # noqa: BLE001 — IoC list is optional
+                except (TypeError, ValueError, AttributeError, KeyError, OSError) as ioc_exc:
                     rec.ioc_status = "error"
                     rec.ioc_error = "Unexpected IOC processing failure"
                     logging.warning(
@@ -4157,17 +4312,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     setup_logging(verbose=args.verbose)
 
-    # Load .env early: populates os.environ for key, proxy, and CA resolution
-    # used by resolve_api_key / build_proxies / resolve_ssl_verify below.
-    env_path = load_project_dotenv(Path(args.env_file) if args.env_file else None)
-    if env_path:
-        logging.info("Loaded configuration from %s", env_path)
-    else:
-        logging.info(
-            "No .env file found (looked for %s). Using process environment / CLI only.",
-            DEFAULT_ENV_FILE,
-        )
-
     # Shared state for the always-on report path (success or failure).
     # Initialized *before* the try so the finally-equivalent HTML block
     # can render an empty-records failure page if we never get that far.
@@ -4186,6 +4330,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         if report_path_error:
             raise RuntimeError(report_path_error)
+        try:
+            env_path = load_project_dotenv(Path(args.env_file) if args.env_file else None)
+        except FileNotFoundError as exc:
+            raise RuntimeError(str(exc)) from exc
+        except OSError as exc:
+            raise RuntimeError(f"Unreadable .env file: {exc}") from exc
+        if env_path:
+            logging.info("Loaded configuration from %s", env_path)
+        else:
+            logging.info(
+                "No .env file found (looked for %s). Using process environment / CLI only.",
+                DEFAULT_ENV_FILE,
+            )
         # --- Resolve CVE targets, then secrets ---
         # --input (single CVE) wins over the CSV from -i / default cve_list.csv.
         if args.input is not None:
@@ -4264,7 +4421,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             ) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
                 body, err, status = original_get(cve)
                 if body is not None:
-                    out = dump_dir / f"{cve.upper()}.json"
+                    canonical = _canonical_cve(cve) or "INVALID"
+                    try:
+                        out = _safe_child_path(dump_dir, f"{canonical}.json")
+                    except ValueError:
+                        logging.warning("Refusing unsafe dump-raw path for %s", canonical)
+                        return body, err, status
                     out.write_text(json.dumps(body, indent=2), encoding="utf-8")
                     logging.debug("Dumped raw JSON → %s", out)
                 return body, err, status
@@ -4317,10 +4479,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         # That is the always-open guarantee — a missing key or SSL failure
         # must not exit before the operator gets a browsable error page.
         fatal_error = _format_fatal_error(exc)
-        logging.error("%s", exc)
+        logging.error("%s", redact_secrets(str(exc)))
         if args.verbose:
             logging.debug("%s", fatal_error)
-        log_console.print(f"[bold red]Error:[/bold red] {exc}")
+        log_console.print(f"[bold red]Error:[/bold red] {redact_secrets(str(exc))}")
         # Prefer exit 2 for config/input problems; 1 for other runtime failures
         msg = str(exc).lower()
         if any(
@@ -4333,6 +4495,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "ca bundle",
                 "placeholder",
                 "--ioc-html",
+                "env file",
+                "unreadable .env",
             )
         ):
             exit_code = 2
