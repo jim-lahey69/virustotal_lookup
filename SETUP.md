@@ -202,8 +202,8 @@ What you should see:
 3. Optional proxy line  
 4. Progress while each CVE is queried  
 5. Enriched CSV at `cve_enriched.csv`  
-6. Primary HTML report and companion `ioc_report.html` written (even if the run fails)
-7. Primary report opened in your browser; the IOC report opens only when you click a CVE's IOC link
+6. One `CVE-…_report.html` / `CVE-…_iocs.html` pair written per CVE in a multi-CVE CSV (single-CVE runs retain `report.html` / `ioc_report.html`)
+7. The first CVE report opened in your browser, followed by a numbered CLI selector; IOC reports open only from their primary-report links
 
 ### Quick connectivity check (optional)
 
@@ -228,9 +228,9 @@ curl -I -x http://webproxy:8080 --cacert ./certs/corporate-ca.pem https://www.vi
 | HTTPS proxy | If required by network | `HTTPS_PROXY` / `VT_HTTPS_PROXY` / `--https-proxy` | none (direct) |
 | Corporate CA | If SSL inspection breaks verify | `CORPORATE_CA_BUNDLE` / `--ca-bundle` / `certs/corporate-ca.pem` | system/certifi trust |
 | Request delay | No | `VT_REQUEST_DELAY` / `--delay` | `1.0` seconds |
-| HTML report | Always written | `--html` | `report.html` |
-| IOC report | Always written | `--ioc-html` | `ioc_report.html` beside the primary report |
-| Open browser | Yes by default | `--no-open` to disable | open on every run |
+| HTML report | Always written | `--html` | `report.html` for one CVE; `CVE-…_report.html` per CVE for a multi-CVE CSV |
+| IOC report | Always written | `--ioc-html` | `ioc_report.html` for one CVE; `CVE-…_iocs.html` per CVE for a multi-CVE CSV |
+| Open browser | Yes by default | `--no-open` to disable | first report opens; multi-CVE runs then show the selector |
 
 There are **no** hard-coded key or proxy placeholders inside `cve_enricher.py`. Placeholder key values such as `your_key_here` are rejected.
 
@@ -240,13 +240,13 @@ There are **no** hard-coded key or proxy placeholders inside `cve_enricher.py`. 
 
 | Outcome | Primary report | IOC report | Browser |
 |---------|----------------|------------|---------|
-| All CVEs enriched | Full cards + IOC deep links | One anchored section per CVE | Primary opens |
-| Partial success | Cards + error cards | IOC data/status per CVE | Primary opens |
+| All CVEs enriched | One full report per CVE + IOC link | One complete IOC report per CVE | First opens; numbered selector can open more |
+| Partial success | One full/error report per CVE | IOC data/status per CVE | First opens; numbered selector can open more |
 | Missing API key / bad input | Error banner + traceback summary | Failure audit page | Primary opens |
 | SSL / proxy / network failure | Error banner + traceback summary | Failure audit page | Primary opens |
 | Privilege 401/403 | Per-CVE + summary banner | Failure status per CVE | Primary opens |
 
-Use `--no-open` only for automation/CI. Both report files are still written. The IOC report is never opened automatically, preventing multiple tabs after a run.
+Use `--no-open` for automation/CI. All report files are still written, and both the automatic first-report open and selector are skipped. IOC reports are never opened automatically.
 
 ---
 
@@ -261,7 +261,7 @@ Use `--no-open` only for automation/CI. Both report files are still written. The
 | SSL / certificate verify failed | Corporate TLS inspection without org CA | Export root CA → `certs/corporate-ca.pem` or set `CORPORATE_CA_BUNDLE` |
 | CA bundle not found | Path in `.env` wrong or file not created | Check path relative to project root |
 | `429` rate limited | Too many requests | Increase `--delay` (e.g. `1.5` or `2.0`) |
-| Browser did not open | Restricted desktop / headless | Open `report.html` manually; or check logs |
+| Browser did not open | Restricted desktop / headless | Open `report.html` (single CVE) or the desired `CVE-…_report.html` manually; or check logs |
 
 ---
 

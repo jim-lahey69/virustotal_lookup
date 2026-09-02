@@ -41,6 +41,10 @@ def _reports_for(records: list[ce.CVERecord]) -> tuple[str, str]:
         )
 
 
+def _ioc_row_count(report: str) -> int:
+    return report.count('class="ioc-record"')
+
+
 class ExploitationStateTests(unittest.TestCase):
     def test_all_official_labels_and_levels(self) -> None:
         expected = {
@@ -366,6 +370,8 @@ class IocReportingTests(unittest.TestCase):
         self.assertIn("http://evil.example/log4j", ioc)
         self.assertIn("IOC Type", ioc)
         self.assertIn("IOC Value", ioc)
+        self.assertIn("Indicators of Compromise: <span class=\"ioc-count\">3</span>", ioc)
+        self.assertEqual(_ioc_row_count(ioc), 3)
 
     def test_explicit_zero_iocs_has_clear_message(self) -> None:
         rec = ce.extract_record(
@@ -377,6 +383,56 @@ class IocReportingTests(unittest.TestCase):
         self.assertIn("No associated IOCs returned by VirusTotal.", primary)
         self.assertIn("No associated IOCs returned by VirusTotal.", ioc)
         self.assertIn('href="ioc_report.html#CVE-1900-0008"', primary)
+        self.assertIn("Indicators of Compromise: <span class=\"ioc-count\">0</span>", ioc)
+        self.assertEqual(_ioc_row_count(ioc), 0)
+
+    def test_one_ioc_count_matches_one_rendered_row(self) -> None:
+        value = "only.example"
+        rec = ce.CVERecord(
+            cve="CVE-1900-0001",
+            ioc_status="complete",
+            ioc_count="1",
+            ioc_domains_total=1,
+            ioc_domains=[{"id": value, "display": value}],
+        )
+        _, ioc = _reports_for([rec])
+        self.assertIn("Indicators of Compromise: <span class=\"ioc-count\">1</span>", ioc)
+        self.assertEqual(_ioc_row_count(ioc), 1)
+        self.assertEqual(ioc.count(value), 1)
+
+    def test_log4j_twenty_iocs_are_all_rendered(self) -> None:
+        file_rows = [
+            {
+                "type": "file",
+                "id": f"{index:064x}",
+                "attributes": {"sha256": f"{index:064x}"},
+            }
+            for index in range(18)
+        ]
+        url_rows = [
+            {
+                "type": "url",
+                "id": f"url-{index}",
+                "attributes": {"url": f"https://ioc.example/log4j/{index}"},
+            }
+            for index in range(2)
+        ]
+
+        class _Stub:
+            def get_relationship(self, cve: str, relationship: str, *, limit: int = 40):
+                rows = file_rows if relationship == "files" else url_rows
+                return {"data": rows, "meta": {"count": len(rows)}}, None, 200
+
+        payload = _load("cve-2021-44228.json")
+        rec = ce.extract_record("CVE-2021-44228", payload)
+        ce.attach_iocs(_Stub(), rec, payload)  # type: ignore[arg-type]
+        _, ioc = _reports_for([rec])
+        self.assertEqual(rec.ioc_status, "complete")
+        self.assertEqual(ce._ioc_record_count(rec), 20)
+        self.assertIn("Indicators of Compromise: <span class=\"ioc-count\">20</span>", ioc)
+        self.assertEqual(_ioc_row_count(ioc), 20)
+        for item in rec.ioc_files + rec.ioc_urls:
+            self.assertIn(item["display"], ioc)
 
     def test_absent_ioc_property_is_not_reported_as_none(self) -> None:
         rec = ce.extract_record("CVE-1900-0009", {"data": {"attributes": {}}})
@@ -434,7 +490,26 @@ class IocReportingTests(unittest.TestCase):
         primary, ioc = _reports_for([rec])
         self.assertNotIn(f"{29:064x}", primary)
         self.assertIn(f"{29:064x}", ioc)
-        self.assertIn("the API returned 30 for this run", ioc)
+        self.assertIn("the API returned 30 unique renderable record(s) for this run", ioc)
+        self.assertIn("Indicators of Compromise: <span class=\"ioc-count\">30</span>", ioc)
+        self.assertEqual(_ioc_row_count(ioc), 30)
+
+    def test_one_hundred_iocs_are_not_sliced_or_hidden(self) -> None:
+        domains = [
+            {"id": f"ioc-{index}.example", "display": f"ioc-{index}.example"}
+            for index in range(100)
+        ]
+        rec = ce.CVERecord(
+            cve="CVE-1900-0100",
+            ioc_status="complete",
+            ioc_count="100",
+            ioc_domains_total=100,
+            ioc_domains=domains,
+        )
+        _, ioc = _reports_for([rec])
+        self.assertIn("Indicators of Compromise: <span class=\"ioc-count\">100</span>", ioc)
+        self.assertEqual(_ioc_row_count(ioc), 100)
+        self.assertIn("ioc-99.example", ioc)
 
     def test_multiple_cves_deep_link_to_their_own_sections(self) -> None:
         records = []
@@ -540,7 +615,8 @@ class AttachIocsTests(unittest.TestCase):
         self.assertEqual([call[1] for call in stub.called], ["files", "urls"])
         self.assertEqual(len(rec.ioc_files), 2)
         self.assertEqual(rec.ioc_files[0]["name"], "exploit.jar")
-        self.assertEqual(rec.ioc_status, "complete")
+        self.assertEqual(rec.ioc_status, "partial")
+        self.assertIn("reported 3 IOC(s)", rec.ioc_error)
 
 
 class IocPaginationTests(unittest.TestCase):
@@ -576,6 +652,38 @@ class IocPaginationTests(unittest.TestCase):
         self.assertEqual((error, status), (None, 200))
         self.assertEqual(len(calls), 2)
         self.assertEqual([row["id"] for row in body["data"]], ["one.example", "two.example"])
+
+    def test_relationship_fetch_collects_one_hundred_objects_across_pages(self) -> None:
+        client = ce.GTIClient("test-key", delay=0, max_retries=1)
+        calls: list[str] = []
+
+        def _fake_get(url: str, *, context: str):
+            page = len(calls)
+            calls.append(url)
+            start, stop = ((0, 40), (40, 80), (80, 100))[page]
+            body = {
+                "data": [
+                    {"type": "domain", "id": f"ioc-{index}.example"}
+                    for index in range(start, stop)
+                ],
+                "meta": {"count": 100},
+            }
+            if page < 2:
+                body["links"] = {
+                    "next": (
+                        "https://www.virustotal.com/api/v3/collections/"
+                        "vulnerability--cve-2026-40100/domains"
+                        f"?cursor=page{page + 2}&limit=40"
+                    )
+                }
+            return body, None, 200
+
+        client._get_json = _fake_get  # type: ignore[method-assign]
+        body, error, status = client.get_relationship("CVE-2026-40100", "domains")
+        self.assertEqual((error, status), (None, 200))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(body["data"]), 100)
+        self.assertEqual(body["data"][-1]["id"], "ioc-99.example")
 
     def test_relationship_fetch_rejects_cross_origin_next_link(self) -> None:
         client = ce.GTIClient("test-key", delay=0, max_retries=1)

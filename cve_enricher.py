@@ -40,10 +40,11 @@ Do **not** disable TLS verification. Place your org root CA at
 
 HTML report
 -----------
-The primary HTML report (default ``report.html``) and companion IOC report
-(default ``ioc_report.html``) are always written. Only the primary report is
-opened automatically; per-CVE links open the corresponding IOC section on
-demand. Failure reports include a prominent error section.
+Single-CVE runs write the primary HTML report (default ``report.html``) and
+companion IOC report (default ``ioc_report.html``). Multi-CVE runs write one
+``CVE-..._report.html`` / ``CVE-..._iocs.html`` pair per input record, open the
+first primary report automatically, and offer a lightweight numbered selector
+for additional reports. Failure reports include a prominent error section.
 
 Report architecture
 -------------------
@@ -1308,6 +1309,23 @@ def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) ->
             setattr(rec, total_attr, meta_count)
         logging.debug("Fetched %d %s IoC(s) for %s (total=%s)", len(items), rel, rec.cve, getattr(rec, total_attr))
 
+    collected_count = _ioc_record_count(rec)
+    reported_count = max(
+        counts["iocs"],
+        sum(counts[relationship] for relationship in IOC_RELATIONSHIPS),
+    )
+    if collected_count < reported_count and not failures:
+        failures.append(
+            f"VirusTotal reported {reported_count} IOC(s), but the relationship "
+            f"endpoints returned {collected_count} unique renderable record(s)"
+        )
+    logging.debug(
+        "Collected %d unique IOC record(s) for %s (VirusTotal reported %d)",
+        collected_count,
+        rec.cve,
+        reported_count,
+    )
+
     if failures:
         rec.ioc_status = "partial" if successes else "error"
         rec.ioc_error = "; ".join(failures)
@@ -2432,6 +2450,28 @@ def default_ioc_report_path(primary_path: Path) -> Path:
     return candidate
 
 
+def _report_targets(
+    records: list[CVERecord],
+    primary_path: Path,
+    ioc_path: Path,
+) -> list[tuple[list[CVERecord], Path, Path]]:
+    """Map records to report files, retaining legacy paths for zero/one CVE."""
+    if len(records) <= 1:
+        return [(records, primary_path, ioc_path)]
+
+    targets: list[tuple[list[CVERecord], Path, Path]] = []
+    for rec in records:
+        safe_cve = _ioc_anchor_id(rec.cve)
+        targets.append(
+            (
+                [rec],
+                primary_path.with_name(f"{safe_cve}_report.html"),
+                ioc_path.with_name(f"{safe_cve}_iocs.html"),
+            )
+        )
+    return targets
+
+
 def _relative_report_href(source_path: Path, target_path: Path) -> str:
     """Return a URL-encoded relative link suitable for local ``file://`` use."""
     try:
@@ -2662,6 +2702,19 @@ def _html_ioc_link(item: dict[str, str]) -> str:
     return f'<span class="mono">{display}</span>'
 
 
+def _ioc_record_count(rec: CVERecord) -> int:
+    """Return the number of unique IOC records available to the renderer."""
+    return sum(
+        len(items)
+        for items in (
+            rec.ioc_files,
+            rec.ioc_urls,
+            rec.ioc_domains,
+            rec.ioc_ip_addresses,
+        )
+    )
+
+
 def _html_ioc_table(
     title: str,
     items: list[dict[str, str]],
@@ -2672,10 +2725,10 @@ def _html_ioc_table(
     if not items and total <= 0:
         return ""
     shown = items
-    unreturned = max(0, total - len(shown)) if total else 0
+    rendered_count = len(shown)
     if not shown:
         return (
-            f"<h4>{_html_escape(title)} <span class='muted'>({total})</span></h4>"
+            f"<h4>{_html_escape(title)} <span class='muted'>(0)</span></h4>"
             f"<p class='muted'>Count reported by GTI, but no objects were returned for this type.</p>"
         )
     if kind == "files":
@@ -2687,7 +2740,7 @@ def _html_ioc_table(
             ftype = it.get("type") or ""
             name_type = " · ".join(p for p in (name, ftype) if p) or "—"
             body_rows.append(
-                "<tr>"
+                '<tr class="ioc-record">'
                 "<td>SHA-256</td>"
                 f"<td>{_html_ioc_link(it)}</td>"
                 f"<td class='mono muted'>{_html_escape(hashes) if hashes else '—'}</td>"
@@ -2705,19 +2758,19 @@ def _html_ioc_table(
         }.get(kind, "Indicator")
         head = "<tr><th>IOC Type</th><th>IOC Value</th></tr>"
         body = "".join(
-            f"<tr><td>{_html_escape(type_label)}</td><td>{_html_ioc_link(it)}</td></tr>"
+            f'<tr class="ioc-record"><td>{_html_escape(type_label)}</td><td>{_html_ioc_link(it)}</td></tr>'
             for it in shown
         )
     more_line = ""
-    if unreturned > 0:
+    if total and total != rendered_count:
         more_line = (
             f"<p class='muted ioc-more'>VirusTotal reports {total} object(s); "
-            f"the API returned {len(shown)} for this run.</p>"
+            f"the API returned {rendered_count} unique renderable record(s) for this run.</p>"
         )
     return f"""
-    <h4>{_html_escape(title)} <span class="muted">({total or len(shown)})</span></h4>
+    <h4>{_html_escape(title)} <span class="muted">({rendered_count})</span></h4>
     <div class="ioc-wrap">
-      <table class="ioc">{head}{body}</table>
+      <table class="ioc"><thead>{head}</thead><tbody>{body}</tbody></table>
     </div>
     {more_line}
 """
@@ -2743,6 +2796,11 @@ def _partition_ip_iocs(
 
 def _html_ioc_detail_section(rec: CVERecord) -> str:
     """Render IOC objects while preserving none/absent/error distinctions."""
+    rendered_count = _ioc_record_count(rec)
+    heading = (
+        'Indicators of Compromise: '
+        f'<span class="ioc-count">{rendered_count}</span>'
+    )
     ipv4, ipv6, other_ips = _partition_ip_iocs(rec.ioc_ip_addresses)
     blocks = [
         _html_ioc_table("Files", rec.ioc_files, rec.ioc_files_total, kind="files"),
@@ -2753,7 +2811,6 @@ def _html_ioc_detail_section(rec: CVERecord) -> str:
         _html_ioc_table("Other / unclassified", other_ips, len(other_ips), kind="other"),
     ]
     nonempty = [b for b in blocks if b]
-    total_label = rec.ioc_count if rec.ioc_count not in {"N/A", ""} else ""
     status_note = ""
     if rec.ioc_status in {"partial", "error"}:
         detail = rec.ioc_error or "VirusTotal did not return the requested IOC relationships."
@@ -2762,10 +2819,9 @@ def _html_ioc_detail_section(rec: CVERecord) -> str:
             f"{_html_escape(detail)}</p>"
         )
     if nonempty:
-        count_bit = f' <span class="muted">({_html_escape(str(total_label))})</span>' if total_label else ""
         return f"""
   <section class="iocs">
-    <h3>Indicators of Compromise{count_bit}</h3>
+    <h3>{heading}</h3>
     {status_note}
     {"".join(nonempty)}
   </section>
@@ -2773,14 +2829,14 @@ def _html_ioc_detail_section(rec: CVERecord) -> str:
     if rec.ioc_status in {"partial", "error"}:
         return f"""
   <section class="iocs">
-    <h3>Indicators of Compromise</h3>
+    <h3>{heading}</h3>
     {status_note}
   </section>
 """
     if rec.ioc_status == "not_returned":
-        return """
+        return f"""
   <section class="iocs">
-    <h3>Indicators of Compromise</h3>
+    <h3>{heading}</h3>
     <p class="muted">IOC availability was not returned by VirusTotal.</p>
   </section>
 """
@@ -2793,13 +2849,13 @@ def _html_ioc_detail_section(rec: CVERecord) -> str:
     if reported > 0:
         return f"""
   <section class="iocs">
-    <h3>Indicators of Compromise <span class="muted">({_html_escape(str(reported))})</span></h3>
+    <h3>{heading}</h3>
     <p class="muted">VirusTotal reports {reported} associated IOC(s), but no relationship objects were returned.</p>
   </section>
 """
-    return """
+    return f"""
   <section class="iocs">
-    <h3>Indicators of Compromise</h3>
+    <h3>{heading}</h3>
     <p class="muted">No associated IOCs returned by VirusTotal.</p>
   </section>
 """
@@ -2816,17 +2872,7 @@ def _html_ioc_summary(rec: CVERecord, report_href: str) -> str:
     elif rec.ioc_status in {"partial", "error"}:
         status = "IOC retrieval failed or was incomplete; see the IOC report for details."
     else:
-        count = rec.ioc_count if rec.ioc_count not in {"", "N/A"} else str(
-            sum(
-                len(items)
-                for items in (
-                    rec.ioc_files,
-                    rec.ioc_urls,
-                    rec.ioc_domains,
-                    rec.ioc_ip_addresses,
-                )
-            )
-        )
+        count = str(_ioc_record_count(rec))
         status = f"{count} associated indicator(s)."
     return f"""
   <section class="iocs ioc-summary">
@@ -2849,6 +2895,9 @@ def render_ioc_report(
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     primary_path = primary_report_path or path.with_name(DEFAULT_HTML)
     primary_href = _relative_report_href(path, primary_path)
+    expected_rendered_count = sum(
+        _ioc_record_count(rec) for rec in records if rec.status == "ok"
+    )
 
     nav_links: list[str] = []
     sections: list[str] = []
@@ -2945,7 +2994,7 @@ def render_ioc_report(
   <main class="wrap">
     <header class="page-header">
       <h1>{_html_escape(title)}</h1>
-      <div class="meta">Generated {generated} · {len(records)} CVE(s) · one section per CVE</div>
+      <div class="meta">Generated {generated} · {len(records)} CVE(s) · Indicators of Compromise: {expected_rendered_count}</div>
       <div class="nav">{''.join(nav_links)}</div>
     </header>
     {fatal_section}
@@ -2958,6 +3007,12 @@ def render_ioc_report(
 </body>
 </html>
 """
+    actual_rendered_count = doc.count('class="ioc-record"')
+    if actual_rendered_count != expected_rendered_count:
+        raise RuntimeError(
+            "IOC report rendering mismatch: "
+            f"received {expected_rendered_count} record(s), rendered {actual_rendered_count}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(doc, encoding="utf-8")
     logging.info("Wrote IOC report: %s", path)
@@ -3677,6 +3732,40 @@ def open_report_in_browser(path: Path) -> None:
     )
 
 
+def select_report_to_open(reports: list[tuple[str, Path]]) -> None:
+    """Let an analyst open any additional per-CVE reports in input order."""
+    if len(reports) <= 1:
+        return
+
+    print("\nAvailable CVE reports:\n")
+    for index, (cve, _) in enumerate(reports, start=1):
+        print(f"{index}: {cve}")
+
+    while True:
+        try:
+            selection = input(
+                "\nSelect a report to open by number, or press Enter to exit: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if not selection:
+            return
+        try:
+            selected_index = int(selection)
+        except ValueError:
+            selected_index = 0
+
+        if not 1 <= selected_index <= len(reports):
+            print(f"Invalid selection. Enter a number between 1 and {len(reports)}.")
+            continue
+
+        cve, report_path = reports[selected_index - 1]
+        print(f"Opening report for {cve}...")
+        open_report_in_browser(report_path)
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -3934,7 +4023,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Define CLI flags; defaults favor .env for secrets and network settings.
 
     Flags are overrides, not the primary config surface. ``--html`` always
-    has a path (default ``report.html``) because the report is always written.
+    has a path (default ``report.html``); on multi-CVE runs its directory is
+    used for the individual ``CVE-..._report.html`` files.
     ``--no-open`` is the only way to skip the browser, and it does not skip
     the write.
     """
@@ -3968,13 +4058,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--html",
         default=DEFAULT_HTML,
         metavar="PATH",
-        help="Self-contained HTML report path (always written and opened)",
+        help=(
+            "Self-contained HTML report path; multi-CVE runs write "
+            "CVE-..._report.html files in its directory"
+        ),
     )
     p.add_argument(
         "--ioc-html",
         default=None,
         metavar="PATH",
-        help="IOC HTML report path (default: ioc_report.html beside --html)",
+        help=(
+            "IOC HTML report path; multi-CVE runs write CVE-..._iocs.html "
+            "files in its directory (default: beside --html)"
+        ),
     )
     p.add_argument(
         "--no-open",
@@ -4049,8 +4145,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     Guarantees: after parse + logging setup, primary and IOC HTML reports are
     always generated, even when the run fails with a missing key, SSL error,
-    bad input, or unexpected exception. Only the primary report is opened
-    automatically (unless ``--no-open``).
+    bad input, or unexpected exception. Multi-CVE runs generate one pair per
+    record. The first primary report opens automatically and a numbered selector
+    can open more reports (unless ``--no-open``).
 
     Exit codes (unchanged): 0 = at least one success; 1 = no successes /
     runtime error; 2 = config/input/CA; 3 = privilege (401/403) and zero
@@ -4243,8 +4340,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             exit_code = 1
 
     # ------------------------------------------------------------------
-    # Always write both HTML reports (success, partial, or total failure), but
-    # open only the primary report. The IOC report opens on analyst click.
+    # Always write HTML reports (success, partial, or total failure). Multi-CVE
+    # runs get one primary/IOC pair per CVE; zero/single-CVE runs retain the
+    # configured legacy paths. IOC reports open only from their primary report.
     #
     # This block intentionally sits *outside* the main try so config/SSL/key
     # failures still produce a browsable error page. ``records`` may be empty
@@ -4254,39 +4352,61 @@ def main(argv: Optional[list[str]] = None) -> int:
     # swallows the original enrichment exit code if it was already non-zero.
     # ------------------------------------------------------------------
     report_failed = False
-    try:
-        render_ioc_report(
-            records,
-            ioc_path,
-            title="GTI IOC Report" if not fatal_error else "GTI IOC Report — FAILED",
-            primary_report_path=html_path,
-            fatal_error=fatal_error,
-        )
-        logging.info("IOC report: %s", ioc_path.resolve())
-    except Exception as report_exc:  # noqa: BLE001
-        report_failed = True
-        logging.error("Failed to write IOC report: %s", report_exc)
-
-    primary_written = False
-    try:
-        title = "GTI CVE Enrichment Report"
+    written_primary_reports: list[tuple[str, Path]] = []
+    fallback_primary_path: Optional[Path] = None
+    targets = _report_targets(records, html_path, ioc_path)
+    for target_records, target_primary_path, target_ioc_path in targets:
+        cve_label = target_records[0].cve if target_records else ""
+        ioc_title = "GTI IOC Report"
+        primary_title = "GTI CVE Enrichment Report"
+        if len(records) > 1:
+            ioc_title = f"{ioc_title} — {cve_label}"
+            primary_title = f"{primary_title} — {cve_label}"
         if fatal_error:
-            title = "GTI CVE Enrichment Report — FAILED"
-        render_html_report(
-            records,
-            html_path,
-            title=title,
-            fatal_error=fatal_error,
-            ioc_report_path=ioc_path,
-        )
-        primary_written = True
-        logging.info("HTML report: %s", html_path.resolve())
-    except Exception as report_exc:  # noqa: BLE001
-        report_failed = True
-        logging.error("Failed to write primary HTML report: %s", report_exc)
+            ioc_title = f"{ioc_title} — FAILED"
+            primary_title = f"{primary_title} — FAILED"
 
-    if primary_written and not args.no_open:
-        open_report_in_browser(html_path)
+        try:
+            render_ioc_report(
+                target_records,
+                target_ioc_path,
+                title=ioc_title,
+                primary_report_path=target_primary_path,
+                fatal_error=fatal_error,
+            )
+            logging.info("IOC report: %s", target_ioc_path.resolve())
+        except Exception as report_exc:  # noqa: BLE001
+            report_failed = True
+            logging.error("Failed to write IOC report for %s: %s", cve_label or "run", report_exc)
+
+        try:
+            render_html_report(
+                target_records,
+                target_primary_path,
+                title=primary_title,
+                fatal_error=fatal_error,
+                ioc_report_path=target_ioc_path,
+            )
+            logging.info("HTML report: %s", target_primary_path.resolve())
+            if target_records:
+                written_primary_reports.append((cve_label, target_primary_path))
+            else:
+                fallback_primary_path = target_primary_path
+        except Exception as report_exc:  # noqa: BLE001
+            report_failed = True
+            logging.error(
+                "Failed to write primary HTML report for %s: %s",
+                cve_label or "run",
+                report_exc,
+            )
+
+    if not args.no_open:
+        if written_primary_reports:
+            open_report_in_browser(written_primary_reports[0][1])
+            if len(written_primary_reports) > 1:
+                select_report_to_open(written_primary_reports)
+        elif fallback_primary_path is not None:
+            open_report_in_browser(fallback_primary_path)
     if report_failed and exit_code == 0:
         exit_code = 1
 

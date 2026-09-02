@@ -14,8 +14,8 @@ GET https://www.virustotal.com/api/v3/collections/vulnerability--{cve-lowercase}
 
 - A structured **CSV** for tickets, SIEM, or spreadsheets  
 - **Rich terminal cards** for interactive review  
-- A self-contained primary **HTML report** that always opens in your browser
-- A companion **IOC report** with per-CVE deep links from the primary report
+- A self-contained primary **HTML report** per CVE; the first opens automatically
+- A companion **IOC report** per CVE with a working link from its primary report
 
 It is built for **corporate Windows environments**: API key and proxy live in a project `.env` file (no session-level `$env:` every time you open PowerShell), and TLS works with **corporate SSL inspection** via an explicit CA bundle—never by disabling certificate verification.
 
@@ -28,7 +28,8 @@ It is built for **corporate Windows environments**: API key and proxy live in a 
 - **VirusTotal / GTI CVE enrichment** — risk rating, EPSS, CVSS, CISA KEV, exploitation state, affected products, and more  
 - **Derived priority (P0–P4)** — GTI-style priority from risk + exploitation signals (the raw API `priority` field is also preserved)  
 - **Dynamic priority visualization** — offline inline SVG driven by the same normalized Risk Rating, Exploit Availability, and Exploitation State values as the text report
-- **Separate IOC workflow** — one `ioc_report.html` per run; the main report keeps only count/status and a link to the correct CVE anchor
+- **Separate IOC workflow** — complete, paginated IOC rows live in a companion report; its visible count is the number of unique rows actually rendered
+- **Lightweight report selection** — multi-CVE runs create one report pair per CVE and offer a numbered CLI selector in input order
 - **`.env` configuration** — single source of truth for API key, HTTP proxy, and corporate CA path (loaded via `python-dotenv`)  
 - **Corporate proxy support** — `HTTP_PROXY` / `HTTPS_PROXY` applied to the `requests` session  
 - **Corporate SSL inspection** — use a PEM/CRT root CA (`CORPORATE_CA_BUNDLE` or `./certs/corporate-ca.pem`); TLS verification is always on  
@@ -230,8 +231,8 @@ python cve_enricher.py --input CVE-2026-12345
 | `--input CVE` | Single CVE identifier to enrich (example: `CVE-2026-12345`). When set, this ID is the sole target and the CSV from `-i` is ignored. | none |
 | `-i FILE` | Input CSV of CVE IDs (ignored when `--input` is set) | `cve_list.csv` |
 | `-o` / `--output` | Enriched CSV path | `cve_enriched.csv` |
-| `--html PATH` | HTML report path (always written) | `report.html` |
-| `--ioc-html PATH` | Companion IOC report path | `ioc_report.html` beside `--html` |
+| `--html PATH` | Single-CVE HTML path; for multi-CVE runs, supplies the directory for `CVE-…_report.html` files | `report.html` |
+| `--ioc-html PATH` | Single-CVE IOC path; for multi-CVE runs, supplies the directory for `CVE-…_iocs.html` files | `ioc_report.html` beside `--html` |
 | `--no-open` | Write HTML but do not open a browser | off |
 | `--no-rich` | Skip Rich terminal cards | off |
 | `--api-key` | API key (prefer `.env`) | from `.env` |
@@ -257,11 +258,13 @@ python cve_enricher.py --input CVE-2026-12345
 
 ## HTML Report
 
-After **every** run—success, partial success, or complete failure—the tool:
+For a single CVE, after **every** run—success, partial success, or complete failure—the tool:
 
 1. Writes the self-contained primary report (default `report.html`)
-2. Writes one companion IOC report (default `ioc_report.html`) with an anchored section for every requested CVE
-3. Opens only the primary report in the default browser; the IOC report opens when its per-CVE link is clicked
+2. Writes its companion IOC report (default `ioc_report.html`)
+3. Opens the primary report in the default browser; the IOC report opens when its link is clicked
+
+For a CSV with multiple CVEs, the tool writes `CVE-…_report.html` and `CVE-…_iocs.html` for every record in the original input order. It opens the first CVE report, prints the numbered list, and accepts repeated selections until Enter is pressed. Invalid and out-of-range selections are reported without ending the enrichment run. `--no-open` skips both the automatic open and selector.
 
 ### What the report contains
 
@@ -276,7 +279,7 @@ After **every** run—success, partial success, or complete failure—the tool:
 - Prominent **Run failed** banner with exception message and traceback summary  
 - Any partial per-CVE results still appear below the banner  
 
-Use `--no-open` only for automation/CI; both files are still written so you can open them manually.
+Use `--no-open` for automation/CI; all applicable report files are still written so you can open them manually.
 
 ### Report mapping notes
 
@@ -284,7 +287,7 @@ These rules are implemented in `cve_enricher.py` (extraction + HTML template). T
 
 **CVE identifier.** CVE is the canonical vulnerability identifier in the API mapping, internal record, CSV, terminal output, and HTML report. Context still includes CWE, disclosure/last-modified dates, products, risk factors, and the VirusTotal collection URL.
 
-**IOCs.** `counters.iocs` / `files_count` / etc. are counts only. When a count is greater than zero the client fetches relationship objects (`files`, `urls`, `domains`, `ip_addresses`) once as part of enrichment using the same proxy, corporate CA bundle, throttle, and retry path as the collection GET. Each relationship uses a 40-object page size and follows VirusTotal's supported `links.next` pagination; next-page URLs are restricted to the configured API origin and relationship path before the API key-bearing request is sent. The normalized objects are rendered only in `ioc_report.html`; each primary-report card links to `ioc_report.html#CVE-…`. The IOC report groups files, URLs, domains, IPv4, IPv6, and unclassified values, preserves full values, and deduplicates identical returned objects. Explicit zero, absent counters, request failure, partial pagination, and response-parsing failure remain distinct statuses, and every CVE still receives an IOC section.
+**IOCs.** `counters.iocs` / `files_count` / etc. are counts only. When a count is greater than zero the client fetches relationship objects (`files`, `urls`, `domains`, `ip_addresses`) once as part of enrichment using the same proxy, corporate CA bundle, throttle, and retry path as the collection GET. Each relationship uses a 40-object page size and follows VirusTotal's supported `links.next` pagination; next-page URLs are restricted to the configured API origin and relationship path before the API key-bearing request is sent. The IOC report groups files, URLs, domains, IPv4, IPv6, and unclassified values, preserves full values, and removes only identical indicators within the same relationship type. It does not slice the returned collection. The visible `Indicators of Compromise` count is computed from the unique table rows actually rendered, and report generation verifies that the collected and rendered row totals match. A counter/relationship shortfall is marked partial and explained in the report. Explicit zero, absent counters, request failure, partial pagination, and response-parsing failure remain distinct statuses.
 
 **Exploitation State.** The value is shown with the existing color treatment plus an info icon. Tooltip text is the official definition (“Indicates our knowledge of the current exploitation landscape…”) and the level legend: 0 = No Known, 1 = Suspected, 2 = Reported, 3 = Confirmed, 4 = Wide. Missing or unrecognized API values render as **Unknown**, not “No Known”.
 
@@ -372,8 +375,8 @@ virustotal/
 | File | Purpose |
 |------|---------|
 | `cve_enriched.csv` | Flattened enrichment results |
-| `report.html` | Always-written HTML report (opened in browser) |
-| `ioc_report.html` | Always-written companion IOC report (opened from per-CVE links) |
+| `report.html` / `ioc_report.html` | Single-CVE or pre-enrichment-failure report pair |
+| `CVE-…_report.html` / `CVE-…_iocs.html` | Per-CVE report pairs for multi-CVE CSV runs |
 
 ---
 
