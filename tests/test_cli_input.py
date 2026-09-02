@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import cve_enricher as ce  # noqa: E402
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 def _success_record(cve: str) -> ce.CVERecord:
@@ -64,6 +67,7 @@ class InputParserTests(unittest.TestCase):
         help_text = ce.build_arg_parser().format_help()
         self.assertIn("--input CVE", help_text)
         self.assertIn("Single CVE identifier to enrich", help_text)
+        self.assertIn("--ioc-html PATH", help_text)
 
     def test_missing_input_value_is_a_parser_error(self) -> None:
         stderr = io.StringIO()
@@ -133,6 +137,77 @@ class ClientErrorClassificationTests(unittest.TestCase):
 
 
 class InputMainTests(unittest.TestCase):
+    def test_successful_fixture_run_writes_linked_reports(self) -> None:
+        cve = "CVE-2021-44228"
+        vulnerability = json.loads(
+            (FIXTURES / "cve-2021-44228.json").read_text(encoding="utf-8")
+        )
+        related_files = json.loads(
+            (FIXTURES / "relationship-files.json").read_text(encoding="utf-8")
+        )
+
+        class FixtureClient:
+            def get_vulnerability(self, requested_cve: str):
+                self.assert_cve = requested_cve
+                return vulnerability, None, 200
+
+            def get_observed_in_the_wild(self, requested_cve: str):
+                return True, None, 200
+
+            def get_relationship(self, requested_cve: str, relationship: str, *, limit: int = 40):
+                if relationship == "files":
+                    return related_files, None, 200
+                if relationship == "urls":
+                    return {
+                        "data": [
+                            {
+                                "type": "url",
+                                "id": "fixture-url-id",
+                                "attributes": {"url": "https://ioc.example/exploit"},
+                            }
+                        ],
+                        "meta": {"count": 1},
+                    }, None, 200
+                return {"data": [], "meta": {"count": 0}}, None, 200
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "result.csv"
+            primary = root / "report.html"
+            ioc = root / "ioc_report.html"
+            with (
+                patch.object(ce, "load_project_dotenv", return_value=None),
+                patch.object(ce, "resolve_api_key", return_value="test-api-key"),
+                patch.object(ce, "build_proxies", return_value=None),
+                patch.object(ce, "resolve_ssl_verify", return_value=True),
+                patch.object(ce, "resolve_request_delay", return_value=0.0),
+                patch.object(ce, "GTIClient", return_value=FixtureClient()),
+            ):
+                exit_code = ce.main(
+                    [
+                        "--input",
+                        cve,
+                        "--output",
+                        str(output),
+                        "--html",
+                        str(primary),
+                        "--ioc-html",
+                        str(ioc),
+                        "--no-open",
+                        "--no-rich",
+                    ]
+                )
+            primary_html = primary.read_text(encoding="utf-8")
+            ioc_html = ioc.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn('<svg class="priority-chart"', primary_html)
+        self.assertIn(f'href="ioc_report.html#{cve}"', primary_html)
+        self.assertNotIn("exploit.jar", primary_html)
+        self.assertIn(f'id="{cve}"', ioc_html)
+        self.assertIn("exploit.jar", ioc_html)
+        self.assertIn("https://ioc.example/exploit", ioc_html)
+
     def test_valid_input_reaches_existing_pipeline_exactly_once(self) -> None:
         cve = "CVE-2026-12345"
         record = _success_record(cve)
@@ -152,6 +227,7 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "enrich_cves", return_value=[record]) as enrich,
                 patch.object(ce, "write_csv") as write_csv,
                 patch.object(ce, "print_rich_report"),
+                patch.object(ce, "render_ioc_report") as render_ioc,
                 patch.object(ce, "render_html_report") as render_html,
                 patch.object(ce, "open_report_in_browser") as open_browser,
             ):
@@ -171,7 +247,9 @@ class InputMainTests(unittest.TestCase):
         load_cve_list.assert_not_called()
         enrich.assert_called_once_with(client, [cve], stop_on_forbidden=True)
         write_csv.assert_called_once_with([record], output)
+        self.assertEqual(render_ioc.call_args.args[:2], ([record], html.with_name("ioc_report.html")))
         self.assertEqual(render_html.call_args.args[:2], ([record], html))
+        self.assertEqual(render_html.call_args.kwargs["ioc_report_path"], html.with_name("ioc_report.html"))
         open_browser.assert_not_called()
 
     def test_lowercase_input_is_canonical_before_pipeline_call(self) -> None:
@@ -189,6 +267,7 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "enrich_cves", return_value=[record]) as enrich,
                 patch.object(ce, "write_csv"),
                 patch.object(ce, "print_rich_report"),
+                patch.object(ce, "render_ioc_report"),
                 patch.object(ce, "render_html_report"),
             ):
                 exit_code = ce.main(
@@ -212,6 +291,7 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "GTIClient") as client_class,
                 patch.object(ce, "enrich_cves") as enrich,
                 patch.object(ce, "write_csv") as write_csv,
+                patch.object(ce, "render_ioc_report") as render_ioc,
                 patch.object(ce, "render_html_report") as render_html,
             ):
                 exit_code = ce.main(
@@ -229,6 +309,7 @@ class InputMainTests(unittest.TestCase):
         client_class.assert_not_called()
         enrich.assert_not_called()
         write_csv.assert_not_called()
+        render_ioc.assert_called_once()
         self.assertEqual(
             render_html.call_args.kwargs["title"],
             "GTI CVE Enrichment Report — FAILED",
@@ -272,12 +353,16 @@ class InputMainTests(unittest.TestCase):
                 )
 
             html_text = html.read_text(encoding="utf-8")
+            ioc_text = html.with_name("ioc_report.html").read_text(encoding="utf-8")
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(client.calls, [cve])
         self.assertIn(cve, html_text)
         self.assertIn("0 enriched successfully", html_text)
         self.assertIn("Network error", html_text)
+        self.assertIn(f'ioc_report.html#{cve}', html_text)
+        self.assertIn(cve, ioc_text)
+        self.assertIn("enrichment failed", ioc_text)
 
     def test_report_generation_failure_changes_success_exit_to_failure(self) -> None:
         cve = "CVE-2026-12345"
@@ -294,6 +379,7 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "enrich_cves", return_value=[record]),
                 patch.object(ce, "write_csv"),
                 patch.object(ce, "print_rich_report"),
+                patch.object(ce, "render_ioc_report"),
                 patch.object(
                     ce,
                     "render_html_report",
@@ -311,6 +397,30 @@ class InputMainTests(unittest.TestCase):
                 )
 
         self.assertEqual(exit_code, 1)
+
+    def test_only_primary_report_is_opened(self) -> None:
+        cve = "CVE-2026-12345"
+        record = _success_record(cve)
+        with tempfile.TemporaryDirectory() as tmp:
+            html = Path(tmp) / "report.html"
+            with (
+                patch.object(ce, "load_project_dotenv", return_value=None),
+                patch.object(ce, "resolve_api_key", return_value="test-api-key"),
+                patch.object(ce, "build_proxies", return_value=None),
+                patch.object(ce, "resolve_ssl_verify", return_value=True),
+                patch.object(ce, "resolve_request_delay", return_value=0.0),
+                patch.object(ce, "GTIClient", return_value=object()),
+                patch.object(ce, "enrich_cves", return_value=[record]),
+                patch.object(ce, "write_csv"),
+                patch.object(ce, "print_rich_report"),
+                patch.object(ce, "render_ioc_report"),
+                patch.object(ce, "render_html_report"),
+                patch.object(ce, "open_report_in_browser") as open_browser,
+            ):
+                exit_code = ce.main(["--input", cve, "--html", str(html)])
+
+        self.assertEqual(exit_code, 0)
+        open_browser.assert_called_once_with(html)
 
     def test_cve_propagates_into_generated_html(self) -> None:
         cve = "CVE-2026-12345"

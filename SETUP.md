@@ -202,7 +202,8 @@ What you should see:
 3. Optional proxy line  
 4. Progress while each CVE is queried  
 5. Enriched CSV at `cve_enriched.csv`  
-6. HTML report written **and opened in your browser** (even if the run fails)
+6. Primary HTML report and companion `ioc_report.html` written (even if the run fails)
+7. Primary report opened in your browser; the IOC report opens only when you click a CVE's IOC link
 
 ### Quick connectivity check (optional)
 
@@ -228,23 +229,24 @@ curl -I -x http://webproxy:8080 --cacert ./certs/corporate-ca.pem https://www.vi
 | Corporate CA | If SSL inspection breaks verify | `CORPORATE_CA_BUNDLE` / `--ca-bundle` / `certs/corporate-ca.pem` | system/certifi trust |
 | Request delay | No | `VT_REQUEST_DELAY` / `--delay` | `1.0` seconds |
 | HTML report | Always written | `--html` | `report.html` |
+| IOC report | Always written | `--ioc-html` | `ioc_report.html` beside the primary report |
 | Open browser | Yes by default | `--no-open` to disable | open on every run |
 
 There are **no** hard-coded key or proxy placeholders inside `cve_enricher.py`. Placeholder key values such as `your_key_here` are rejected.
 
 ---
 
-## 7. HTML report behavior (always open)
+## 7. HTML report behavior
 
-| Outcome | HTML report | Browser |
-|---------|-------------|---------|
-| All CVEs enriched | Full cards | Opens |
-| Partial success | Cards + error cards | Opens |
-| Missing API key / bad input | Error banner + traceback summary | Opens |
-| SSL / proxy / network failure | Error banner + traceback summary | Opens |
-| Privilege 401/403 | Per-CVE + summary banner | Opens |
+| Outcome | Primary report | IOC report | Browser |
+|---------|----------------|------------|---------|
+| All CVEs enriched | Full cards + IOC deep links | One anchored section per CVE | Primary opens |
+| Partial success | Cards + error cards | IOC data/status per CVE | Primary opens |
+| Missing API key / bad input | Error banner + traceback summary | Failure audit page | Primary opens |
+| SSL / proxy / network failure | Error banner + traceback summary | Failure audit page | Primary opens |
+| Privilege 401/403 | Per-CVE + summary banner | Failure status per CVE | Primary opens |
 
-Use `--no-open` only for automation/CI. The report file is still written.
+Use `--no-open` only for automation/CI. Both report files are still written. The IOC report is never opened automatically, preventing multiple tabs after a run.
 
 ---
 

@@ -40,25 +40,16 @@ Do **not** disable TLS verification. Place your org root CA at
 
 HTML report
 -----------
-An HTML report is always written (default ``report.html``) and opened in
-the default browser — including when enrichment fails (missing key, SSL
-errors, network issues). The failure report includes a prominent error
-section with the exception message.
+The primary HTML report (default ``report.html``) and companion IOC report
+(default ``ioc_report.html``) are always written. Only the primary report is
+opened automatically; per-CVE links open the corresponding IOC section on
+demand. Failure reports include a prominent error section.
 
-Cleanup log (hygiene / documentation only — no functional change)
------------------------------------------------------------------
-Auditable notes from the maintainability pass. Runtime behavior of
-``.env`` loading, proxy construction, CA-bundle resolution, ``GTIClient``,
-HTML generation, and the always-open-report path is unchanged.
-
-- Removed unused ``dataclasses.field`` import.
-- Removed unused ``_dig()`` helper (never called; extraction uses ``_first``).
-- Removed a no-op ``exploited_in_the_wild`` inference block that only ``pass``-ed.
-- Removed an unreachable Critical→P0 branch in ``derive_priority_rating`` fallback
-  (P0 for Critical already returns earlier in the official table).
-- Deduplicated CVE-ID accumulation in ``load_cve_list`` via ``_accept_cve``.
-- Expanded educational comments on corporate proxy/TLS, GTI client wiring,
-  and why the HTML report is generated and launched even on failure.
+Report architecture
+-------------------
+API responses are normalized once into ``CVERecord`` objects. The primary
+report, companion IOC report, CSV, terminal cards, and inline SVG visualization
+all consume those records; report rendering never repeats an enrichment query.
 """
 
 from __future__ import annotations
@@ -73,6 +64,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -127,6 +119,7 @@ DEFAULT_INPUT = "cve_list.csv"
 DEFAULT_OUTPUT = "cve_enriched.csv"
 # HTML path is always used (report is written even when enrichment fails).
 DEFAULT_HTML = "report.html"
+DEFAULT_IOC_HTML = "ioc_report.html"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BACKOFF_BASE = 2.0  # seconds; exponential: base^attempt + jitter
 
@@ -156,6 +149,49 @@ EXPLOITATION_STATE_ALIASES: dict[str, int] = {
     "confirmed": 3,
     "wide": 4,
 }
+
+# The public Vulnerability API exposes labels for the three priority axes, not
+# an image or separate numeric visualization fields. These centralized maps
+# convert those documented ordinal labels to the 0-4 scale used by GTI's
+# Priority Visualization. Both visible labels and SVG positions are populated
+# from the normalized CVERecord fields produced with these maps.
+RISK_RATING_LEVELS: dict[int, str] = {
+    0: "Unrated",
+    1: "Low",
+    2: "Medium",
+    3: "High",
+    4: "Critical",
+}
+RISK_RATING_ALIASES: dict[str, int] = {
+    "none": 0,
+    "unrated": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
+EXPLOIT_AVAILABILITY_LEVELS: dict[int, str] = {
+    0: "No Known",
+    1: "Interest Observed",
+    2: "Unverified",
+    3: "Privately Held",
+    4: "Publicly Available",
+}
+EXPLOIT_AVAILABILITY_ALIASES: dict[str, int] = {
+    "none": 0,
+    "no known": 0,
+    "no_known": 0,
+    "no-known": 0,
+    "noknown": 0,
+    "interest observed": 1,
+    "unverified": 2,
+    "privately held": 3,
+    "known": 4,
+    "publicly available": 4,
+    # Trivial exploitation is at least as accessible as public exploit code;
+    # the official graphic has no level above 4, so both occupy its endpoint.
+    "trivial": 4,
+}
 WILD_COLLECTION_TAGS = frozenset(
     {
         "observed in the wild",
@@ -171,8 +207,12 @@ WILD_COLLECTION_TAGS = frozenset(
     }
 )
 
-# Relationship IoCs: fetch/display cap per type so reports stay readable.
-IOC_DISPLAY_CAP = 25
+# The collection relationship endpoint supports a maximum page size of 40.
+# Every object returned on that page is retained and rendered in the separate
+# IOC report; nothing is truncated again by the presentation layer.
+IOC_PAGE_SIZE = 40
+# Compatibility alias for external callers that imported the old name.
+IOC_DISPLAY_CAP = IOC_PAGE_SIZE
 IOC_RELATIONSHIPS: tuple[str, ...] = ("files", "urls", "domains", "ip_addresses")
 
 # Fallback delay; actual value is resolved after .env load (see resolve_request_delay).
@@ -440,6 +480,7 @@ class CVERecord:
     priority_rating: str = "N/A"  # P0–P4 (derived)
     priority_raw: str = "N/A"  # raw API field (may be bool / missing)
     risk_rating: str = "N/A"
+    risk_rating_level: str = "N/A"  # 0–4 visualization level
     predicted_risk_rating: str = "N/A"
     risk_factors: str = "N/A"
 
@@ -447,6 +488,7 @@ class CVERecord:
     exploitation_state: str = "Unknown"
     exploitation_state_level: str = "N/A"  # 0–4 or N/A when Unknown
     exploit_availability: str = "N/A"
+    exploit_availability_level: str = "N/A"  # 0–4 visualization level
     exploited_in_the_wild: str = "Unknown"
     exploited_in_the_wild_status: str = "not_returned"
     exploited_in_the_wild_sources: str = ""  # debug: authoritative field/filter source
@@ -504,7 +546,7 @@ class CVERecord:
     ioc_count: str = "N/A"
     ioc_status: str = "not_returned"
     ioc_error: str = ""
-    # Actual IoC objects (relationship fetch). Totals come from counters; lists are capped.
+    # Actual IoC objects from the relationship fetch. Totals come from counters.
     ioc_files_total: int = 0
     ioc_urls_total: int = 0
     ioc_domains_total: int = 0
@@ -759,6 +801,62 @@ def normalize_exploitation_state(value: Any) -> tuple[Optional[int], str]:
         if num in EXPLOITATION_STATE_LEVELS:
             return num, EXPLOITATION_STATE_LEVELS[num]
     return None, "Unknown"
+
+
+def normalize_risk_rating(value: Any) -> tuple[Optional[int], str]:
+    """Return the canonical Risk Rating label and its visualization level.
+
+    GTI documents the ordered labels ``Unrated``, ``Low``, ``Medium``,
+    ``High``, and ``Critical``. The local visualization places these at 0-4.
+    Missing values remain unavailable rather than being treated as Unrated.
+    """
+    if value is None:
+        return None, "N/A"
+    text = str(value).strip()
+    if not text:
+        return None, "N/A"
+    key = _norm_label(text).replace("_", " ").replace("-", " ")
+    if key.isdigit() and int(key) in RISK_RATING_LEVELS:
+        level = int(key)
+        return level, RISK_RATING_LEVELS[level]
+    level = RISK_RATING_ALIASES.get(key)
+    if level is None:
+        return None, text
+    return level, RISK_RATING_LEVELS[level]
+
+
+def normalize_exploit_availability(value: Any) -> tuple[Optional[int], str]:
+    """Return canonical Exploit Availability text and its 0-4 graph level.
+
+    The API returns categorical labels while the GTI graphic has five points.
+    ``Publicly Available``, legacy ``Known``, and ``Trivial`` share level 4;
+    their distinct display labels are retained because they carry useful
+    analyst meaning even though the graph has no higher position.
+    """
+    if value is None:
+        return None, "N/A"
+    text = str(value).strip()
+    if not text:
+        return None, "N/A"
+    key = _norm_label(text).replace("_", " ").replace("-", " ")
+    if key.isdigit() and int(key) in EXPLOIT_AVAILABILITY_LEVELS:
+        level = int(key)
+        return level, EXPLOIT_AVAILABILITY_LEVELS[level]
+    level = EXPLOIT_AVAILABILITY_ALIASES.get(key)
+    if level is None:
+        return None, text
+    label = {
+        "none": "No Known",
+        "no known": "No Known",
+        "noknown": "No Known",
+        "interest observed": "Interest Observed",
+        "unverified": "Unverified",
+        "privately held": "Privately Held",
+        "known": "Publicly Available",
+        "publicly available": "Publicly Available",
+        "trivial": "Trivial",
+    }.get(key, EXPLOIT_AVAILABILITY_LEVELS[level])
+    return level, label
 
 
 def _truthy_flag(value: Any) -> bool:
@@ -1029,14 +1127,21 @@ def parse_relationship_iocs(
     if not isinstance(rows, list):
         raise ValueError(f"{relationship} relationship response has no data list")
     parsed: list[dict[str, str]] = []
+    seen: set[str] = set()
     for obj in rows:
         if not isinstance(obj, dict) or obj.get("error"):
             continue
         item = _parse_one_ioc(relationship, obj)
-        if item:
-            parsed.append(item)
-        if len(parsed) >= IOC_DISPLAY_CAP:
-            break
+        if not item:
+            continue
+        identity = (item.get("display") or item.get("id") or "").strip()
+        # Domain and file hashes are case-insensitive; URL paths can be
+        # case-sensitive, so preserve their exact identity for deduplication.
+        dedupe_key = identity if relationship.lower() == "urls" else identity.casefold()
+        if not dedupe_key or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        parsed.append(item)
     return parsed
 
 
@@ -1173,7 +1278,7 @@ def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) ->
     failures: list[str] = []
     successes = 0
     for rel in wanted:
-        body, err, status = client.get_relationship(rec.cve, rel, limit=IOC_DISPLAY_CAP)
+        body, err, status = client.get_relationship(rec.cve, rel, limit=IOC_PAGE_SIZE)
         if err or not isinstance(body, dict):
             logging.warning(
                 "Could not list %s IoCs for %s (status=%s, err=%s)",
@@ -1191,6 +1296,9 @@ def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) ->
             failures.append(f"{rel}: response parsing failed")
             continue
         successes += 1
+        pagination_error = str(body.get("_pagination_error") or "").strip()
+        if pagination_error:
+            failures.append(f"{rel}: {pagination_error}")
         setattr(rec, field_by_rel[rel], items)
         meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
         meta_count = _as_nonneg_int(meta.get("count"))
@@ -1673,18 +1781,80 @@ class GTIClient:
         cve: str,
         relationship: str,
         *,
-        limit: int = IOC_DISPLAY_CAP,
+        limit: int = IOC_PAGE_SIZE,
     ) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
         """Fetch a collection relationship (files / urls / domains / ip_addresses).
 
         Full related objects (not descriptors-only) so file names, hashes, and
-        URL strings are available for the HTML IoC section. Same TLS/proxy/
-        retry path as ``get_vulnerability``.
+        URL strings are available for the IOC report. Supported ``links.next``
+        pagination is followed so all returned objects are retained. Every page
+        uses the same TLS/proxy/retry path as ``get_vulnerability``.
         """
         object_id = cve_api_id(cve)
         rel = relationship.strip().strip("/")
         url = f"{self.base_url}/collections/{object_id}/{rel}?limit={int(limit)}"
-        return self._get_json(url, context=f"{cve}/{rel}")
+        expected = urllib.parse.urlparse(url)
+        rows: list[Any] = []
+        total = 0
+        seen_urls: set[str] = set()
+        next_url: Optional[str] = url
+
+        while next_url:
+            if next_url in seen_urls:
+                return {
+                    "data": rows,
+                    "meta": {"count": max(total, len(rows))},
+                    "_pagination_error": "VirusTotal returned a repeated pagination URL",
+                }, None, 200
+            seen_urls.add(next_url)
+
+            body, err, status = self._get_json(next_url, context=f"{cve}/{rel}")
+            if err or not isinstance(body, dict):
+                if rows:
+                    return {
+                        "data": rows,
+                        "meta": {"count": max(total, len(rows))},
+                        "_pagination_error": (
+                            f"pagination request failed (HTTP {status or 'n/a'}, {err or 'error'})"
+                        ),
+                    }, None, 200
+                return body, err, status
+
+            page_rows = body.get("data")
+            if not isinstance(page_rows, list):
+                if rows:
+                    return {
+                        "data": rows,
+                        "meta": {"count": max(total, len(rows))},
+                        "_pagination_error": "paginated response had no data list",
+                    }, None, 200
+                return body, None, status
+            rows.extend(page_rows)
+            meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+            total = max(total, _as_nonneg_int(meta.get("count")), len(rows))
+            links = body.get("links") if isinstance(body.get("links"), dict) else {}
+            candidate = str(links.get("next") or "").strip()
+            if not candidate:
+                next_url = None
+                continue
+
+            candidate = urllib.parse.urljoin(next_url, candidate)
+            parsed = urllib.parse.urlparse(candidate)
+            # A pagination URL comes from API data but is sent with x-apikey;
+            # constrain it to the exact configured origin and relationship path.
+            if (
+                parsed.scheme.casefold() != expected.scheme.casefold()
+                or parsed.netloc.casefold() != expected.netloc.casefold()
+                or parsed.path != expected.path
+            ):
+                return {
+                    "data": rows,
+                    "meta": {"count": max(total, len(rows))},
+                    "_pagination_error": "VirusTotal returned an unsafe pagination URL",
+                }, None, 200
+            next_url = candidate
+
+        return {"data": rows, "meta": {"count": max(total, len(rows))}}, None, 200
 
 
 def _safe_error_body(resp: requests.Response, limit: int = 300) -> str:
@@ -1839,10 +2009,13 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         default=None,
     )
     state_level, state_label = normalize_exploitation_state(exploitation_state_raw)
-    exploit_availability = _first(
+    exploit_availability_raw = _first(
         attrs.get("exploit_availability"),
         exploitation.get("exploit_availability"),
-        default="N/A",
+        default=None,
+    )
+    availability_level, exploit_availability = normalize_exploit_availability(
+        exploit_availability_raw
     )
     exploited_zero_day = _first(
         attrs.get("exploited_as_zero_day"),
@@ -1877,7 +2050,7 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
 
     # --- Risk / priority ---
     # API documents priority as boolean; the GTI UI shows P0–P4 — we derive that.
-    risk_rating = na(attrs.get("risk_rating"))
+    risk_level, risk_rating = normalize_risk_rating(attrs.get("risk_rating"))
     predicted = na(attrs.get("predicted_risk_rating"))
     risk_factors = na(attrs.get("risk_factors"))
     priority_raw = attrs.get("priority")
@@ -1888,8 +2061,8 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
 
     priority_rating = derive_priority_rating(
         risk_rating,
-        str(exploitation_state_raw) if exploitation_state_raw is not None else "N/A",
-        str(exploit_availability),
+        state_label,
+        exploit_availability,
     )
     # Prefer an explicit P0–P4 string if the API ever supplies one
     if isinstance(priority_raw, str) and re.match(r"^P[0-4]$", priority_raw.strip(), re.I):
@@ -1916,11 +2089,15 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         priority_rating=priority_rating,
         priority_raw=priority_raw_str,
         risk_rating=risk_rating,
+        risk_rating_level="N/A" if risk_level is None else str(risk_level),
         predicted_risk_rating=predicted,
         risk_factors=risk_factors,
         exploitation_state=state_label,
         exploitation_state_level="N/A" if state_level is None else str(state_level),
-        exploit_availability=na(exploit_availability),
+        exploit_availability=exploit_availability,
+        exploit_availability_level=(
+            "N/A" if availability_level is None else str(availability_level)
+        ),
         exploited_in_the_wild=exploited_in_wild,
         exploited_in_the_wild_status=wild_status,
         exploited_in_the_wild_sources="; ".join(wild_sources),
@@ -2241,6 +2418,29 @@ def _html_escape(value: str) -> str:
     return html.escape(value or "", quote=True)
 
 
+def _ioc_anchor_id(cve: str) -> str:
+    """Create a stable, attribute-safe anchor for a CVE's IOC section."""
+    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "-", str(cve).strip().upper()).strip("-")
+    return cleaned or "IOC"
+
+
+def default_ioc_report_path(primary_path: Path) -> Path:
+    """Place the run's IOC report beside the primary report."""
+    candidate = primary_path.with_name(DEFAULT_IOC_HTML)
+    if candidate.resolve() == primary_path.resolve():
+        candidate = primary_path.with_name(f"{primary_path.stem}_ioc_report.html")
+    return candidate
+
+
+def _relative_report_href(source_path: Path, target_path: Path) -> str:
+    """Return a URL-encoded relative link suitable for local ``file://`` use."""
+    try:
+        relative = os.path.relpath(target_path.resolve(), start=source_path.parent.resolve())
+    except ValueError as exc:
+        raise ValueError("Primary and IOC reports must be written on the same drive") from exc
+    return urllib.parse.quote(Path(relative).as_posix(), safe="/._-~")
+
+
 def _html_bool(value: str) -> str:
     """Render a boolean-ish string as a colored YES/no badge."""
     v = str(value).strip().lower()
@@ -2291,8 +2491,94 @@ def _html_exploit_state_class(state: str) -> str:
     }.get(key, "unknown")
 
 
+def _priority_level(value: str) -> Optional[int]:
+    """Parse a normalized record level without coercing missing data to zero."""
+    try:
+        level = int(value)
+    except (TypeError, ValueError):
+        return None
+    return level if 0 <= level <= 4 else None
+
+
+def _svg_axis_point(
+    origin: tuple[float, float],
+    endpoint: tuple[float, float],
+    level: int,
+) -> tuple[float, float]:
+    fraction = level / 4
+    return (
+        origin[0] + (endpoint[0] - origin[0]) * fraction,
+        origin[1] + (endpoint[1] - origin[1]) * fraction,
+    )
+
+
+def _html_priority_svg(rec: CVERecord) -> str:
+    """Render the three normalized GTI metrics as an offline inline SVG."""
+    origin = (250.0, 220.0)
+    axes = {
+        "risk": ((250.0, 54.0), _priority_level(rec.risk_rating_level)),
+        "availability": ((75.0, 321.0), _priority_level(rec.exploit_availability_level)),
+        "state": ((425.0, 321.0), _priority_level(rec.exploitation_state_level)),
+    }
+
+    axis_lines = []
+    tick_labels = []
+    value_markers = []
+    points: list[tuple[float, float]] = []
+    for axis_name, (endpoint, level) in axes.items():
+        axis_lines.append(
+            f'<line class="priority-axis" x1="{origin[0]:g}" y1="{origin[1]:g}" '
+            f'x2="{endpoint[0]:g}" y2="{endpoint[1]:g}"/>'
+        )
+        for tick in range(1, 5):
+            tx, ty = _svg_axis_point(origin, endpoint, tick)
+            if axis_name == "risk":
+                label_x, label_y, anchor = tx + 12, ty + 5, "start"
+            elif axis_name == "availability":
+                label_x, label_y, anchor = tx - 6, ty + 5, "end"
+            else:
+                label_x, label_y, anchor = tx + 6, ty + 5, "start"
+            tick_labels.append(
+                f'<text class="priority-tick" x="{label_x:g}" y="{label_y:g}" '
+                f'text-anchor="{anchor}">{tick}</text>'
+            )
+        if level is not None:
+            px, py = _svg_axis_point(origin, endpoint, level)
+            points.append((px, py))
+            value_markers.append(
+                f'<circle class="priority-marker" cx="{px:g}" cy="{py:g}" r="8" '
+                f'data-axis="{axis_name}" data-level="{level}"/>'
+            )
+
+    polygon = ""
+    if len(points) == 3:
+        point_text = " ".join(f"{x:g},{y:g}" for x, y in points)
+        polygon = f'<polygon class="priority-shape" points="{point_text}"/>'
+
+    accessible = _html_escape(
+        "Priority metrics: "
+        f"Risk Rating {rec.risk_rating} level {rec.risk_rating_level}; "
+        f"Exploit Availability {rec.exploit_availability} level "
+        f"{rec.exploit_availability_level}; Exploitation State "
+        f"{rec.exploitation_state} level {rec.exploitation_state_level}."
+    )
+    return f"""
+      <svg class="priority-chart" viewBox="0 0 500 380" role="img" aria-labelledby="priority-title-{_ioc_anchor_id(rec.cve)}">
+        <title id="priority-title-{_ioc_anchor_id(rec.cve)}">{accessible}</title>
+        <g>{''.join(axis_lines)}</g>
+        {polygon}
+        <g>{''.join(tick_labels)}</g>
+        <g>{''.join(value_markers)}</g>
+        <circle class="priority-origin" cx="250" cy="220" r="4"/>
+        <text class="priority-axis-label" x="250" y="24" text-anchor="middle">Risk Rating</text>
+        <text class="priority-axis-label" x="12" y="368" text-anchor="start">Exploit Availability</text>
+        <text class="priority-axis-label" x="488" y="368" text-anchor="end">Exploitation State</text>
+      </svg>
+"""
+
+
 def _html_priority_viz(rec: CVERecord) -> str:
-    """P0–P4 visualization plus the three GTI inputs (impact, exploit access, real-world use)."""
+    """Dynamic Y-axis visualization plus the three GTI priority inputs."""
     pri_cls = _html_risk_class(rec.priority_rating)
     cvss_bits = []
     if rec.cvss_v3_base != "N/A":
@@ -2308,24 +2594,27 @@ def _html_priority_viz(rec: CVERecord) -> str:
       <span class="badge badge-{pri_cls} badge-lg">{_html_escape(rec.priority_rating)}</span>
     </div>
     <p class="priority-viz-caption">{_html_escape(PRIORITY_VIZ_CAPTION)}</p>
-    <div class="priority-inputs">
-      <div class="priority-input">
-        <div class="metric-label">1 · Potential impact</div>
-        <div class="metric-value-sm">{_html_escape(rec.risk_rating)}</div>
-        <div class="metric-sub">Risk rating {_html_escape(rec.risk_rating)}
-          · Predicted {_html_escape(rec.predicted_risk_rating)}
-          · {cvss_line}</div>
-      </div>
-      <div class="priority-input">
-        <div class="metric-label">2 · Exploit accessibility</div>
-        <div class="metric-value-sm">{_html_escape(rec.exploit_availability)}</div>
-        <div class="metric-sub">Whether a functional exploit exists and is accessible to attackers</div>
-      </div>
-      <div class="priority-input">
-        <div class="metric-label">3 · Real-world use</div>
-        <div class="metric-value-sm">{_html_escape(rec.exploitation_state)}
-          · {_html_bool(rec.exploited_in_the_wild)}</div>
-        <div class="metric-sub">Exploitation state + exploited in the wild</div>
+    <div class="priority-viz-body">
+      <div class="priority-chart-wrap">{_html_priority_svg(rec)}</div>
+      <div class="priority-inputs">
+        <div class="priority-input">
+          <div class="metric-label">1 · Potential impact</div>
+          <div class="metric-value-sm">{_html_escape(rec.risk_rating)}</div>
+          <div class="metric-sub">Risk rating level {_html_escape(rec.risk_rating_level)}
+            · Predicted {_html_escape(rec.predicted_risk_rating)}
+            · {cvss_line}</div>
+        </div>
+        <div class="priority-input">
+          <div class="metric-label">2 · Exploit accessibility</div>
+          <div class="metric-value-sm">{_html_escape(rec.exploit_availability)}</div>
+          <div class="metric-sub">Exploit Availability level {_html_escape(rec.exploit_availability_level)}</div>
+        </div>
+        <div class="priority-input">
+          <div class="metric-label">3 · Real-world use</div>
+          <div class="metric-value-sm">{_html_escape(rec.exploitation_state)}
+            · {_html_bool(rec.exploited_in_the_wild)}</div>
+          <div class="metric-sub">Exploitation State level {_html_escape(rec.exploitation_state_level)}</div>
+        </div>
       </div>
     </div>
   </section>
@@ -2363,8 +2652,13 @@ def _html_wild_status_note(rec: CVERecord) -> str:
 def _html_ioc_link(item: dict[str, str]) -> str:
     display = _html_escape(item.get("display") or item.get("id") or "")
     href = (item.get("vt_url") or "").strip()
-    if href:
-        return f'<a class="mono" href="{_html_escape(href)}" target="_blank" rel="noopener">{display}</a>'
+    parsed = urllib.parse.urlparse(href)
+    if (
+        parsed.scheme == "https"
+        and parsed.hostname
+        and parsed.hostname.casefold() in {"virustotal.com", "www.virustotal.com"}
+    ):
+        return f'<a class="mono" href="{_html_escape(href)}" target="_blank" rel="noopener noreferrer">{display}</a>'
     return f'<span class="mono">{display}</span>'
 
 
@@ -2377,15 +2671,15 @@ def _html_ioc_table(
 ) -> str:
     if not items and total <= 0:
         return ""
-    shown = items[:IOC_DISPLAY_CAP]
-    more = max(0, total - len(shown)) if total else 0
+    shown = items
+    unreturned = max(0, total - len(shown)) if total else 0
     if not shown:
         return (
             f"<h4>{_html_escape(title)} <span class='muted'>({total})</span></h4>"
             f"<p class='muted'>Count reported by GTI, but no objects were returned for this type.</p>"
         )
     if kind == "files":
-        head = "<tr><th>SHA256</th><th>SHA1 / MD5</th><th>Name / type</th></tr>"
+        head = "<tr><th>IOC Type</th><th>IOC Value</th><th>SHA-1 / MD5</th><th>Context</th></tr>"
         body_rows = []
         for it in shown:
             hashes = " / ".join(h for h in (it.get("sha1") or "", it.get("md5") or "") if h)
@@ -2394,6 +2688,7 @@ def _html_ioc_table(
             name_type = " · ".join(p for p in (name, ftype) if p) or "—"
             body_rows.append(
                 "<tr>"
+                "<td>SHA-256</td>"
                 f"<td>{_html_ioc_link(it)}</td>"
                 f"<td class='mono muted'>{_html_escape(hashes) if hashes else '—'}</td>"
                 f"<td>{_html_escape(name_type)}</td>"
@@ -2401,13 +2696,23 @@ def _html_ioc_table(
             )
         body = "".join(body_rows)
     else:
-        head = "<tr><th>Indicator</th></tr>"
-        body = "".join(f"<tr><td>{_html_ioc_link(it)}</td></tr>" for it in shown)
+        type_label = {
+            "urls": "URL",
+            "domains": "Domain",
+            "ipv4": "IPv4 address",
+            "ipv6": "IPv6 address",
+            "other": "Unclassified",
+        }.get(kind, "Indicator")
+        head = "<tr><th>IOC Type</th><th>IOC Value</th></tr>"
+        body = "".join(
+            f"<tr><td>{_html_escape(type_label)}</td><td>{_html_ioc_link(it)}</td></tr>"
+            for it in shown
+        )
     more_line = ""
-    if more > 0:
+    if unreturned > 0:
         more_line = (
-            f"<p class='muted ioc-more'>and {more} more "
-            f"(showing {len(shown)} of {total})</p>"
+            f"<p class='muted ioc-more'>VirusTotal reports {total} object(s); "
+            f"the API returned {len(shown)} for this run.</p>"
         )
     return f"""
     <h4>{_html_escape(title)} <span class="muted">({total or len(shown)})</span></h4>
@@ -2418,15 +2723,34 @@ def _html_ioc_table(
 """
 
 
-def _html_ioc_section(rec: CVERecord) -> str:
+def _partition_ip_iocs(
+    items: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+    """Classify returned IP relationship objects deterministically."""
+    ipv4: list[dict[str, str]] = []
+    ipv6: list[dict[str, str]] = []
+    other: list[dict[str, str]] = []
+    for item in items:
+        value = (item.get("display") or item.get("id") or "").strip()
+        try:
+            parsed = ipaddress.ip_address(value)
+        except ValueError:
+            other.append(item)
+        else:
+            (ipv4 if parsed.version == 4 else ipv6).append(item)
+    return ipv4, ipv6, other
+
+
+def _html_ioc_detail_section(rec: CVERecord) -> str:
     """Render IOC objects while preserving none/absent/error distinctions."""
+    ipv4, ipv6, other_ips = _partition_ip_iocs(rec.ioc_ip_addresses)
     blocks = [
         _html_ioc_table("Files", rec.ioc_files, rec.ioc_files_total, kind="files"),
         _html_ioc_table("URLs", rec.ioc_urls, rec.ioc_urls_total, kind="urls"),
         _html_ioc_table("Domains", rec.ioc_domains, rec.ioc_domains_total, kind="domains"),
-        _html_ioc_table(
-            "IP addresses", rec.ioc_ip_addresses, rec.ioc_ip_addresses_total, kind="ips"
-        ),
+        _html_ioc_table("IPv4 addresses", ipv4, len(ipv4), kind="ipv4"),
+        _html_ioc_table("IPv6 addresses", ipv6, len(ipv6), kind="ipv6"),
+        _html_ioc_table("Other / unclassified", other_ips, len(other_ips), kind="other"),
     ]
     nonempty = [b for b in blocks if b]
     total_label = rec.ioc_count if rec.ioc_count not in {"N/A", ""} else ""
@@ -2481,12 +2805,171 @@ def _html_ioc_section(rec: CVERecord) -> str:
 """
 
 
+def _html_ioc_summary(rec: CVERecord, report_href: str) -> str:
+    """Render only status/count and a deep-link; IOC payloads stay out of the main report."""
+    anchor = urllib.parse.quote(_ioc_anchor_id(rec.cve), safe="-._~")
+    href = f"{report_href}#{anchor}"
+    if rec.ioc_status == "none":
+        status = "No associated IOCs returned by VirusTotal."
+    elif rec.ioc_status == "not_returned":
+        status = "IOC availability was not returned by VirusTotal."
+    elif rec.ioc_status in {"partial", "error"}:
+        status = "IOC retrieval failed or was incomplete; see the IOC report for details."
+    else:
+        count = rec.ioc_count if rec.ioc_count not in {"", "N/A"} else str(
+            sum(
+                len(items)
+                for items in (
+                    rec.ioc_files,
+                    rec.ioc_urls,
+                    rec.ioc_domains,
+                    rec.ioc_ip_addresses,
+                )
+            )
+        )
+        status = f"{count} associated indicator(s)."
+    return f"""
+  <section class="iocs ioc-summary">
+    <h3>Indicators of Compromise</h3>
+    <p>{_html_escape(status)}</p>
+    <a class="ioc-report-link" href="{_html_escape(href)}" target="_blank" rel="noopener noreferrer">View IOC Report ↗</a>
+  </section>
+"""
+
+
+def render_ioc_report(
+    records: list[CVERecord],
+    path: Path,
+    title: str = "GTI IOC Report",
+    *,
+    primary_report_path: Optional[Path] = None,
+    fatal_error: Optional[str] = None,
+) -> None:
+    """Write one standalone IOC report containing an anchored section per CVE."""
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    primary_path = primary_report_path or path.with_name(DEFAULT_HTML)
+    primary_href = _relative_report_href(path, primary_path)
+
+    nav_links: list[str] = []
+    sections: list[str] = []
+    for rec in records:
+        anchor = _ioc_anchor_id(rec.cve)
+        encoded_anchor = urllib.parse.quote(anchor, safe="-._~")
+        nav_links.append(
+            f'<a class="chip" href="#{_html_escape(encoded_anchor)}">{_html_escape(rec.cve)}</a>'
+        )
+        if rec.status != "ok":
+            content = (
+                '<p class="ioc-error" role="alert">IOC data is unavailable because '
+                f'enrichment failed: {_html_escape(rec.error_message or rec.status)}</p>'
+            )
+        else:
+            content = _html_ioc_detail_section(rec)
+        sections.append(
+            f"""
+    <article class="card" id="{_html_escape(anchor)}">
+      <header class="card-header">
+        <div><div class="eyebrow">CVE Identifier</div><h2>{_html_escape(rec.cve)}</h2></div>
+        <a href="{_html_escape(primary_href)}" rel="noopener">Back to primary report</a>
+      </header>
+      {content}
+    </article>
+"""
+        )
+
+    fatal_section = ""
+    if fatal_error:
+        fatal_section = f"""
+    <section class="fatal-banner" role="alert">
+      <h2>Run failed</h2>
+      <p>The IOC report was still generated so the run has a complete audit trail.</p>
+      <pre>{_html_escape(fatal_error)}</pre>
+    </section>
+"""
+    empty = '<p class="muted">No CVE records were produced for this run.</p>'
+    doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{_html_escape(title)}</title>
+<style>
+  :root {{
+    --bg: #0b1220; --surface: #121a2b; --surface-2: #1a2438;
+    --text: #e8eefc; --muted: #8b9bb8; --border: #2a3754;
+    --accent: #38bdf8; --danger: #ef4444;
+  }}
+  * {{ box-sizing: border-box; }}
+  html {{ scroll-behavior: smooth; }}
+  body {{
+    margin: 0; min-height: 100vh; color: var(--text); line-height: 1.5;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: radial-gradient(1200px 600px at 10% -10%, #1e293b 0%, var(--bg) 55%);
+  }}
+  .wrap {{ max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }}
+  .page-header {{ border-bottom: 1px solid var(--border); margin-bottom: 1.5rem; padding-bottom: 1rem; }}
+  h1 {{ margin: 0 0 0.35rem; font-size: 1.75rem; }}
+  h2 {{ margin: 0; font-size: 1.3rem; }}
+  h3 {{ margin: 1rem 0 0.5rem; color: var(--accent); font-size: 0.95rem; letter-spacing: 0.06em; text-transform: uppercase; }}
+  h4 {{ margin: 0.9rem 0 0.4rem; font-size: 0.9rem; color: #dbeafe; }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .muted {{ color: var(--muted); }}
+  .meta {{ color: var(--muted); font-size: 0.9rem; }}
+  .eyebrow {{ color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; }}
+  .nav {{ display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 0.9rem; }}
+  .chip {{ padding: 0.25rem 0.6rem; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); font-size: 0.8rem; }}
+  .card {{
+    scroll-margin-top: 1rem; margin-bottom: 1.25rem; padding: 1.2rem 1.3rem;
+    border: 1px solid var(--border); border-left: 5px solid var(--accent);
+    border-radius: 14px; background: linear-gradient(180deg, var(--surface), #0f172a);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+  }}
+  .card-header {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }}
+  .iocs > h3 {{ margin-top: 1.1rem; }}
+  .ioc-wrap {{ overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: #0d1628; }}
+  table.ioc {{ width: 100%; border-collapse: collapse; font-size: 0.84rem; }}
+  table.ioc th {{ padding: 0.45rem 0.55rem; text-align: left; color: var(--muted); border-bottom: 1px solid var(--border); }}
+  table.ioc td {{ padding: 0.45rem 0.55rem; vertical-align: top; border-bottom: 1px solid #1e293b; word-break: break-all; }}
+  table.ioc tr:last-child td {{ border-bottom: 0; }}
+  .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; user-select: text; }}
+  .ioc-more {{ margin: 0.45rem 0; font-size: 0.8rem; }}
+  .ioc-error, .fatal-banner {{ color: #fecaca; background: #3f0d0d; border: 1px solid #7f1d1d; border-radius: 10px; padding: 0.7rem 0.85rem; }}
+  .fatal-banner {{ margin-bottom: 1.25rem; }}
+  .fatal-banner pre {{ white-space: pre-wrap; word-break: break-word; font-size: 0.78rem; }}
+  footer {{ margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.8rem; }}
+  @media (max-width: 700px) {{ .card-header {{ flex-direction: column; }} }}
+</style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="page-header">
+      <h1>{_html_escape(title)}</h1>
+      <div class="meta">Generated {generated} · {len(records)} CVE(s) · one section per CVE</div>
+      <div class="nav">{''.join(nav_links)}</div>
+    </header>
+    {fatal_section}
+    {''.join(sections) if sections else empty}
+    <footer>
+      IOC objects were collected during the same enrichment run as the primary report.
+      Values are shown in full and grouped only by their VirusTotal relationship type.
+    </footer>
+  </main>
+</body>
+</html>
+"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(doc, encoding="utf-8")
+    logging.info("Wrote IOC report: %s", path)
+
+
 def render_html_report(
     records: list[CVERecord],
     path: Path,
     title: str = "GTI CVE Enrichment Report",
     *,
     fatal_error: Optional[str] = None,
+    ioc_report_path: Optional[Path] = None,
 ) -> None:
     """
     Write a self-contained HTML report with card layout and risk badges.
@@ -2500,6 +2983,8 @@ def render_html_report(
     crash). Per-CVE failures live on their own error cards below the banner.
     """
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    resolved_ioc_path = ioc_report_path or default_ioc_report_path(path)
+    ioc_report_href = _relative_report_href(path, resolved_ioc_path)
     ok = sum(1 for r in records if r.status == "ok")
     failed = len(records) - ok
     pri_counts: dict[str, int] = {}
@@ -2564,6 +3049,7 @@ def render_html_report(
   </header>
   <p class="error-msg">{_html_escape(rec.error_message or "No data")}</p>
   <p class="meta"><a href="{_html_escape(rec.vt_url)}" target="_blank" rel="noopener">VirusTotal</a></p>
+  {_html_ioc_summary(rec, ioc_report_href)}
 </article>
 """
             )
@@ -2604,7 +3090,7 @@ def render_html_report(
             else ""
         )
         wild_note = _html_wild_status_note(rec)
-        ioc_section = _html_ioc_section(rec)
+        ioc_section = _html_ioc_summary(rec, ioc_report_href)
         priority_viz = _html_priority_viz(rec)
 
         cards.append(
@@ -3001,9 +3487,34 @@ def render_html_report(
     font-size: 0.82rem;
     margin: 0.55rem 0 0.8rem;
   }}
+  .priority-viz-body {{
+    display: grid;
+    grid-template-columns: minmax(320px, 1.25fr) minmax(260px, 0.75fr);
+    gap: 1rem;
+    align-items: center;
+  }}
+  .priority-chart-wrap {{
+    min-width: 0;
+    background: #111b30;
+    border: 1px solid #334361;
+    border-radius: 10px;
+    padding: 0.35rem;
+  }}
+  .priority-chart {{ display: block; width: 100%; height: auto; max-height: 26rem; }}
+  .priority-axis {{ stroke: #435777; stroke-width: 7; stroke-linecap: square; }}
+  .priority-shape {{
+    fill: rgba(255, 93, 83, 0.13);
+    stroke: #ff5d53;
+    stroke-width: 6;
+    stroke-linejoin: round;
+  }}
+  .priority-marker {{ fill: #ff5d53; stroke: #ffd2cf; stroke-width: 1.5; }}
+  .priority-origin {{ fill: #435777; }}
+  .priority-tick {{ fill: #d8e1f1; font-size: 17px; }}
+  .priority-axis-label {{ fill: #f4f7ff; font-size: 20px; font-weight: 500; }}
   .priority-inputs {{
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: 1fr;
     gap: 0.65rem;
   }}
   .priority-input {{
@@ -3018,7 +3529,7 @@ def render_html_report(
     margin-top: 0.2rem;
   }}
   @media (max-width: 800px) {{
-    .priority-inputs {{ grid-template-columns: 1fr; }}
+    .priority-viz-body {{ grid-template-columns: 1fr; }}
   }}
   .debug-note {{
     margin-top: 0.35rem;
@@ -3061,6 +3572,21 @@ def render_html_report(
     border: 1px solid #7f1d1d;
     border-radius: 8px;
     padding: 0.55rem 0.7rem;
+  }}
+  .ioc-summary {{
+    border-top: 1px solid var(--border);
+    margin-top: 1rem;
+    padding-top: 0.15rem;
+  }}
+  .ioc-summary p {{ margin: 0.2rem 0 0.55rem; color: var(--muted); }}
+  .ioc-report-link {{
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid #0ea5e9;
+    border-radius: 8px;
+    padding: 0.42rem 0.7rem;
+    background: #082f49;
+    font-weight: 700;
   }}
 </style>
 </head>
@@ -3445,6 +3971,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Self-contained HTML report path (always written and opened)",
     )
     p.add_argument(
+        "--ioc-html",
+        default=None,
+        metavar="PATH",
+        help="IOC HTML report path (default: ioc_report.html beside --html)",
+    )
+    p.add_argument(
         "--no-open",
         action="store_true",
         help="Do not open the HTML report in a browser (report is still written)",
@@ -3515,9 +4047,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     """
     Run enrichment end-to-end.
 
-    Guarantees: after parse + logging setup, an HTML report is always generated
-    and opened (unless ``--no-open``), even when the run fails with a missing
-    key, SSL error, bad input, or unexpected exception.
+    Guarantees: after parse + logging setup, primary and IOC HTML reports are
+    always generated, even when the run fails with a missing key, SSL error,
+    bad input, or unexpected exception. Only the primary report is opened
+    automatically (unless ``--no-open``).
 
     Exit codes (unchanged): 0 = at least one success; 1 = no successes /
     runtime error; 2 = config/input/CA; 3 = privilege (401/403) and zero
@@ -3542,12 +4075,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Initialized *before* the try so the finally-equivalent HTML block
     # can render an empty-records failure page if we never get that far.
     html_path = Path(args.html)
+    ioc_path = Path(args.ioc_html) if args.ioc_html else default_ioc_report_path(html_path)
+    report_path_error: Optional[str] = None
+    if ioc_path.resolve() == html_path.resolve():
+        report_path_error = "--ioc-html must be different from --html"
+        # Keep the always-written failure artifacts distinct even for bad input.
+        ioc_path = default_ioc_report_path(html_path)
     records: list[CVERecord] = []
     fatal_error: Optional[str] = None
     exit_code = 0
     output_path = Path(args.output)
 
     try:
+        if report_path_error:
+            raise RuntimeError(report_path_error)
         # --- Resolve CVE targets, then secrets ---
         # --input (single CVE) wins over the CSV from -i / default cve_list.csv.
         if args.input is not None:
@@ -3694,6 +4235,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "failed to read input",
                 "ca bundle",
                 "placeholder",
+                "--ioc-html",
             )
         ):
             exit_code = 2
@@ -3701,7 +4243,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             exit_code = 1
 
     # ------------------------------------------------------------------
-    # Always write + open HTML report (success, partial, or total failure).
+    # Always write both HTML reports (success, partial, or total failure), but
+    # open only the primary report. The IOC report opens on analyst click.
     #
     # This block intentionally sits *outside* the main try so config/SSL/key
     # failures still produce a browsable error page. ``records`` may be empty
@@ -3710,6 +4253,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     # A failure *here* is logged and can flip a 0 exit to 1, but never
     # swallows the original enrichment exit code if it was already non-zero.
     # ------------------------------------------------------------------
+    report_failed = False
+    try:
+        render_ioc_report(
+            records,
+            ioc_path,
+            title="GTI IOC Report" if not fatal_error else "GTI IOC Report — FAILED",
+            primary_report_path=html_path,
+            fatal_error=fatal_error,
+        )
+        logging.info("IOC report: %s", ioc_path.resolve())
+    except Exception as report_exc:  # noqa: BLE001
+        report_failed = True
+        logging.error("Failed to write IOC report: %s", report_exc)
+
+    primary_written = False
     try:
         title = "GTI CVE Enrichment Report"
         if fatal_error:
@@ -3719,14 +4277,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             html_path,
             title=title,
             fatal_error=fatal_error,
+            ioc_report_path=ioc_path,
         )
+        primary_written = True
         logging.info("HTML report: %s", html_path.resolve())
-        if not args.no_open:
-            open_report_in_browser(html_path)
     except Exception as report_exc:  # noqa: BLE001
-        logging.error("Failed to write/open HTML report: %s", report_exc)
-        if exit_code == 0:
-            exit_code = 1
+        report_failed = True
+        logging.error("Failed to write primary HTML report: %s", report_exc)
+
+    if primary_written and not args.no_open:
+        open_report_in_browser(html_path)
+    if report_failed and exit_code == 0:
+        exit_code = 1
 
     return exit_code
 
