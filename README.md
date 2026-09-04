@@ -264,7 +264,11 @@ For a single CVE, after **every** run—success, partial success, or complete fa
 2. Writes its companion IOC report (default `ioc_report.html`)
 3. Opens the primary report in the default browser; the IOC report opens when its link is clicked
 
-For a CSV with multiple CVEs, the tool writes `CVE-…_report.html` and `CVE-…_iocs.html` for every record in the original input order. It opens the first CVE report, prints the numbered list, and accepts repeated selections until Enter is pressed. Invalid and out-of-range selections are reported without ending the enrichment run. `--no-open` skips both the automatic open and selector.
+For a CSV with multiple CVEs, the tool writes `CVE-…_report.html` and `CVE-…_iocs.html` for every record in the original input order. It opens the first CVE report, prints the numbered list, and accepts repeated selections until Enter is pressed. Invalid and out-of-range selections are reported without ending the enrichment run. `--no-open` skips both the automatic open and numbered selector.
+
+Reports stay available throughout review. Press Enter at the final prompt (`Press Enter to exit and remove generated HTML reports...`, or the equivalent numbered selector prompt) to delete only the primary and IOC HTML files written by that invocation. This also applies to single-CVE runs, failure reports, custom output paths, and manual review with `--no-open`. CSV and raw JSON exports, older reports at other paths, and unrelated HTML files are preserved. Missing files are skipped; a deletion failure identifies the file in a warning and cleanup continues.
+
+EOF (closed input) or Ctrl+C at the review prompt exits without deleting reports, since cleanup requires Enter. Files left by interrupted runs may need manual removal. The default report names and per-CVE report patterns are gitignored as an additional safeguard; custom filenames may need their own ignore rules.
 
 ### What the report contains
 
@@ -279,7 +283,7 @@ For a CSV with multiple CVEs, the tool writes `CVE-…_report.html` and `CVE-…
 - Prominent **Run failed** banner with exception message and traceback summary  
 - Any partial per-CVE results still appear below the banner  
 
-Use `--no-open` for automation/CI; all applicable report files are still written so you can open them manually.
+For automation/CI, use `--no-open` with closed standard input to retain reports without waiting for review. Supplying a blank input line instead confirms cleanup and removes the generated HTML reports.
 
 ### Report mapping notes
 

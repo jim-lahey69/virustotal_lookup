@@ -45,6 +45,8 @@ companion IOC report (default ``ioc_report.html``). Multi-CVE runs write one
 ``CVE-..._report.html`` / ``CVE-..._iocs.html`` pair per input record, open the
 first primary report automatically, and offer a lightweight numbered selector
 for additional reports. Failure reports include a prominent error section.
+Reports remain available until Enter confirms exit and cleanup; EOF or Ctrl+C
+leaves them on disk.
 
 Report architecture
 -------------------
@@ -3038,6 +3040,40 @@ def _html_ioc_summary(rec: CVERecord, report_href: str) -> str:
 """
 
 
+def _write_html_report(
+    path: Path, doc: str, generated_report_files: Optional[set[Path]] = None
+) -> None:
+    """Register only files opened for report output, including partial writes."""
+    path = path.absolute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as report_file:
+        # Opening succeeded and created/truncated this run's report. Register
+        # before writing so a write or close failure cannot leave it untracked.
+        if generated_report_files is not None:
+            generated_report_files.add(path)
+        report_file.write(doc)
+
+
+def cleanup_generated_reports(report_paths: Iterable[Path]) -> None:
+    """Remove only paths registered by this invocation's report writer.
+
+    The caller supplies its run-local registry, never a directory scan or a
+    list of planned output paths (which might not have been written).
+    """
+    removed = 0
+    for path in sorted(set(report_paths)):
+        try:
+            if path.exists():
+                path.unlink()
+                removed += 1
+        except FileNotFoundError:
+            # The analyst may have removed it after the existence check.
+            continue
+        except OSError as exc:
+            logging.warning("Could not remove generated HTML report %s: %s", path, exc)
+    logging.info("Removed %d generated HTML report(s).", removed)
+
+
 def render_ioc_report(
     records: list[CVERecord],
     path: Path,
@@ -3045,6 +3081,7 @@ def render_ioc_report(
     *,
     primary_report_path: Optional[Path] = None,
     fatal_error: Optional[str] = None,
+    generated_report_files: Optional[set[Path]] = None,
 ) -> None:
     """Write one standalone IOC report containing an anchored section per CVE."""
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -3168,8 +3205,7 @@ def render_ioc_report(
             "IOC report rendering mismatch: "
             f"received {expected_rendered_count} record(s), rendered {actual_rendered_count}"
         )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(doc, encoding="utf-8")
+    _write_html_report(path, doc, generated_report_files)
     logging.info("Wrote IOC report: %s", path)
 
 
@@ -3180,6 +3216,7 @@ def render_html_report(
     *,
     fatal_error: Optional[str] = None,
     ioc_report_path: Optional[Path] = None,
+    generated_report_files: Optional[set[Path]] = None,
 ) -> None:
     """
     Write a self-contained HTML report with card layout and risk badges.
@@ -3824,8 +3861,7 @@ def render_html_report(
 </body>
 </html>
 """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(doc, encoding="utf-8")
+    _write_html_report(path, doc, generated_report_files)
     logging.info("Wrote HTML report: %s", path)
 
 
@@ -3887,26 +3923,35 @@ def open_report_in_browser(path: Path) -> None:
     )
 
 
-def select_report_to_open(reports: list[tuple[str, Path]]) -> None:
-    """Let an analyst open any additional per-CVE reports in input order."""
-    if len(reports) <= 1:
-        return
+def select_report_to_open(reports: list[tuple[str, Path]]) -> bool:
+    """Review reports; return True only when Enter confirms exit and cleanup.
 
-    print("\nAvailable CVE reports:\n")
-    for index, (cve, _) in enumerate(reports, start=1):
-        print(f"{index}: {cve}")
+    Zero/one selectable reports use the same exit flow without a numbered menu.
+    An empty list also supports manual review with ``--no-open``.
+    """
+    prompt = "\nPress Enter to exit and remove generated HTML reports... "
+    if len(reports) > 1:
+        print("\nAvailable CVE reports:\n")
+        for index, (cve, _) in enumerate(reports, start=1):
+            print(f"{index}: {cve}")
+        prompt = (
+            "\nSelect a report to open by number, or press Enter to exit "
+            "and remove generated HTML reports: "
+        )
 
     while True:
         try:
-            selection = input(
-                "\nSelect a report to open by number, or press Enter to exit: "
-            ).strip()
+            selection = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print()
-            return
+            logging.warning("Exit was not confirmed with Enter; generated HTML reports kept.")
+            return False
 
         if not selection:
-            return
+            return True
+        if len(reports) <= 1:
+            print("Press Enter when you have finished reviewing the reports.")
+            continue
         try:
             selected_index = int(selection)
         except ValueError:
@@ -3934,6 +3979,7 @@ def select_report_to_open(reports: list[tuple[str, Path]]) -> None:
 #   5. GTIClient(...)  with those resolved values
 #   6. enrich + CSV + optional Rich
 #   7. ALWAYS render HTML and (unless --no-open) launch the browser
+#   8. Wait for Enter at the review prompt, then clean up this run's HTML
 # Step 7 lives outside the enrichment try so missing keys, missing CA
 # files, and SSL errors still produce a browsable failure page.
 # ---------------------------------------------------------------------------
@@ -4302,7 +4348,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     always generated, even when the run fails with a missing key, SSL error,
     bad input, or unexpected exception. Multi-CVE runs generate one pair per
     record. The first primary report opens automatically and a numbered selector
-    can open more reports (unless ``--no-open``).
+    can open more reports (unless ``--no-open``). Enter at the review prompt
+    removes only this invocation's generated HTML files.
 
     Exit codes (unchanged): 0 = at least one success; 1 = no successes /
     runtime error; 2 = config/input/CA; 3 = privilege (401/403) and zero
@@ -4326,6 +4373,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     fatal_error: Optional[str] = None
     exit_code = 0
     output_path = Path(args.output)
+    generated_report_files: set[Path] = set()
 
     try:
         if report_path_error:
@@ -4537,6 +4585,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 title=ioc_title,
                 primary_report_path=target_primary_path,
                 fatal_error=fatal_error,
+                generated_report_files=generated_report_files,
             )
             logging.info("IOC report: %s", target_ioc_path.resolve())
         except Exception as report_exc:  # noqa: BLE001
@@ -4550,6 +4599,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 title=primary_title,
                 fatal_error=fatal_error,
                 ioc_report_path=target_ioc_path,
+                generated_report_files=generated_report_files,
             )
             logging.info("HTML report: %s", target_primary_path.resolve())
             if target_records:
@@ -4567,12 +4617,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.no_open:
         if written_primary_reports:
             open_report_in_browser(written_primary_reports[0][1])
-            if len(written_primary_reports) > 1:
-                select_report_to_open(written_primary_reports)
         elif fallback_primary_path is not None:
             open_report_in_browser(fallback_primary_path)
     if report_failed and exit_code == 0:
         exit_code = 1
+
+    if generated_report_files and select_report_to_open(
+        written_primary_reports if not args.no_open else []
+    ):
+        cleanup_generated_reports(generated_report_files)
 
     return exit_code
 

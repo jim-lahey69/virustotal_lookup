@@ -238,6 +238,12 @@ class ReportSelectionTests(unittest.TestCase):
 
 
 class InputMainTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Existing export assertions inspect retained files after a batch run.
+        input_patch = patch("builtins.input", side_effect=EOFError)
+        input_patch.start()
+        self.addCleanup(input_patch.stop)
+
     def test_successful_fixture_run_writes_linked_reports(self) -> None:
         cve = "CVE-2021-44228"
         vulnerability = json.loads(
@@ -534,6 +540,18 @@ class InputMainTests(unittest.TestCase):
             html = root / "report.html"
             input_csv = root / "input.csv"
             input_csv.write_text("CVE\n" + "\n".join(cves) + "\n", encoding="utf-8")
+            expected_primary = [root / f"{cve}_report.html" for cve in cves]
+            expected_ioc = [root / f"{cve}_iocs.html" for cve in cves]
+            primary_text: list[str] = []
+            ioc_text: list[str] = []
+            selections = iter(["8", "abc", "2", "3", ""])
+
+            def review_reports(prompt: str) -> str:
+                self.assertIn("remove generated HTML reports", prompt)
+                primary_text[:] = [path.read_text(encoding="utf-8") for path in expected_primary]
+                ioc_text[:] = [path.read_text(encoding="utf-8") for path in expected_ioc]
+                return next(selections)
+
             with (
                 patch.object(ce, "load_project_dotenv", return_value=None),
                 patch.object(ce, "resolve_api_key", return_value="test-api-key"),
@@ -545,15 +563,12 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "write_csv"),
                 patch.object(ce, "print_rich_report"),
                 patch.object(ce, "open_report_in_browser") as open_browser,
-                patch("builtins.input", side_effect=["8", "abc", "2", "3", ""]),
+                patch("builtins.input", side_effect=review_reports),
                 redirect_stdout(io.StringIO()) as output,
             ):
                 exit_code = ce.main(["-i", str(input_csv), "--html", str(html)])
 
-            expected_primary = [root / f"{cve}_report.html" for cve in cves]
-            expected_ioc = [root / f"{cve}_iocs.html" for cve in cves]
-            primary_text = [path.read_text(encoding="utf-8") for path in expected_primary]
-            ioc_text = [path.read_text(encoding="utf-8") for path in expected_ioc]
+            self.assertTrue(all(not path.exists() for path in expected_primary + expected_ioc))
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(

@@ -25,6 +25,9 @@ vtevn/
 # Tool outputs
 cve_enriched.csv
 report.html
+ioc_report.html
+CVE-[0-9][0-9][0-9][0-9]-[0-9]*_report.html
+CVE-[0-9][0-9][0-9][0-9]-[0-9]*_iocs.html
 *.log
 
 # IDE / OS
