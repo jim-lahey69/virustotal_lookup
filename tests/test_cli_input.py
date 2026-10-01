@@ -68,6 +68,7 @@ class InputParserTests(unittest.TestCase):
         self.assertIn("--input CVE", help_text)
         self.assertIn("Single CVE identifier to enrich", help_text)
         self.assertIn("--ioc-html PATH", help_text)
+        self.assertIn("--associations-html PATH", help_text)
 
     def test_missing_input_value_is_a_parser_error(self) -> None:
         stderr = io.StringIO()
@@ -277,11 +278,18 @@ class InputMainTests(unittest.TestCase):
                     }, None, 200
                 return {"data": [], "meta": {"count": 0}}, None, 200
 
+            def get_collection_relationship(self, requested_cve: str, relationship: str, *, limit: int = 40):
+                return {"data": [], "meta": {"count": 0}}, None, 200
+
+            def get_attack_technique_tactics(self, technique_id: str, *, limit: int = 40):
+                return {"data": [], "meta": {"count": 0}}, None, 200
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             output = root / "result.csv"
             primary = root / "report.html"
             ioc = root / "ioc_report.html"
+            associations = root / "associations_report.html"
             with (
                 patch.object(ce, "load_project_dotenv", return_value=None),
                 patch.object(ce, "resolve_api_key", return_value="test-api-key"),
@@ -306,14 +314,17 @@ class InputMainTests(unittest.TestCase):
                 )
             primary_html = primary.read_text(encoding="utf-8")
             ioc_html = ioc.read_text(encoding="utf-8")
+            associations_html = associations.read_text(encoding="utf-8")
 
         self.assertEqual(exit_code, 0)
         self.assertIn('<svg class="priority-chart"', primary_html)
         self.assertIn(f'href="ioc_report.html#{cve}"', primary_html)
+        self.assertIn(f'href="associations_report.html#{cve}"', primary_html)
         self.assertNotIn("exploit.jar", primary_html)
         self.assertIn(f'id="{cve}"', ioc_html)
         self.assertIn("exploit.jar", ioc_html)
         self.assertIn("https://ioc.example/exploit", ioc_html)
+        self.assertIn(cve, associations_html)
 
     def test_valid_input_reaches_existing_pipeline_exactly_once(self) -> None:
         cve = "CVE-2026-12345"
@@ -335,6 +346,7 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "write_csv") as write_csv,
                 patch.object(ce, "print_rich_report"),
                 patch.object(ce, "render_ioc_report") as render_ioc,
+                patch.object(ce, "render_associations_report") as render_associations,
                 patch.object(ce, "render_html_report") as render_html,
                 patch.object(ce, "open_report_in_browser") as open_browser,
             ):
@@ -355,8 +367,16 @@ class InputMainTests(unittest.TestCase):
         enrich.assert_called_once_with(client, [cve], stop_on_forbidden=True)
         write_csv.assert_called_once_with([record], output)
         self.assertEqual(render_ioc.call_args.args[:2], ([record], html.with_name("ioc_report.html")))
+        self.assertEqual(
+            render_associations.call_args.args[:2],
+            ([record], html.with_name("associations_report.html")),
+        )
         self.assertEqual(render_html.call_args.args[:2], ([record], html))
         self.assertEqual(render_html.call_args.kwargs["ioc_report_path"], html.with_name("ioc_report.html"))
+        self.assertEqual(
+            render_html.call_args.kwargs["associations_report_path"],
+            html.with_name("associations_report.html"),
+        )
         open_browser.assert_not_called()
 
     def test_lowercase_input_is_canonical_before_pipeline_call(self) -> None:
@@ -375,6 +395,7 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "write_csv"),
                 patch.object(ce, "print_rich_report"),
                 patch.object(ce, "render_ioc_report"),
+                patch.object(ce, "render_associations_report"),
                 patch.object(ce, "render_html_report"),
             ):
                 exit_code = ce.main(
@@ -399,6 +420,7 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "enrich_cves") as enrich,
                 patch.object(ce, "write_csv") as write_csv,
                 patch.object(ce, "render_ioc_report") as render_ioc,
+                patch.object(ce, "render_associations_report") as render_associations,
                 patch.object(ce, "render_html_report") as render_html,
             ):
                 exit_code = ce.main(
@@ -417,6 +439,7 @@ class InputMainTests(unittest.TestCase):
         enrich.assert_not_called()
         write_csv.assert_not_called()
         render_ioc.assert_called_once()
+        render_associations.assert_called_once()
         self.assertEqual(
             render_html.call_args.kwargs["title"],
             "GTI CVE Enrichment Report — FAILED",
@@ -487,6 +510,7 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "write_csv"),
                 patch.object(ce, "print_rich_report"),
                 patch.object(ce, "render_ioc_report"),
+                patch.object(ce, "render_associations_report"),
                 patch.object(
                     ce,
                     "render_html_report",
@@ -521,6 +545,7 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "write_csv"),
                 patch.object(ce, "print_rich_report"),
                 patch.object(ce, "render_ioc_report"),
+                patch.object(ce, "render_associations_report"),
                 patch.object(ce, "render_html_report"),
                 patch.object(ce, "open_report_in_browser") as open_browser,
                 patch.object(ce, "select_report_to_open") as select_report,
@@ -542,14 +567,19 @@ class InputMainTests(unittest.TestCase):
             input_csv.write_text("CVE\n" + "\n".join(cves) + "\n", encoding="utf-8")
             expected_primary = [root / f"{cve}_report.html" for cve in cves]
             expected_ioc = [root / f"{cve}_iocs.html" for cve in cves]
+            expected_associations = [root / f"{cve}_associations.html" for cve in cves]
             primary_text: list[str] = []
             ioc_text: list[str] = []
+            associations_text: list[str] = []
             selections = iter(["8", "abc", "2", "3", ""])
 
             def review_reports(prompt: str) -> str:
                 self.assertIn("remove generated HTML reports", prompt)
                 primary_text[:] = [path.read_text(encoding="utf-8") for path in expected_primary]
                 ioc_text[:] = [path.read_text(encoding="utf-8") for path in expected_ioc]
+                associations_text[:] = [
+                    path.read_text(encoding="utf-8") for path in expected_associations
+                ]
                 return next(selections)
 
             with (
@@ -568,7 +598,12 @@ class InputMainTests(unittest.TestCase):
             ):
                 exit_code = ce.main(["-i", str(input_csv), "--html", str(html)])
 
-            self.assertTrue(all(not path.exists() for path in expected_primary + expected_ioc))
+            self.assertTrue(
+                all(
+                    not path.exists()
+                    for path in expected_primary + expected_ioc + expected_associations
+                )
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(
@@ -580,10 +615,16 @@ class InputMainTests(unittest.TestCase):
         for index, cve in enumerate(cves):
             self.assertTrue(expected_primary[index].name.endswith("_report.html"))
             self.assertTrue(expected_ioc[index].name.endswith("_iocs.html"))
+            self.assertTrue(expected_associations[index].name.endswith("_associations.html"))
             self.assertIn(cve, primary_text[index])
             self.assertIn(f'href="{cve}_iocs.html#{cve}"', primary_text[index])
+            self.assertIn(
+                f'href="{cve}_associations.html#{cve}"',
+                primary_text[index],
+            )
             self.assertIn(cve, ioc_text[index])
             self.assertIn(f'href="{cve}_report.html"', ioc_text[index])
+            self.assertIn(cve, associations_text[index])
 
     def test_cve_propagates_into_generated_html(self) -> None:
         cve = "CVE-2026-12345"

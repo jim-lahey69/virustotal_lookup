@@ -27,21 +27,27 @@ class ReportCleanupTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.generated: set[Path] = set()
 
-    def generate_pair(self, cve: str = "CVE-2021-44228") -> tuple[Path, Path]:
+    def generate_pair(self, cve: str = "CVE-2021-44228") -> tuple[Path, Path, Path]:
         record = ce.extract_record(cve, {"data": {"attributes": {"name": cve}}})
         primary = self.root / f"{cve}_report.html"
         ioc = self.root / f"{cve}_iocs.html"
+        associations = self.root / f"{cve}_associations.html"
         ce.render_ioc_report(
             [record], ioc, primary_report_path=primary,
             generated_report_files=self.generated,
         )
         ce.render_html_report(
-            [record], primary, ioc_report_path=ioc,
+            [record], primary, ioc_report_path=ioc, associations_report_path=associations,
+            generated_report_files=self.generated,
+        )
+        ce.render_associations_report(
+            [record], associations, primary_report_path=primary, ioc_report_path=ioc,
             generated_report_files=self.generated,
         )
         self.assertTrue(primary.is_file())
         self.assertTrue(ioc.is_file())
-        return primary, ioc
+        self.assertTrue(associations.is_file())
+        return primary, ioc, associations
 
     def test_single_cve_pair_is_tracked_and_removed(self) -> None:
         paths = self.generate_pair()
@@ -56,7 +62,7 @@ class ReportCleanupTests(unittest.TestCase):
         paths = []
         for cve in ("CVE-2021-44228", "CVE-2023-12345", "CVE-2024-56789"):
             paths.extend(self.generate_pair(cve))
-        self.assertEqual(len(self.generated), 6)
+        self.assertEqual(len(self.generated), 9)
         self.assertEqual(self.generated, set(paths))
         ce.cleanup_generated_reports(self.generated)
         self.assertTrue(all(not path.exists() for path in paths))
@@ -64,15 +70,16 @@ class ReportCleanupTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "preserve this HTML")
 
     def test_missing_generated_file_does_not_stop_cleanup(self) -> None:
-        primary, ioc = self.generate_pair()
+        primary, ioc, associations = self.generate_pair()
         primary.unlink()
         ce.cleanup_generated_reports(self.generated)
         self.assertFalse(ioc.exists())
+        self.assertFalse(associations.exists())
         ce.cleanup_generated_reports(self.generated)  # Safe to retry.
 
     def test_locked_file_warns_and_cleanup_continues(self) -> None:
         self.generate_pair()
-        locked, removable = sorted(self.generated)
+        locked, *removable = sorted(self.generated)
         original_unlink = Path.unlink
 
         def unlink(path: Path, *args, **kwargs) -> None:
@@ -83,7 +90,7 @@ class ReportCleanupTests(unittest.TestCase):
         with patch.object(Path, "unlink", unlink), self.assertLogs(level="WARNING") as logs:
             ce.cleanup_generated_reports(self.generated)
         self.assertTrue(locked.exists())
-        self.assertFalse(removable.exists())
+        self.assertTrue(all(not path.exists() for path in removable))
         self.assertIn(str(locked), "\n".join(logs.output))
         self.assertIn("file is locked", "\n".join(logs.output))
 
@@ -151,6 +158,12 @@ class FixtureClient:
             }, None, 200
         return {"data": [], "meta": {"count": 0}}, None, 200
 
+    def get_collection_relationship(self, cve: str, relationship: str, *, limit: int = 40):
+        return {"data": [], "meta": {"count": 0}}, None, 200
+
+    def get_attack_technique_tactics(self, technique_id: str, *, limit: int = 40):
+        return {"data": [], "meta": {"count": 0}}, None, 200
+
 
 class ReportSessionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -161,6 +174,7 @@ class ReportSessionTests(unittest.TestCase):
         self.static.write_text("static page", encoding="utf-8")
         self.primary = self.root / "report.html"
         self.ioc = self.root / "ioc_report.html"
+        self.associations = self.root / "associations_report.html"
         self.csv = self.root / "result.csv"
         self.args = ["--input", "CVE-2021-44228", "--html", str(self.primary),
                      "--output", str(self.csv), "--no-rich"]
@@ -174,12 +188,22 @@ class ReportSessionTests(unittest.TestCase):
         self.cleanup = stack.enter_context(patch.object(ce, "cleanup_generated_reports", wraps=ce.cleanup_generated_reports))
         stack.enter_context(redirect_stdout(io.StringIO()))
 
-    def assert_linked_pair(self, cve: str, primary: Path, ioc: Path) -> None:
+    def assert_linked_pair(self, cve: str, primary: Path, ioc: Path, associations: Path) -> None:
         primary_html = primary.read_text(encoding="utf-8")
         ioc_html = ioc.read_text(encoding="utf-8")
+        associations_html = associations.read_text(encoding="utf-8")
         self.assertIn(f'href="{ce._relative_report_href(primary, ioc)}#{cve}"', primary_html)
+        self.assertIn(
+            f'href="{ce._relative_report_href(primary, associations)}#{cve}"',
+            primary_html,
+        )
         self.assertIn(f'id="{cve}"', ioc_html)
         self.assertIn(f'href="{ce._relative_report_href(ioc, primary)}"', ioc_html)
+        self.assertIn(f'id="{cve}"', associations_html)
+        self.assertIn(
+            f'href="{ce._relative_report_href(associations, primary)}"',
+            associations_html,
+        )
         self.assertIn('<svg class="priority-chart"', primary_html)
         self.assertIn("exploit.jar", ioc_html)
         self.assertIn("https://ioc.example/exploit", ioc_html)
@@ -190,16 +214,19 @@ class ReportSessionTests(unittest.TestCase):
         def review(prompt: str) -> str:
             self.assertIn("Press Enter to exit and remove generated HTML reports", prompt)
             self.cleanup.assert_not_called()
-            self.assert_linked_pair("CVE-2021-44228", self.primary, self.ioc)
+            self.assert_linked_pair(
+                "CVE-2021-44228", self.primary, self.ioc, self.associations
+            )
             self.open_browser.assert_called_once_with(self.primary)
             return next(responses)
 
         with patch("builtins.input", side_effect=review) as read_input:
             self.assertEqual(ce.main(self.args), 0)
         self.assertEqual(read_input.call_count, 2)
-        self.cleanup.assert_called_once_with({self.primary, self.ioc})
+        self.cleanup.assert_called_once_with({self.primary, self.ioc, self.associations})
         self.assertFalse(self.primary.exists())
         self.assertFalse(self.ioc.exists())
+        self.assertFalse(self.associations.exists())
         self.assertTrue(self.csv.exists())
         self.assertEqual(self.static.read_text(encoding="utf-8"), "static page")
 
@@ -207,28 +234,37 @@ class ReportSessionTests(unittest.TestCase):
         cves = ["CVE-2021-44228", "CVE-2023-12345", "CVE-2024-56789"]
         source = self.root / "input.csv"
         source.write_text("CVE\n" + "\n".join(cves), encoding="utf-8")
-        paths = [(self.root / f"{cve}_report.html", self.root / f"{cve}_iocs.html") for cve in cves]
+        paths = [
+            (
+                self.root / f"{cve}_report.html",
+                self.root / f"{cve}_iocs.html",
+                self.root / f"{cve}_associations.html",
+            )
+            for cve in cves
+        ]
         responses = iter(["2", "3", ""])
 
         def review(prompt: str) -> str:
             self.assertIn("remove generated HTML reports", prompt)
             self.cleanup.assert_not_called()
-            for cve, (primary, ioc) in zip(cves, paths):
-                self.assert_linked_pair(cve, primary, ioc)
+            for cve, (primary, ioc, associations) in zip(cves, paths):
+                self.assert_linked_pair(cve, primary, ioc, associations)
             return next(responses)
 
         with patch("builtins.input", side_effect=review):
             self.assertEqual(ce.main(["-i", str(source)] + self.args[2:]), 0)
         generated = {path for pair in paths for path in pair}
         self.cleanup.assert_called_once_with(generated)
-        self.assertEqual([call.args[0] for call in self.open_browser.call_args_list], [pair[0] for pair in paths])
+        self.assertEqual([call.args[0] for call in self.open_browser.call_args_list], [report_set[0] for report_set in paths])
         self.assertTrue(all(not path.exists() for path in generated))
         self.assertEqual(set(self.root.glob("*.html")), {self.static})
 
     def test_no_open_still_waits_for_manual_review(self) -> None:
         def review(prompt: str) -> str:
             self.assertNotIn("Select a report", prompt)
-            self.assert_linked_pair("CVE-2021-44228", self.primary, self.ioc)
+            self.assert_linked_pair(
+                "CVE-2021-44228", self.primary, self.ioc, self.associations
+            )
             self.cleanup.assert_not_called()
             return ""
 
@@ -237,6 +273,7 @@ class ReportSessionTests(unittest.TestCase):
         self.open_browser.assert_not_called()
         self.assertFalse(self.primary.exists())
         self.assertFalse(self.ioc.exists())
+        self.assertFalse(self.associations.exists())
 
     def test_eof_and_interrupt_preserve_reports(self) -> None:
         for end_input in (EOFError, KeyboardInterrupt):
@@ -244,26 +281,47 @@ class ReportSessionTests(unittest.TestCase):
                 self.assertEqual(ce.main(self.args), 0)
             self.assertTrue(self.primary.is_file())
             self.assertTrue(self.ioc.is_file())
+            self.assertTrue(self.associations.is_file())
         self.cleanup.assert_not_called()
 
     def test_custom_report_directories_are_tracked(self) -> None:
         primary = self.root / "primary pages" / "custom.html"
         ioc = self.root / "ioc pages" / "indicators.html"
+        associations = self.root / "association pages" / "threats.html"
 
         def review(prompt: str) -> str:
-            self.assert_linked_pair("CVE-2021-44228", primary, ioc)
+            self.assert_linked_pair("CVE-2021-44228", primary, ioc, associations)
             return ""
 
         with patch("builtins.input", side_effect=review):
-            self.assertEqual(ce.main(self.args + ["--html", str(primary), "--ioc-html", str(ioc)]), 0)
-        self.cleanup.assert_called_once_with({primary, ioc})
+            self.assertEqual(
+                ce.main(
+                    self.args
+                    + [
+                        "--html",
+                        str(primary),
+                        "--ioc-html",
+                        str(ioc),
+                        "--associations-html",
+                        str(associations),
+                    ]
+                ),
+                0,
+            )
+        self.cleanup.assert_called_once_with({primary, ioc, associations})
         self.assertFalse(primary.exists())
         self.assertFalse(ioc.exists())
+        self.assertFalse(associations.exists())
 
     def test_either_report_generation_failure_keeps_other_tracked(self) -> None:
-        for renderer, generated in (("render_ioc_report", self.primary), ("render_html_report", self.ioc)):
+        cases = (
+            ("render_ioc_report", {self.primary, self.associations}),
+            ("render_associations_report", {self.primary, self.ioc}),
+            ("render_html_report", {self.ioc, self.associations}),
+        )
+        for renderer, generated in cases:
             def review(prompt: str) -> str:
-                self.assertTrue(generated.is_file())
+                self.assertTrue(all(path.is_file() for path in generated))
                 return ""
 
             with (
@@ -272,13 +330,14 @@ class ReportSessionTests(unittest.TestCase):
                 patch("builtins.input", side_effect=review),
             ):
                 self.assertEqual(ce.main(self.args), 1)
-            self.assertEqual(self.cleanup.call_args.args[0], {generated})
-            self.assertFalse(generated.exists())
+            self.assertEqual(self.cleanup.call_args.args[0], generated)
+            self.assertTrue(all(not path.exists() for path in generated))
 
     def test_configuration_failure_reports_are_reviewed_then_removed(self) -> None:
         def review(prompt: str) -> str:
             self.assertIn("No API key", self.primary.read_text(encoding="utf-8"))
             self.assertTrue(self.ioc.is_file())
+            self.assertTrue(self.associations.is_file())
             self.cleanup.assert_not_called()
             return ""
 
@@ -286,6 +345,7 @@ class ReportSessionTests(unittest.TestCase):
             self.assertEqual(ce.main(self.args), 2)
         self.assertFalse(self.primary.exists())
         self.assertFalse(self.ioc.exists())
+        self.assertFalse(self.associations.exists())
 
 
 if __name__ == "__main__":

@@ -42,7 +42,8 @@ HTML report
 -----------
 Single-CVE runs write the primary HTML report (default ``report.html``) and
 companion IOC report (default ``ioc_report.html``). Multi-CVE runs write one
-``CVE-..._report.html`` / ``CVE-..._iocs.html`` pair per input record, open the
+``CVE-..._report.html`` / ``CVE-..._iocs.html`` / ``CVE-..._associations.html``
+report set per input record, open the
 first primary report automatically, and offer a lightweight numbered selector
 for additional reports. Failure reports include a prominent error section.
 Reports remain available until Enter confirms exit and cleanup; EOF or Ctrl+C
@@ -80,7 +81,7 @@ import time
 import traceback
 import urllib.parse
 import webbrowser
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
@@ -124,12 +125,15 @@ DEFAULT_OUTPUT = "cve_enriched.csv"
 # HTML path is always used (report is written even when enrichment fails).
 DEFAULT_HTML = "report.html"
 DEFAULT_IOC_HTML = "ioc_report.html"
+DEFAULT_ASSOCIATIONS_HTML = "associations_report.html"
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_BACKOFF_BASE = 2.0  # seconds; exponential: base^attempt + jitter
 DEFAULT_HTTP_TIMEOUT = 60.0
 MAX_REDIRECTS = 5
 # Relationship page size is 40; cap pages so a hostile/broken next-link cannot loop forever.
-MAX_IOC_PAGES = 50
+MAX_RELATIONSHIP_PAGES = 50
+# Backward-compatible name retained for callers/tests that inspect this guard.
+MAX_IOC_PAGES = MAX_RELATIONSHIP_PAGES
 
 # Canonical CVE ID shape used for validation after normalization.
 CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
@@ -218,6 +222,48 @@ WILD_COLLECTION_TAGS = frozenset(
 IOC_PAGE_SIZE = 40
 IOC_RELATIONSHIPS: tuple[str, ...] = ("files", "urls", "domains", "ip_addresses")
 IOC_RELATIONSHIP_SET = frozenset(IOC_RELATIONSHIPS)
+
+# Vulnerability associations are fetched once through the documented broad
+# ``associations`` relationship, then filtered locally. This avoids redundant
+# ``threat_actors`` / ``campaigns`` calls while retaining relevant supporting
+# intelligence for analyst context.
+ASSOCIATION_PAGE_SIZE = 40
+VULNERABILITY_ASSOCIATION_RELATIONSHIPS = frozenset({"associations", "attack_techniques"})
+RELEVANT_ASSOCIATION_TYPES = frozenset(
+    {
+        "threat-actor",
+        "campaign",
+        "malware-family",
+        "software-toolkit",
+        "report",
+        "collection",
+    }
+)
+
+# ATT&CK stage names always come from VirusTotal objects. This map controls
+# display ordering only for recognized Enterprise ATT&CK tactic identifiers;
+# it never creates a stage. Mobile/ICS/unknown tactics retain API order.
+MITRE_ENTERPRISE_TACTIC_ORDER: dict[str, int] = {
+    tactic_id: index
+    for index, tactic_id in enumerate(
+        (
+            "TA0043",  # Reconnaissance
+            "TA0042",  # Resource Development
+            "TA0001",  # Initial Access
+            "TA0002",  # Execution
+            "TA0003",  # Persistence
+            "TA0004",  # Privilege Escalation
+            "TA0005",  # Defense Evasion
+            "TA0006",  # Credential Access
+            "TA0007",  # Discovery
+            "TA0008",  # Lateral Movement
+            "TA0009",  # Collection
+            "TA0011",  # Command and Control
+            "TA0010",  # Exfiltration
+            "TA0040",  # Impact
+        )
+    )
+}
 
 # Fallback delay; actual value is resolved after .env load (see resolve_request_delay).
 DEFAULT_DELAY = 1.0
@@ -472,6 +518,54 @@ def describe_ssl_verify(verify: Union[bool, str]) -> str:
 
 
 @dataclass
+class AssociationEntity:
+    """Normalized threat-intelligence object directly associated with a CVE."""
+
+    entity_id: str
+    entity_type: str
+    name: str
+    relationship: str = "associations"
+    description: str = ""
+    origin: str = ""
+    alt_names: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    first_seen: str = ""
+    last_seen: str = ""
+    creation_date: str = ""
+    last_modification_date: str = ""
+    classifications: list[str] = field(default_factory=list)
+    references: list[dict[str, str]] = field(default_factory=list)
+    vt_url: str = ""
+    context: str = ""
+
+
+@dataclass
+class AttackTechnique:
+    """VirusTotal-associated MITRE ATT&CK technique (the requested Tcode)."""
+
+    technique_id: str
+    name: str
+    relationship: str = "attack_techniques"
+    description: str = ""
+    link: str = ""
+    sources: list[str] = field(default_factory=list)
+    tactics: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class AttackChainStage:
+    """Analytical tactic placement backed by direct VirusTotal technique data."""
+
+    stage_id: str
+    stage: str
+    techniques: list[AttackTechnique] = field(default_factory=list)
+    evidence_type: str = "Analytical Mapping"
+    confidence: str = "Mapped — not observed chronology"
+    evidence: list[str] = field(default_factory=list)
+    notes: str = ""
+
+
+@dataclass
 class CVERecord:
     """Flattened, decision-ready CVE enrichment record.
 
@@ -564,6 +658,18 @@ class CVERecord:
     ioc_urls: list[dict[str, str]] = field(default_factory=list)
     ioc_domains: list[dict[str, str]] = field(default_factory=list)
     ioc_ip_addresses: list[dict[str, str]] = field(default_factory=list)
+
+    # Direct GTI threat-object associations plus ATT&CK-derived chain mapping.
+    # These fields are deliberately excluded from CSV; they belong to the
+    # separate analyst-oriented Associations report.
+    association_status: str = "not_returned"
+    association_error: str = ""
+    threat_actors: list[AssociationEntity] = field(default_factory=list)
+    campaigns: list[AssociationEntity] = field(default_factory=list)
+    supporting_intelligence: list[AssociationEntity] = field(default_factory=list)
+    attack_techniques: list[AttackTechnique] = field(default_factory=list)
+    attack_chain: list[AttackChainStage] = field(default_factory=list)
+    attack_chain_note: str = ""
 
     # Truncated JSON bag for advanced consumers (SIEM, custom parsers)
     extra_json: str = ""
@@ -1383,6 +1489,415 @@ def attach_iocs(client: "GTIClient", rec: CVERecord, payload: dict[str, Any]) ->
 
 
 # ---------------------------------------------------------------------------
+# Threat associations and ATT&CK evidence
+# ---------------------------------------------------------------------------
+
+
+def _string_list(value: Any) -> list[str]:
+    """Return non-empty strings without inventing values or flattening dicts."""
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            result.append(item.strip())
+    return result
+
+
+def _dated_detail_values(value: Any) -> list[str]:
+    """Extract documented ``value`` fields from GTI first/last-seen details."""
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("value")
+        if raw not in (None, ""):
+            result.append(fmt_ts(raw) if isinstance(raw, (int, float)) else str(raw))
+    return result
+
+
+def _association_entity_type(obj: dict[str, Any], attrs: dict[str, Any]) -> str:
+    """Normalize only documented GTI collection types and legacy spellings."""
+    raw = str(attrs.get("collection_type") or obj.get("type") or "").strip().lower()
+    normalized = raw.replace("_", "-")
+    aliases = {
+        "threat-actor": "threat-actor",
+        "threatactor": "threat-actor",
+        "campaign": "campaign",
+        "malware": "malware-family",
+        "malware-family": "malware-family",
+        "software-toolkit": "software-toolkit",
+        "software-or-toolkit": "software-toolkit",
+        "report": "report",
+        "ioc-collection": "collection",
+        "collection": "collection",
+        "vulnerability": "vulnerability",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    entity_id = str(obj.get("id") or "").lower()
+    prefix = entity_id.split("--", 1)[0].replace("_", "-")
+    return aliases.get(prefix, normalized)
+
+
+def _association_references(attrs: dict[str, Any]) -> list[dict[str, str]]:
+    """Normalize URLs/titles actually present on an association object."""
+    candidates: list[Any] = []
+    references = attrs.get("references")
+    if isinstance(references, list):
+        candidates.extend(references)
+    info = attrs.get("info") if isinstance(attrs.get("info"), dict) else {}
+    refs = info.get("refs") if isinstance(info, dict) else None
+    if isinstance(refs, list):
+        candidates.extend(refs)
+    if attrs.get("link"):
+        candidates.append({"url": attrs.get("link"), "title": "Related resource"})
+
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in candidates:
+        if isinstance(item, str):
+            url, title = item.strip(), "Reference"
+        elif isinstance(item, dict):
+            url = str(item.get("url") or item.get("link") or "").strip()
+            title = str(item.get("title") or item.get("name") or "Reference").strip()
+        else:
+            continue
+        if not url:
+            continue
+        key = (url, title)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({"url": url, "title": title})
+    return result
+
+
+def _association_classifications(attrs: dict[str, Any]) -> list[str]:
+    """Collect concise documented classification/context values when present."""
+    result: list[str] = []
+    scalar_fields = (
+        ("campaign_type", "Campaign type"),
+        ("threat_category", "Threat category"),
+        ("threat_classification", "Threat classification"),
+    )
+    for key, label in scalar_fields:
+        value = attrs.get(key)
+        if value not in (None, "", [], {}):
+            result.append(f"{label}: {value}")
+    for key, label in (
+        ("motivations", "Motivation"),
+        ("capabilities", "Capability"),
+        ("malware_roles", "Malware role"),
+        ("detection_names", "Detection"),
+    ):
+        rows = attrs.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            value = row.get("value") if isinstance(row, dict) else row
+            if value not in (None, ""):
+                result.append(f"{label}: {value}")
+    return list(dict.fromkeys(result))
+
+
+def parse_associations(payload: Optional[dict[str, Any]]) -> dict[str, list[AssociationEntity]]:
+    """Filter a vulnerability's broad ``associations`` response for CTI use.
+
+    The endpoint intentionally returns heterogeneous threat objects. Other
+    vulnerabilities and unknown collection types are excluded rather than
+    rendered as an unrelated raw-object dump.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("associations response is not an object")
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        raise ValueError("associations response has no data list")
+
+    groups: dict[str, list[AssociationEntity]] = {
+        "threat_actors": [],
+        "campaigns": [],
+        "supporting_intelligence": [],
+    }
+    seen: set[tuple[str, str]] = set()
+    for obj in rows:
+        if not isinstance(obj, dict) or obj.get("error"):
+            continue
+        attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+        entity_type = _association_entity_type(obj, attrs)
+        if entity_type not in RELEVANT_ASSOCIATION_TYPES:
+            continue
+        entity_id = str(obj.get("id") or "").strip()
+        if not entity_id:
+            continue
+        key = (entity_type, entity_id.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        alt_names = _string_list(attrs.get("alt_names"))
+        name = str(attrs.get("name") or (alt_names[0] if alt_names else entity_id)).strip()
+        first_values = _dated_detail_values(attrs.get("first_seen_details"))
+        last_values = _dated_detail_values(attrs.get("last_seen_details"))
+        first_seen = " | ".join(first_values) or (
+            fmt_ts(attrs.get("first_seen")) if attrs.get("first_seen") not in (None, "") else ""
+        )
+        last_seen = " | ".join(last_values) or (
+            fmt_ts(attrs.get("last_seen")) if attrs.get("last_seen") not in (None, "") else ""
+        )
+        links = obj.get("links") if isinstance(obj.get("links"), dict) else {}
+        context_attributes = (
+            obj.get("context_attributes")
+            if isinstance(obj.get("context_attributes"), dict)
+            else {}
+        )
+        context = ""
+        if context_attributes:
+            # Keep provenance useful without dumping arbitrary raw JSON.
+            related_from = context_attributes.get("related_from")
+            if isinstance(related_from, list):
+                descriptors = [
+                    f"{item.get('type', 'object')}:{item.get('id', '')}"
+                    for item in related_from
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                context = ", ".join(descriptors)
+
+        entity = AssociationEntity(
+            entity_id=entity_id,
+            entity_type=entity_type,
+            name=name,
+            description=str(attrs.get("description") or "").strip(),
+            origin=str(attrs.get("origin") or attrs.get("source") or "").strip(),
+            alt_names=alt_names,
+            tags=list(
+                dict.fromkeys(
+                    _string_list(attrs.get("tags"))
+                    + _string_list(attrs.get("autogenerated_tags"))
+                )
+            ),
+            first_seen=first_seen,
+            last_seen=last_seen,
+            creation_date=(
+                fmt_ts(attrs.get("creation_date"))
+                if attrs.get("creation_date") not in (None, "")
+                else ""
+            ),
+            last_modification_date=(
+                fmt_ts(attrs.get("last_modification_date"))
+                if attrs.get("last_modification_date") not in (None, "")
+                else ""
+            ),
+            classifications=_association_classifications(attrs),
+            references=_association_references(attrs),
+            vt_url=str(links.get("self") or "").strip(),
+            context=context,
+        )
+        if entity_type == "threat-actor":
+            groups["threat_actors"].append(entity)
+        elif entity_type == "campaign":
+            groups["campaigns"].append(entity)
+        else:
+            groups["supporting_intelligence"].append(entity)
+    return groups
+
+
+def parse_attack_techniques(payload: Optional[dict[str, Any]]) -> list[AttackTechnique]:
+    """Normalize VirusTotal ATT&CK technique objects; IDs are the Tcodes."""
+    if not isinstance(payload, dict):
+        raise ValueError("attack_techniques response is not an object")
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        raise ValueError("attack_techniques response has no data list")
+    result: list[AttackTechnique] = []
+    seen: set[str] = set()
+    for obj in rows:
+        if not isinstance(obj, dict) or obj.get("error"):
+            continue
+        technique_id = str(obj.get("id") or "").strip().upper()
+        if not re.fullmatch(r"T\d{4}(?:\.\d{3})?", technique_id) or technique_id in seen:
+            continue
+        seen.add(technique_id)
+        attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+        context = obj.get("context_attributes") if isinstance(obj.get("context_attributes"), dict) else {}
+        result.append(
+            AttackTechnique(
+                technique_id=technique_id,
+                name=str(attrs.get("name") or technique_id).strip(),
+                description=str(attrs.get("description") or "").strip(),
+                link=str(attrs.get("link") or "").strip(),
+                sources=_string_list(context.get("source")) + _string_list(attrs.get("source")),
+            )
+        )
+    return result
+
+
+def parse_attack_tactics(payload: Optional[dict[str, Any]]) -> list[dict[str, str]]:
+    """Normalize tactics returned by an attack technique's relationship."""
+    if not isinstance(payload, dict):
+        raise ValueError("attack_tactics response is not an object")
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        raise ValueError("attack_tactics response has no data list")
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for obj in rows:
+        if not isinstance(obj, dict):
+            continue
+        tactic_id = str(obj.get("id") or "").strip().upper()
+        if not re.fullmatch(r"TA\d{4}", tactic_id) or tactic_id in seen:
+            continue
+        seen.add(tactic_id)
+        attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+        result.append(
+            {
+                "id": tactic_id,
+                "name": str(attrs.get("name") or tactic_id).strip(),
+                "link": str(attrs.get("link") or "").strip(),
+                "description": str(attrs.get("description") or "").strip(),
+            }
+        )
+    return result
+
+
+def build_attack_chain(techniques: list[AttackTechnique]) -> tuple[list[AttackChainStage], str]:
+    """Map direct CVE Tcodes into VirusTotal-returned ATT&CK tactics.
+
+    Tactic grouping is observed data; ordering across recognized Enterprise
+    tactics is analytical. The representation intentionally does not attach
+    CVE-level actors, campaigns, malware, tools, or IOCs to an individual
+    technique because the vulnerability relationships do not prove that edge.
+    """
+    grouped: dict[str, AttackChainStage] = {}
+    order_seen: dict[str, int] = {}
+    unplaced: list[str] = []
+    for technique in techniques:
+        if not technique.tactics:
+            unplaced.append(technique.technique_id)
+            continue
+        for tactic in technique.tactics:
+            tactic_id = tactic.get("id", "")
+            if not tactic_id:
+                continue
+            if tactic_id not in grouped:
+                order_seen[tactic_id] = len(order_seen)
+                grouped[tactic_id] = AttackChainStage(
+                    stage_id=tactic_id,
+                    stage=tactic.get("name") or tactic_id,
+                    notes=(
+                        "Stage placement uses VirusTotal's technique-to-tactic relationship. "
+                        "The displayed sequence is ATT&CK lifecycle ordering, not an observed "
+                        "chronology for this vulnerability."
+                    ),
+                )
+            stage = grouped[tactic_id]
+            if all(existing.technique_id != technique.technique_id for existing in stage.techniques):
+                stage.techniques.append(technique)
+                stage.evidence.append(
+                    f"VirusTotal directly associates {technique.technique_id} with the CVE; "
+                    f"VirusTotal maps it to {tactic_id}."
+                )
+
+    stages = list(grouped.values())
+    stages.sort(
+        key=lambda stage: (
+            0 if stage.stage_id in MITRE_ENTERPRISE_TACTIC_ORDER else 1,
+            MITRE_ENTERPRISE_TACTIC_ORDER.get(stage.stage_id, order_seen[stage.stage_id]),
+        )
+    )
+    if not stages:
+        return (
+            [],
+            "Insufficient VirusTotal intelligence is available to construct a defensible "
+            "attack chain for this vulnerability.",
+        )
+    note = (
+        "This is an ATT&CK-aligned analytical mapping of VirusTotal-associated techniques, "
+        "not an observed intrusion chronology. Actors, campaigns, malware, tools, and IOCs "
+        "shown elsewhere are CVE-level context and are not attributed to a stage without a "
+        "direct VirusTotal relationship."
+    )
+    if unplaced:
+        note += " Tactic placement was unavailable for: " + ", ".join(unplaced) + "."
+    return stages, note
+
+
+def attach_associations(client: "GTIClient", rec: CVERecord) -> None:
+    """Retrieve and normalize associations without making CVE enrichment fatal."""
+    failures: list[str] = []
+    successful_requests = 0
+
+    body, err, status = client.get_collection_relationship(rec.cve, "associations")
+    if err or not isinstance(body, dict):
+        failures.append(f"associations: request failed (HTTP {status or 'n/a'}, {err or 'error'})")
+    else:
+        successful_requests += 1
+        try:
+            groups = parse_associations(body)
+            rec.threat_actors = groups["threat_actors"]
+            rec.campaigns = groups["campaigns"]
+            rec.supporting_intelligence = groups["supporting_intelligence"]
+            pagination_error = str(body.get("_pagination_error") or "").strip()
+            if pagination_error:
+                failures.append(f"associations: {pagination_error}")
+        except (TypeError, ValueError) as exc:
+            failures.append(f"associations: response parsing failed ({exc})")
+
+    technique_body, technique_err, technique_status = client.get_collection_relationship(
+        rec.cve, "attack_techniques"
+    )
+    if technique_err or not isinstance(technique_body, dict):
+        failures.append(
+            "attack_techniques: request failed "
+            f"(HTTP {technique_status or 'n/a'}, {technique_err or 'error'})"
+        )
+    else:
+        successful_requests += 1
+        try:
+            rec.attack_techniques = parse_attack_techniques(technique_body)
+            pagination_error = str(technique_body.get("_pagination_error") or "").strip()
+            if pagination_error:
+                failures.append(f"attack_techniques: {pagination_error}")
+        except (TypeError, ValueError) as exc:
+            failures.append(f"attack_techniques: response parsing failed ({exc})")
+
+    for technique in rec.attack_techniques:
+        tactic_body, tactic_err, tactic_status = client.get_attack_technique_tactics(
+            technique.technique_id
+        )
+        if tactic_err or not isinstance(tactic_body, dict):
+            failures.append(
+                f"{technique.technique_id}/attack_tactics: request failed "
+                f"(HTTP {tactic_status or 'n/a'}, {tactic_err or 'error'})"
+            )
+            continue
+        try:
+            technique.tactics = parse_attack_tactics(tactic_body)
+            pagination_error = str(tactic_body.get("_pagination_error") or "").strip()
+            if pagination_error:
+                failures.append(f"{technique.technique_id}/attack_tactics: {pagination_error}")
+        except (TypeError, ValueError) as exc:
+            failures.append(f"{technique.technique_id}/attack_tactics: parsing failed ({exc})")
+
+    rec.attack_chain, rec.attack_chain_note = build_attack_chain(rec.attack_techniques)
+    has_data = bool(
+        rec.threat_actors
+        or rec.campaigns
+        or rec.supporting_intelligence
+        or rec.attack_techniques
+    )
+    if failures:
+        rec.association_status = "partial" if successful_requests or has_data else "error"
+        rec.association_error = "; ".join(failures)
+    else:
+        rec.association_status = "complete" if has_data else "none"
+
+
+# ---------------------------------------------------------------------------
 # Priority derivation (GTI P0–P4 model)
 # ---------------------------------------------------------------------------
 #
@@ -1913,31 +2428,13 @@ class GTIClient:
             )
             return None, "parse_error", status
 
-    def get_relationship(
+    def _get_paginated_relationship(
         self,
-        cve: str,
-        relationship: str,
+        url: str,
         *,
-        limit: int = IOC_PAGE_SIZE,
+        context: str,
     ) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
-        """Fetch a collection relationship (files / urls / domains / ip_addresses).
-
-        Full related objects (not descriptors-only) so file names, hashes, and
-        URL strings are available for the IOC report. Supported ``links.next``
-        pagination is followed so all returned objects are retained. Every page
-        uses the same TLS/proxy/retry path as ``get_vulnerability``.
-        """
-        canonical = _canonical_cve(cve)
-        if canonical is None:
-            logging.error("Refusing invalid CVE identifier %r", (cve or "")[:64])
-            return None, "error", 0
-        rel = relationship.strip().strip("/").lower()
-        if rel not in IOC_RELATIONSHIP_SET:
-            logging.error("Refusing unsupported relationship %r", relationship)
-            return None, "error", 0
-        page_size = min(max(1, int(limit)), IOC_PAGE_SIZE)
-        object_id = cve_api_id(canonical)
-        url = f"{self.base_url}/collections/{object_id}/{rel}?limit={page_size}"
+        """Follow a full-object relationship's same-path ``links.next`` URLs."""
         expected = urllib.parse.urlparse(url)
         expected_path = _normalized_posix_path(expected.path)
         rows: list[Any] = []
@@ -1946,12 +2443,12 @@ class GTIClient:
         next_url: Optional[str] = url
 
         while next_url:
-            if len(seen_urls) >= MAX_IOC_PAGES:
+            if len(seen_urls) >= MAX_RELATIONSHIP_PAGES:
                 return {
                     "data": rows,
                     "meta": {"count": max(total, len(rows))},
                     "_pagination_error": (
-                        f"pagination exceeded cap of {MAX_IOC_PAGES} pages"
+                        f"pagination exceeded cap of {MAX_RELATIONSHIP_PAGES} pages"
                     ),
                 }, None, 200
             if next_url in seen_urls:
@@ -1962,7 +2459,7 @@ class GTIClient:
                 }, None, 200
             seen_urls.add(next_url)
 
-            body, err, status = self._get_json(next_url, context=f"{canonical}/{rel}")
+            body, err, status = self._get_json(next_url, context=context)
             if err or not isinstance(body, dict):
                 if rows:
                     return {
@@ -2009,6 +2506,69 @@ class GTIClient:
             next_url = candidate
 
         return {"data": rows, "meta": {"count": max(total, len(rows))}}, None, 200
+
+    def get_relationship(
+        self,
+        cve: str,
+        relationship: str,
+        *,
+        limit: int = IOC_PAGE_SIZE,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
+        """Fetch a paginated CVE IOC relationship with complete objects."""
+        canonical = _canonical_cve(cve)
+        if canonical is None:
+            logging.error("Refusing invalid CVE identifier %r", (cve or "")[:64])
+            return None, "error", 0
+        rel = relationship.strip().strip("/").lower()
+        if rel not in IOC_RELATIONSHIP_SET:
+            logging.error("Refusing unsupported relationship %r", relationship)
+            return None, "error", 0
+        page_size = min(max(1, int(limit)), IOC_PAGE_SIZE)
+        object_id = cve_api_id(canonical)
+        url = f"{self.base_url}/collections/{object_id}/{rel}?limit={page_size}"
+        return self._get_paginated_relationship(url, context=f"{canonical}/{rel}")
+
+    def get_collection_relationship(
+        self,
+        cve: str,
+        relationship: str,
+        *,
+        limit: int = ASSOCIATION_PAGE_SIZE,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
+        """Fetch documented CVE threat-object or ATT&CK relationships."""
+        canonical = _canonical_cve(cve)
+        if canonical is None:
+            logging.error("Refusing invalid CVE identifier %r", (cve or "")[:64])
+            return None, "error", 0
+        rel = relationship.strip().strip("/").lower()
+        if rel not in VULNERABILITY_ASSOCIATION_RELATIONSHIPS:
+            logging.error("Refusing unsupported vulnerability relationship %r", relationship)
+            return None, "error", 0
+        page_size = min(max(1, int(limit)), ASSOCIATION_PAGE_SIZE)
+        object_id = cve_api_id(canonical)
+        url = f"{self.base_url}/collections/{object_id}/{rel}?limit={page_size}"
+        return self._get_paginated_relationship(url, context=f"{canonical}/{rel}")
+
+    def get_attack_technique_tactics(
+        self,
+        technique_id: str,
+        *,
+        limit: int = ASSOCIATION_PAGE_SIZE,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str], int]:
+        """Fetch tactics that VirusTotal associates with one MITRE Tcode."""
+        normalized = str(technique_id or "").strip().upper()
+        if not re.fullmatch(r"T\d{4}(?:\.\d{3})?", normalized):
+            logging.error("Refusing invalid ATT&CK technique identifier %r", technique_id)
+            return None, "error", 0
+        page_size = min(max(1, int(limit)), ASSOCIATION_PAGE_SIZE)
+        url = (
+            f"{self.base_url}/attack_techniques/"
+            f"{urllib.parse.quote(normalized, safe='.')}/attack_tactics?limit={page_size}"
+        )
+        return self._get_paginated_relationship(
+            url,
+            context=f"{normalized}/attack_tactics",
+        )
 
 
 def _safe_error_body(resp: requests.Response, limit: int = 300) -> str:
@@ -2359,7 +2919,9 @@ def write_csv(records: Iterable[CVERecord], path: Path) -> None:
         writer = csv.DictWriter(fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         for rec in records:
-            row = asdict(rec)
+            # Do not recursively copy the separate association/IOC object graphs
+            # merely to discard them from this intentionally flat export.
+            row = {key: getattr(rec, key, "") for key in CSV_COLUMNS}
             # Collapse newlines so multi-line descriptions do not break CSV rows
             for key in ("description", "executive_summary", "analysis", "affected_products", "workarounds"):
                 if key in row and isinstance(row[key], str):
@@ -2589,16 +3151,25 @@ def default_ioc_report_path(primary_path: Path) -> Path:
     return candidate
 
 
+def default_associations_report_path(primary_path: Path) -> Path:
+    """Place the run's Associations report beside the primary report."""
+    candidate = primary_path.with_name(DEFAULT_ASSOCIATIONS_HTML)
+    if candidate.resolve() == primary_path.resolve():
+        candidate = primary_path.with_name(f"{primary_path.stem}_associations_report.html")
+    return candidate
+
+
 def _report_targets(
     records: list[CVERecord],
     primary_path: Path,
     ioc_path: Path,
-) -> list[tuple[list[CVERecord], Path, Path]]:
+    associations_path: Path,
+) -> list[tuple[list[CVERecord], Path, Path, Path]]:
     """Map records to report files, retaining legacy paths for zero/one CVE."""
     if len(records) <= 1:
-        return [(records, primary_path, ioc_path)]
+        return [(records, primary_path, ioc_path, associations_path)]
 
-    targets: list[tuple[list[CVERecord], Path, Path]] = []
+    targets: list[tuple[list[CVERecord], Path, Path, Path]] = []
     for rec in records:
         safe_cve = _ioc_anchor_id(rec.cve)
         targets.append(
@@ -2606,6 +3177,7 @@ def _report_targets(
                 [rec],
                 primary_path.with_name(f"{safe_cve}_report.html"),
                 ioc_path.with_name(f"{safe_cve}_iocs.html"),
+                associations_path.with_name(f"{safe_cve}_associations.html"),
             )
         )
     return targets
@@ -2616,7 +3188,7 @@ def _relative_report_href(source_path: Path, target_path: Path) -> str:
     try:
         relative = os.path.relpath(target_path.resolve(), start=source_path.parent.resolve())
     except ValueError as exc:
-        raise ValueError("Primary and IOC reports must be written on the same drive") from exc
+        raise ValueError("Linked reports must be written on the same drive") from exc
     return urllib.parse.quote(Path(relative).as_posix(), safe="/._-~")
 
 
@@ -3040,6 +3612,28 @@ def _html_ioc_summary(rec: CVERecord, report_href: str) -> str:
 """
 
 
+def _html_associations_summary(rec: CVERecord, report_href: str) -> str:
+    """Render association status plus a deep-link from the primary report."""
+    anchor = urllib.parse.quote(_ioc_anchor_id(rec.cve), safe="-._~")
+    href = f"{report_href}#{anchor}"
+    actor_campaign_count = len(rec.threat_actors) + len(rec.campaigns)
+    if rec.association_status == "none":
+        status = "No threat actor or campaign associations were returned by VirusTotal."
+    elif rec.association_status == "not_returned":
+        status = "Association availability was not returned by VirusTotal."
+    elif rec.association_status in {"partial", "error"}:
+        status = "Association retrieval failed or was incomplete; see the report for details."
+    else:
+        status = f"{actor_campaign_count} associated threat actor/campaign object(s)."
+    return f"""
+  <section class="iocs ioc-summary">
+    <h3>Associated Threats</h3>
+    <p>{_html_escape(status)}</p>
+    <a class="ioc-report-link" href="{_html_escape(href)}" target="_blank" rel="noopener noreferrer">View Associations Report ↗</a>
+  </section>
+"""
+
+
 def _write_html_report(
     path: Path, doc: str, generated_report_files: Optional[set[Path]] = None
 ) -> None:
@@ -3209,6 +3803,337 @@ def render_ioc_report(
     logging.info("Wrote IOC report: %s", path)
 
 
+def _is_safe_http_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(str(url).strip())
+    except ValueError:
+        return False
+    return parsed.scheme.casefold() in {"http", "https"} and bool(parsed.netloc)
+
+
+def _html_web_anchor(url: str, label: str) -> str:
+    """Render an API-provided web URL only when it has a safe HTTP(S) scheme."""
+    if not _is_safe_http_url(url):
+        return _html_escape(label)
+    return (
+        f'<a href="{_html_escape(url)}" target="_blank" '
+        f'rel="noopener noreferrer">{_html_escape(label)}</a>'
+    )
+
+
+def _association_type_label(entity_type: str) -> str:
+    return {
+        "threat-actor": "Threat Actor",
+        "campaign": "Campaign",
+        "malware-family": "Malware Family",
+        "software-toolkit": "Software / Toolkit",
+        "report": "Report",
+        "collection": "IOC Collection",
+    }.get(entity_type, entity_type.replace("-", " ").title())
+
+
+def _html_association_entity(entity: AssociationEntity) -> str:
+    """Render one normalized association without exposing arbitrary raw JSON."""
+    rows: list[str] = [
+        f"<tr><th>Entity ID</th><td class='mono'>{_html_escape(entity.entity_id)}</td></tr>",
+        f"<tr><th>Relationship</th><td>{_html_escape(entity.relationship)}</td></tr>",
+    ]
+    optional_rows = (
+        ("Origin / source", entity.origin),
+        ("Alternative names", ", ".join(entity.alt_names)),
+        ("Tags", ", ".join(entity.tags)),
+        ("First seen", entity.first_seen),
+        ("Last seen", entity.last_seen),
+        ("Created", entity.creation_date),
+        ("Last modified", entity.last_modification_date),
+        ("Relationship context", entity.context),
+    )
+    for label, value in optional_rows:
+        if value:
+            rows.append(f"<tr><th>{_html_escape(label)}</th><td>{_html_escape(value)}</td></tr>")
+    if entity.classifications:
+        values = "".join(f"<li>{_html_escape(item)}</li>" for item in entity.classifications)
+        rows.append(f"<tr><th>Classifications</th><td><ul>{values}</ul></td></tr>")
+    links: list[str] = []
+    if entity.vt_url:
+        links.append(_html_web_anchor(entity.vt_url, "VirusTotal API object"))
+    links.extend(
+        _html_web_anchor(ref.get("url", ""), ref.get("title", "Reference"))
+        for ref in entity.references
+    )
+    if links:
+        rows.append(f"<tr><th>References</th><td>{' · '.join(links)}</td></tr>")
+    description = (
+        f"<p class='entity-description'>{_html_escape(entity.description)}</p>"
+        if entity.description
+        else ""
+    )
+    return f"""
+      <section class="entity-card">
+        <div class="entity-heading">
+          <h4>{_html_escape(entity.name)}</h4>
+          <span class="badge">{_html_escape(_association_type_label(entity.entity_type))}</span>
+        </div>
+        {description}
+        <div class="table-wrap"><table class="kv">{''.join(rows)}</table></div>
+      </section>
+"""
+
+
+def _html_techniques_table(techniques: list[AttackTechnique]) -> str:
+    if not techniques:
+        return '<p class="muted">No MITRE ATT&amp;CK techniques were returned by VirusTotal.</p>'
+    rows: list[str] = []
+    for technique in techniques:
+        tactic_names = ", ".join(
+            f"{tactic.get('id', '')} {tactic.get('name', '')}".strip()
+            for tactic in technique.tactics
+        ) or "Tactic mapping unavailable"
+        technique_label = _html_web_anchor(
+            technique.link,
+            f"{technique.technique_id} — {technique.name}",
+        )
+        sources = ", ".join(technique.sources) or "Direct VirusTotal relationship"
+        rows.append(
+            "<tr class='technique-record'>"
+            f"<td>{technique_label}</td>"
+            f"<td>{_html_escape(tactic_names)}</td>"
+            f"<td>{_html_escape(sources)}</td>"
+            "</tr>"
+        )
+    return (
+        '<div class="table-wrap"><table class="data"><thead><tr>'
+        '<th>Tcode / Technique</th><th>VirusTotal tactic mapping</th><th>Evidence source</th>'
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+    )
+
+
+def _html_attack_chain(rec: CVERecord) -> str:
+    if not rec.attack_chain:
+        message = rec.attack_chain_note or (
+            "Insufficient VirusTotal intelligence is available to construct a defensible "
+            "attack chain for this vulnerability."
+        )
+        return f'<p class="chain-empty">{_html_escape(message)}</p>'
+
+    nodes = "".join(
+        f"<span class='chain-node'><span class='stage-id'>{_html_escape(stage.stage_id)}</span>"
+        f"{_html_escape(stage.stage)}</span>"
+        + ("<span class='chain-arrow' aria-hidden='true'>→</span>" if index < len(rec.attack_chain) - 1 else "")
+        for index, stage in enumerate(rec.attack_chain)
+    )
+    details: list[str] = []
+    for index, stage in enumerate(rec.attack_chain, start=1):
+        techniques = "".join(
+            f"<li><span class='mono'>{_html_escape(technique.technique_id)}</span> — "
+            f"{_html_escape(technique.name)}</li>"
+            for technique in stage.techniques
+        )
+        evidence = "".join(f"<li>{_html_escape(item)}</li>" for item in stage.evidence)
+        details.append(
+            f"""
+        <details class="stage-detail" open>
+          <summary>Stage {index}: {_html_escape(stage.stage)} <span class="mono">{_html_escape(stage.stage_id)}</span></summary>
+          <dl>
+            <dt>Evidence type</dt><dd>{_html_escape(stage.evidence_type)}</dd>
+            <dt>Confidence</dt><dd>{_html_escape(stage.confidence)}</dd>
+          </dl>
+          <h5>VirusTotal-associated Tcodes</h5><ul>{techniques}</ul>
+          <h5>Evidence</h5><ul>{evidence}</ul>
+          <p class="muted">{_html_escape(stage.notes)}</p>
+        </details>
+"""
+        )
+    return f"""
+      <p class="integrity-note">{_html_escape(rec.attack_chain_note)}</p>
+      <div class="chain" aria-label="ATT&amp;CK-aligned analytical attack-chain mapping">{nodes}</div>
+      {''.join(details)}
+"""
+
+
+def render_associations_report(
+    records: list[CVERecord],
+    path: Path,
+    title: str = "GTI Associations / Associated Threats Report",
+    *,
+    primary_report_path: Optional[Path] = None,
+    ioc_report_path: Optional[Path] = None,
+    fatal_error: Optional[str] = None,
+    generated_report_files: Optional[set[Path]] = None,
+) -> None:
+    """Write a self-contained associations and evidence-backed chain report."""
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    primary_path = primary_report_path or path.with_name(DEFAULT_HTML)
+    ioc_path = ioc_report_path or default_ioc_report_path(primary_path)
+    primary_href = _relative_report_href(path, primary_path)
+    ioc_href = _relative_report_href(path, ioc_path)
+    nav_links: list[str] = []
+    sections: list[str] = []
+
+    for rec in records:
+        anchor = _ioc_anchor_id(rec.cve)
+        encoded_anchor = urllib.parse.quote(anchor, safe="-._~")
+        nav_links.append(
+            f'<a class="chip" href="#{_html_escape(encoded_anchor)}">{_html_escape(rec.cve)}</a>'
+        )
+        if rec.status != "ok":
+            content = (
+                '<p class="error" role="alert">Association data is unavailable because '
+                f'enrichment failed: {_html_escape(rec.error_message or rec.status)}</p>'
+            )
+        else:
+            if rec.threat_actors:
+                actors_html = "".join(_html_association_entity(item) for item in rec.threat_actors)
+            else:
+                actors_html = '<p class="muted">No associated threat actors were returned.</p>'
+            if rec.campaigns:
+                campaigns_html = "".join(_html_association_entity(item) for item in rec.campaigns)
+            else:
+                campaigns_html = '<p class="muted">No associated campaigns were returned.</p>'
+            if rec.supporting_intelligence:
+                supporting_html = "".join(
+                    _html_association_entity(item) for item in rec.supporting_intelligence
+                )
+            else:
+                supporting_html = '<p class="muted">No relevant supporting threat objects were returned.</p>'
+
+            no_actor_campaign = ""
+            if not rec.threat_actors and not rec.campaigns:
+                no_actor_campaign = (
+                    '<p class="notice">No threat actor or campaign associations were returned '
+                    'by VirusTotal for this vulnerability.</p>'
+                )
+            association_error = ""
+            if rec.association_error:
+                association_error = (
+                    '<p class="error" role="alert">Association retrieval was incomplete: '
+                    f'{_html_escape(rec.association_error)}</p>'
+                )
+            actor_names = ", ".join(item.name for item in rec.threat_actors) or "None returned"
+            campaign_names = ", ".join(item.name for item in rec.campaigns) or "None returned"
+            malware_tools = ", ".join(
+                item.name
+                for item in rec.supporting_intelligence
+                if item.entity_type in {"malware-family", "software-toolkit"}
+            ) or "None returned"
+            ioc_anchor = urllib.parse.quote(anchor, safe="-._~")
+            evidence_rows = f"""
+              <tr><th>Observed actor context</th><td>{_html_escape(actor_names)}</td></tr>
+              <tr><th>Observed campaign context</th><td>{_html_escape(campaign_names)}</td></tr>
+              <tr><th>Observed malware/tool context</th><td>{_html_escape(malware_tools)}</td></tr>
+              <tr><th>Observed IOCs</th><td><a href="{_html_escape(ioc_href)}#{_html_escape(ioc_anchor)}" target="_blank" rel="noopener noreferrer">{_ioc_record_count(rec)} IOC record(s) in the IOC report ↗</a></td></tr>
+              <tr><th>Observed Tcodes</th><td>{len(rec.attack_techniques)} direct <code>attack_techniques</code> relationship object(s)</td></tr>
+              <tr><th>Stage inference</th><td>Technique-to-tactic placement from VirusTotal; recognized Enterprise tactics are displayed in canonical ATT&amp;CK lifecycle order. This is not observed event chronology.</td></tr>
+            """
+            content = f"""
+        {association_error}
+        {no_actor_campaign}
+        <section><h3>Associated Threat Actors</h3>{actors_html}</section>
+        <section><h3>Associated Campaigns</h3>{campaigns_html}</section>
+        <section><h3>Related Threat Intelligence</h3>{supporting_html}</section>
+        <section>
+          <h3>Tcodes / MITRE ATT&amp;CK Techniques</h3>
+          <p class="muted">“Tcodes” are the IDs returned by VirusTotal's <code>attack_techniques</code> relationship; no separate Tcodes field is assumed.</p>
+          {_html_techniques_table(rec.attack_techniques)}
+        </section>
+        <section><h3>Attack Chain</h3>{_html_attack_chain(rec)}</section>
+        <section>
+          <h3>Evidence / Data Sources</h3>
+          <div class="table-wrap"><table class="kv">{evidence_rows}</table></div>
+          <p class="integrity-note">CVE-level co-association does not prove technique-level attribution. The report therefore does not assign actors, campaigns, malware, tools, or IOCs to an individual stage unless VirusTotal supplies that direct relationship.</p>
+        </section>
+"""
+        sections.append(
+            f"""
+    <article class="card" id="{_html_escape(anchor)}">
+      <header class="card-header">
+        <div><div class="eyebrow">CVE Identifier</div><h2>{_html_escape(rec.cve)}</h2></div>
+        <nav class="report-links" aria-label="Related reports">
+          <a href="{_html_escape(primary_href)}" rel="noopener">Primary report</a>
+          <a href="{_html_escape(ioc_href)}#{_html_escape(encoded_anchor)}" target="_blank" rel="noopener noreferrer">IOC report ↗</a>
+        </nav>
+      </header>
+      {content}
+    </article>
+"""
+        )
+
+    fatal_section = ""
+    if fatal_error:
+        fatal_section = f"""
+    <section class="fatal-banner" role="alert">
+      <h2>Run failed</h2>
+      <p>The Associations report was still generated so the run has a complete audit trail.</p>
+      <pre>{_html_escape(fatal_error)}</pre>
+    </section>
+"""
+    empty = '<p class="muted">No CVE records were produced for this run.</p>'
+    doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{_html_escape(title)}</title>
+<style>
+  :root {{ --bg:#0b1220; --surface:#121a2b; --surface-2:#1a2438; --text:#e8eefc; --muted:#8b9bb8; --border:#2a3754; --accent:#38bdf8; --danger:#ef4444; --mapped:#a78bfa; }}
+  * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
+  body {{ margin:0; min-height:100vh; color:var(--text); line-height:1.5; font-family:"Segoe UI",system-ui,-apple-system,sans-serif; background:radial-gradient(1200px 600px at 10% -10%,#1e293b 0%,var(--bg) 55%); }}
+  .wrap {{ max-width:1100px; margin:0 auto; padding:2rem 1.25rem 4rem; }}
+  .page-header {{ border-bottom:1px solid var(--border); margin-bottom:1.5rem; padding-bottom:1rem; }}
+  h1 {{ margin:0 0 .35rem; font-size:1.75rem; }} h2 {{ margin:0; font-size:1.3rem; }}
+  h3 {{ margin:1.25rem 0 .6rem; color:var(--accent); font-size:.95rem; letter-spacing:.06em; text-transform:uppercase; }}
+  h4 {{ margin:0; font-size:1rem; }} h5 {{ margin:.8rem 0 .25rem; }}
+  a {{ color:var(--accent); text-decoration:none; }} a:hover {{ text-decoration:underline; }}
+  code,.mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
+  .muted,.meta,.eyebrow {{ color:var(--muted); }} .meta {{ font-size:.9rem; }}
+  .eyebrow {{ font-size:.72rem; text-transform:uppercase; letter-spacing:.08em; }}
+  .nav,.report-links {{ display:flex; flex-wrap:wrap; gap:.55rem; margin-top:.9rem; }}
+  .report-links {{ margin-top:0; justify-content:flex-end; }}
+  .chip,.badge {{ display:inline-block; padding:.25rem .6rem; border:1px solid var(--border); border-radius:999px; background:var(--surface-2); font-size:.78rem; }}
+  .card {{ scroll-margin-top:1rem; margin-bottom:1.25rem; padding:1.2rem 1.3rem; border:1px solid var(--border); border-left:5px solid var(--accent); border-radius:14px; background:linear-gradient(180deg,var(--surface),#0f172a); box-shadow:0 10px 30px rgba(0,0,0,.25); }}
+  .card-header,.entity-heading {{ display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; }}
+  .entity-card {{ margin:.75rem 0; padding:.9rem 1rem; border:1px solid var(--border); border-radius:11px; background:#0d1628; }}
+  .entity-description {{ color:#dbe7ff; }}
+  .table-wrap {{ overflow-x:auto; border:1px solid var(--border); border-radius:9px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:.84rem; }}
+  th,td {{ padding:.45rem .55rem; text-align:left; vertical-align:top; border-bottom:1px solid #1e293b; word-break:break-word; }}
+  th {{ color:var(--muted); font-weight:600; }} table.kv th {{ width:26%; }} tr:last-child th,tr:last-child td {{ border-bottom:0; }}
+  ul {{ margin:.25rem 0; padding-left:1.2rem; }}
+  .notice,.integrity-note,.chain-empty {{ padding:.7rem .85rem; border:1px solid #4c3d73; border-radius:9px; background:#211a35; color:#ddd6fe; }}
+  .error,.fatal-banner {{ color:#fecaca; background:#3f0d0d; border:1px solid #7f1d1d; border-radius:10px; padding:.7rem .85rem; }}
+  .fatal-banner {{ margin-bottom:1.25rem; }} .fatal-banner pre {{ white-space:pre-wrap; word-break:break-word; font-size:.78rem; }}
+  .chain {{ display:flex; flex-wrap:wrap; align-items:center; gap:.55rem; margin:1rem 0; }}
+  .chain-node {{ display:inline-flex; flex-direction:column; min-width:9rem; padding:.65rem .8rem; border:1px solid var(--mapped); border-radius:10px; background:#211a35; font-weight:700; }}
+  .stage-id {{ color:#c4b5fd; font-size:.72rem; }} .chain-arrow {{ color:var(--accent); font-size:1.35rem; }}
+  .stage-detail {{ margin:.65rem 0; padding:.65rem .8rem; border:1px solid var(--border); border-radius:9px; background:#0d1628; }}
+  .stage-detail summary {{ cursor:pointer; font-weight:700; }}
+  dl {{ display:grid; grid-template-columns:max-content 1fr; gap:.25rem .7rem; }} dt {{ color:var(--muted); }} dd {{ margin:0; }}
+  footer {{ margin-top:2rem; padding-top:1rem; border-top:1px solid var(--border); color:var(--muted); font-size:.8rem; }}
+  @media (max-width:700px) {{ .card-header,.entity-heading {{ flex-direction:column; }} .report-links {{ justify-content:flex-start; }} .chain-arrow {{ transform:rotate(90deg); }} table.kv th {{ width:38%; }} }}
+</style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="page-header">
+      <h1>{_html_escape(title)}</h1>
+      <div class="meta">Generated {generated} · {len(records)} CVE(s)</div>
+      <div class="nav">{''.join(nav_links)}</div>
+    </header>
+    {fatal_section}
+    {''.join(sections) if sections else empty}
+    <footer>
+      Direct threat objects: <code>/api/v3/collections/vulnerability--&lt;cve&gt;/associations</code>.
+      Tcodes: <code>/attack_techniques</code>. Tactic placement: <code>/api/v3/attack_techniques/&lt;Tcode&gt;/attack_tactics</code>.
+      Availability depends on Google TI licensing and object coverage.
+    </footer>
+  </main>
+</body>
+</html>
+"""
+    _write_html_report(path, doc, generated_report_files)
+    logging.info("Wrote Associations report: %s", path)
+
+
 def render_html_report(
     records: list[CVERecord],
     path: Path,
@@ -3216,6 +4141,7 @@ def render_html_report(
     *,
     fatal_error: Optional[str] = None,
     ioc_report_path: Optional[Path] = None,
+    associations_report_path: Optional[Path] = None,
     generated_report_files: Optional[set[Path]] = None,
 ) -> None:
     """
@@ -3232,6 +4158,8 @@ def render_html_report(
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     resolved_ioc_path = ioc_report_path or default_ioc_report_path(path)
     ioc_report_href = _relative_report_href(path, resolved_ioc_path)
+    resolved_associations_path = associations_report_path or default_associations_report_path(path)
+    associations_report_href = _relative_report_href(path, resolved_associations_path)
     ok = sum(1 for r in records if r.status == "ok")
     failed = len(records) - ok
     pri_counts: dict[str, int] = {}
@@ -3297,6 +4225,7 @@ def render_html_report(
   <p class="error-msg">{_html_escape(rec.error_message or "No data")}</p>
   <p class="meta">{_html_vt_anchor(rec.vt_url, "VirusTotal")}</p>
   {_html_ioc_summary(rec, ioc_report_href)}
+  {_html_associations_summary(rec, associations_report_href)}
 </article>
 """
             )
@@ -3338,6 +4267,7 @@ def render_html_report(
         )
         wild_note = _html_wild_status_note(rec)
         ioc_section = _html_ioc_summary(rec, ioc_report_href)
+        associations_section = _html_associations_summary(rec, associations_report_href)
         priority_viz = _html_priority_viz(rec)
 
         cards.append(
@@ -3427,6 +4357,7 @@ def render_html_report(
   </section>
 
   {ioc_section}
+  {associations_section}
 
   <footer class="card-footer">
     {_html_vt_anchor(rec.vt_url, "Open in VirusTotal / GTI ↗")}
@@ -4095,6 +5026,21 @@ def enrich_cves(
                         cve,
                         type(ioc_exc).__name__,
                     )
+                try:
+                    attach_associations(client, rec)
+                except (TypeError, ValueError, AttributeError, KeyError, OSError) as assoc_exc:
+                    rec.association_status = "error"
+                    rec.association_error = "Unexpected associations processing failure"
+                    rec.attack_chain = []
+                    rec.attack_chain_note = (
+                        "Insufficient VirusTotal intelligence is available to construct a "
+                        "defensible attack chain for this vulnerability."
+                    )
+                    logging.warning(
+                        "Associations processing failed for %s (%s)",
+                        cve,
+                        type(assoc_exc).__name__,
+                    )
                 records.append(rec)
                 logging.info(
                     "  → %s | risk=%s | priority=%s | EPSS=%s | KEV=%s",
@@ -4274,6 +5220,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--associations-html",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Associations HTML report path; multi-CVE runs write "
+            "CVE-..._associations.html files in its directory (default: beside --html)"
+        ),
+    )
+    p.add_argument(
         "--no-open",
         action="store_true",
         help="Do not open the HTML report in a browser (report is still written)",
@@ -4344,9 +5299,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     """
     Run enrichment end-to-end.
 
-    Guarantees: after parse + logging setup, primary and IOC HTML reports are
+    Guarantees: after parse + logging setup, primary, IOC, and Associations HTML reports are
     always generated, even when the run fails with a missing key, SSL error,
-    bad input, or unexpected exception. Multi-CVE runs generate one pair per
+    bad input, or unexpected exception. Multi-CVE runs generate one report set per
     record. The first primary report opens automatically and a numbered selector
     can open more reports (unless ``--no-open``). Enter at the review prompt
     removes only this invocation's generated HTML files.
@@ -4364,11 +5319,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     # can render an empty-records failure page if we never get that far.
     html_path = Path(args.html)
     ioc_path = Path(args.ioc_html) if args.ioc_html else default_ioc_report_path(html_path)
+    associations_path = (
+        Path(args.associations_html)
+        if args.associations_html
+        else default_associations_report_path(html_path)
+    )
     report_path_error: Optional[str] = None
-    if ioc_path.resolve() == html_path.resolve():
-        report_path_error = "--ioc-html must be different from --html"
+    resolved_report_paths = {
+        html_path.resolve(),
+        ioc_path.resolve(),
+        associations_path.resolve(),
+    }
+    if len(resolved_report_paths) != 3:
+        report_path_error = (
+            "--html, --ioc-html, and --associations-html must refer to different files"
+        )
         # Keep the always-written failure artifacts distinct even for bad input.
         ioc_path = default_ioc_report_path(html_path)
+        associations_path = default_associations_report_path(html_path)
     records: list[CVERecord] = []
     fatal_error: Optional[str] = None
     exit_code = 0
@@ -4543,6 +5511,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "ca bundle",
                 "placeholder",
                 "--ioc-html",
+                "--associations-html",
                 "env file",
                 "unreadable .env",
             )
@@ -4553,8 +5522,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ------------------------------------------------------------------
     # Always write HTML reports (success, partial, or total failure). Multi-CVE
-    # runs get one primary/IOC pair per CVE; zero/single-CVE runs retain the
-    # configured legacy paths. IOC reports open only from their primary report.
+    # runs get one primary/IOC/Associations set per CVE; zero/single-CVE runs
+    # retain the configured paths. Companion reports open only from links.
     #
     # This block intentionally sits *outside* the main try so config/SSL/key
     # failures still produce a browsable error page. ``records`` may be empty
@@ -4566,16 +5535,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     report_failed = False
     written_primary_reports: list[tuple[str, Path]] = []
     fallback_primary_path: Optional[Path] = None
-    targets = _report_targets(records, html_path, ioc_path)
-    for target_records, target_primary_path, target_ioc_path in targets:
+    targets = _report_targets(records, html_path, ioc_path, associations_path)
+    for target_records, target_primary_path, target_ioc_path, target_associations_path in targets:
         cve_label = target_records[0].cve if target_records else ""
         ioc_title = "GTI IOC Report"
+        associations_title = "GTI Associations / Associated Threats Report"
         primary_title = "GTI CVE Enrichment Report"
         if len(records) > 1:
             ioc_title = f"{ioc_title} — {cve_label}"
+            associations_title = f"{associations_title} — {cve_label}"
             primary_title = f"{primary_title} — {cve_label}"
         if fatal_error:
             ioc_title = f"{ioc_title} — FAILED"
+            associations_title = f"{associations_title} — FAILED"
             primary_title = f"{primary_title} — FAILED"
 
         try:
@@ -4593,12 +5565,32 @@ def main(argv: Optional[list[str]] = None) -> int:
             logging.error("Failed to write IOC report for %s: %s", cve_label or "run", report_exc)
 
         try:
+            render_associations_report(
+                target_records,
+                target_associations_path,
+                title=associations_title,
+                primary_report_path=target_primary_path,
+                ioc_report_path=target_ioc_path,
+                fatal_error=fatal_error,
+                generated_report_files=generated_report_files,
+            )
+            logging.info("Associations report: %s", target_associations_path.resolve())
+        except Exception as report_exc:  # noqa: BLE001
+            report_failed = True
+            logging.error(
+                "Failed to write Associations report for %s: %s",
+                cve_label or "run",
+                report_exc,
+            )
+
+        try:
             render_html_report(
                 target_records,
                 target_primary_path,
                 title=primary_title,
                 fatal_error=fatal_error,
                 ioc_report_path=target_ioc_path,
+                associations_report_path=target_associations_path,
                 generated_report_files=generated_report_files,
             )
             logging.info("HTML report: %s", target_primary_path.resolve())

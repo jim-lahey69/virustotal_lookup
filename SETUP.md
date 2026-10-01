@@ -202,8 +202,8 @@ What you should see:
 3. Optional proxy line  
 4. Progress while each CVE is queried  
 5. Enriched CSV at `cve_enriched.csv`  
-6. One `CVE-…_report.html` / `CVE-…_iocs.html` pair written per CVE in a multi-CVE CSV (single-CVE runs retain `report.html` / `ioc_report.html`)
-7. The first CVE report opened in your browser, followed by a numbered CLI selector; IOC reports open only from their primary-report links
+6. One `CVE-…_report.html` / `CVE-…_iocs.html` / `CVE-…_associations.html` set written per CVE in a multi-CVE CSV (single-CVE runs retain `report.html` / `ioc_report.html` / `associations_report.html`)
+7. The first CVE report opened in your browser, followed by a numbered CLI selector; companion reports open only from their primary-report links
 
 ### Quick connectivity check (optional)
 
@@ -230,6 +230,7 @@ curl -I -x http://webproxy:8080 --cacert ./certs/corporate-ca.pem https://www.vi
 | Request delay | No | `VT_REQUEST_DELAY` / `--delay` | `1.0` seconds |
 | HTML report | Always written | `--html` | `report.html` for one CVE; `CVE-…_report.html` per CVE for a multi-CVE CSV |
 | IOC report | Always written | `--ioc-html` | `ioc_report.html` for one CVE; `CVE-…_iocs.html` per CVE for a multi-CVE CSV |
+| Associations report | Always written | `--associations-html` | `associations_report.html` for one CVE; `CVE-…_associations.html` per CVE for a multi-CVE CSV |
 | Open browser | Yes by default | `--no-open` to disable | first report opens; multi-CVE runs then show the selector |
 
 There are **no** hard-coded key or proxy placeholders inside `cve_enricher.py`. Placeholder key values such as `your_key_here` are rejected.
@@ -238,15 +239,23 @@ There are **no** hard-coded key or proxy placeholders inside `cve_enricher.py`. 
 
 ## 7. HTML report behavior
 
-| Outcome | Primary report | IOC report | Browser |
-|---------|----------------|------------|---------|
-| All CVEs enriched | One full report per CVE + IOC link | One complete IOC report per CVE | First opens; numbered selector can open more |
-| Partial success | One full/error report per CVE | IOC data/status per CVE | First opens; numbered selector can open more |
-| Missing API key / bad input | Error banner + traceback summary | Failure audit page | Primary opens |
-| SSL / proxy / network failure | Error banner + traceback summary | Failure audit page | Primary opens |
-| Privilege 401/403 | Per-CVE + summary banner | Failure status per CVE | Primary opens |
+| Outcome | Primary report | IOC report | Associations report | Browser |
+|---------|----------------|------------|---------------------|---------|
+| All CVEs enriched | One full report per CVE + companion links | One complete IOC report per CVE | Actors/campaigns/supporting intelligence + evidence-backed ATT&CK mapping | First opens; numbered selector can open more |
+| Partial success | One full/error report per CVE | IOC data/status per CVE | Available relationships plus explicit partial-error details | First opens; numbered selector can open more |
+| Missing API key / bad input | Error banner + traceback summary | Failure audit page | Failure audit page | Primary opens |
+| SSL / proxy / network failure | Error banner + traceback summary | Failure audit page | Failure audit page | Primary opens |
+| Privilege 401/403 | Per-CVE + summary banner | Failure status per CVE | Failure status per CVE | Primary opens |
 
-Use `--no-open` for automation/CI. All report files are still written, and both the automatic first-report open and selector are skipped. IOC reports are never opened automatically.
+Use `--no-open` for automation/CI. All report files are still written, and both the automatic first-report open and selector are skipped. Companion reports are never opened automatically.
+
+The Associations report uses the documented vulnerability `associations` and
+`attack_techniques` relationships plus each returned Tcode's `attack_tactics`
+relationship. Threat Actors, Campaigns, and Vulnerabilities require Google TI
+Enterprise or Enterprise Plus. If the configured tier or API response does not
+expose data visible in the web interface, the report records the limitation and
+continues; it does not block the primary or IOC report and does not invent
+attribution or an attack sequence.
 
 ---
 
