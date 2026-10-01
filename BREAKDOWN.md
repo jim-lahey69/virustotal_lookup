@@ -16,7 +16,7 @@ No live VirusTotal request was needed to establish the architecture. API schema 
 
 ### What the project does
 
-This is a Python command-line application for enriching lists of Common Vulnerabilities and Exposures (CVE) identifiers with Google Threat Intelligence (GTI) Vulnerability Intelligence data delivered through the VirusTotal v3 collections API. The application accepts a CSV, normalizes and de-duplicates its CVE identifiers, fetches one vulnerability collection per identifier, flattens the nested response into a stable record, derives a GTI-style P0–P4 priority, and produces three analyst-facing forms of output:
+This is a Python command-line application for enriching lists of Common Vulnerabilities and Exposures (CVE) identifiers with Google Threat Intelligence (GTI) Vulnerability Intelligence data delivered through the VirusTotal v3 collections API. The application accepts a CSV, normalizes and de-duplicates its CVE identifiers, fetches one vulnerability collection per identifier, flattens the nested response into a stable record, calculates an internal 0–100/P0–P3 priority, and produces three analyst-facing forms of output:
 
 1. A flat CSV intended for spreadsheets, SIEM ingestion, or ticket data.
 2. Rich terminal cards for interactive review.
@@ -36,7 +36,7 @@ The project is specifically designed for enterprise Windows environments with an
 - Parse flexible analyst-supplied CSV files, accepting common header names, several delimiters, a UTF-8 BOM, and both canonical and selected noncanonical CVE forms.
 - Query `GET https://www.virustotal.com/api/v3/collections/vulnerability--{cve-lowercase}` sequentially with a shared `requests.Session`, inter-request throttling, bounded retry, exponential backoff, jitter, and selected status-specific handling.
 - Transform GTI data into a `CVERecord`, including risk, exploitation, CISA KEV, EPSS, CVSS v2/v3/v4, CPE-derived products, mitigations, workarounds, narrative, dates, counters, and a GUI deep link.
-- Derive a P0–P4 priority from risk rating, exploitation state, and exploit availability while retaining the API's raw `priority` value.
+- Calculate a P0–P3 rating from five weighted internal criteria while retaining the API's native value only as clearly labeled `vt_priority_raw` comparison data.
 - Preserve one result row per accepted CVE even when a lookup fails or the client stops a batch after a privilege error.
 - Write CSV and HTML artifacts, optionally display Rich terminal cards, optionally dump successful raw JSON, and normally open the HTML report in the default browser.
 
@@ -78,13 +78,15 @@ Other repository state relevant to maintenance:
 
 - `__pycache__/cve_enricher.cpython-313.pyc` is a generated artifact and is present in the Git tree even though `.gitignore` now excludes `__pycache__/` and `*.py[cod]`. It is not part of application design and should not be treated as source.
 - `vtenv/` is a local virtual environment with its own ignore rule. It is dependency-heavy and not application source. Its `pyvenv.cfg` records Python 3.13.2 for this local environment, while the project documentation declares Python 3.10+ as the supported baseline.
-- No test directory, test configuration, `pyproject.toml`, package setup metadata, lock file, Dockerfile, CI workflow, web-service definition, or deployment manifest was found.
+- The `tests/` directory contains fixture, CLI, cleanup, association, report-mapping, and internal-priority coverage. No `pyproject.toml`, package setup metadata, lock file, Dockerfile, CI workflow, web-service definition, or deployment manifest was found.
 
 ### Important file and directory roles
 
 | Path | Role and contents | Dependencies and consumers |
 |---|---|---|
-| `cve_enricher.py` | Entry point, configuration layer, data model, priority rules, input parser, GTI client, transformation logic, renderers, artifact writers, and orchestration. | Imports all declared packages. Reads `.env` and the input CSV. Calls VirusTotal. Writes CSV/HTML/raw JSON. Invoked directly by users. |
+| `cve_enricher.py` | Entry point, configuration layer, data model, input parser, GTI client, normalization/orchestration, renderers, and artifact writers. | Imports the scoring module and declared packages. Reads `.env` and the input CSV. Calls VirusTotal. Writes CSV/HTML/raw JSON. Invoked directly by users. |
+| `priority_scoring.py` | Pure, reusable five-criterion 0–100 scoring engine and P0–P3 classifier. | Has no VirusTotal transport or HTML dependency; called by record extraction and post-association rescoring. |
+| `tests/` | Unit/integration tests and sanitized response fixtures. | Covers CLI/report regressions plus each scoring criterion, thresholds, combined scenarios, and VT-priority non-override behavior. |
 | `cve_list.csv` | Small example input with a `CVE` header and five CVE identifiers. It is also the default input path. | Read by `load_cve_list()` when no `--input` override is supplied. |
 | `requirements.txt` | Four lower-bounded direct dependencies: `requests`, `rich`, `python-dotenv`, and `urllib3`. | Used during environment setup. There is no lock file for reproducible transitive versions. |
 | `.env.example` | Placeholder-only template for the GTI key, HTTP/HTTPS proxy, optional CA bundle, and optional request delay. | Copied to `.env` by operators; names correspond to source resolvers. |
@@ -104,7 +106,7 @@ Other repository state relevant to maintenance:
 |---|---|---|
 | Entry point and process control | `main()` and the `if __name__ == "__main__"` block | Parses CLI arguments, owns exit codes, and ensures post-run HTML handling. |
 | Presentation | Rich helpers, `render_rich_card()`, `print_rich_report()`, `render_html_report()`, `open_report_in_browser()` | Human-first. HTML is inline-CSS and offline-capable. |
-| Business and decision logic | `derive_priority_rating()` | Deterministic GTI-style P0–P4 mapping plus fallback heuristics. |
+| Business and decision logic | `priority_scoring.calculate_internal_priority()` and `classify_priority()` | Deterministic weighted 0–100 score and P0–P3 thresholds, independent of transport and presentation. |
 | Input and transformation | `load_cve_list()`, normalization helpers, `extract_record()`, CPE and value helpers | Converts flexible CSV and variable GTI response shapes to a stable flat model. |
 | Data model | `CVERecord` and `CSV_COLUMNS` | Display-oriented strings use `"N/A"`, `"True"`, and `"False"`; convenient for CSV/HTML, less suitable for typed agent JSON. |
 | External API client | `GTIClient` and `_safe_error_body()` | Encapsulates session headers, proxy/TLS state, throttling, retry, and coarse error kinds. |
@@ -173,7 +175,7 @@ Logs and Rich progress use stderr, leaving stdout for terminal cards or future s
 
 #### Purpose
 
-This is the repository's only Python source module and its executable entry point. It implements the entire local CVE-enrichment lifecycle: configuration, input validation, API access, data flattening, priority derivation, error records, CSV export, Rich output, HTML generation, browser launch, and process exit semantics.
+This is the repository's executable entry point and integration module. It implements the local CVE-enrichment lifecycle: configuration, input validation, API access, data flattening, scoring orchestration, error records, CSV export, Rich output, HTML generation, browser launch, and process exit semantics. Pure priority calculations live in `priority_scoring.py`.
 
 #### Important imports
 
@@ -192,7 +194,7 @@ This is the repository's only Python source module and its executable entry poin
 
 | Name | Inputs and outputs | Behavior, side effects, dependencies, and workflow role |
 |---|---|---|
-| `PROJECT_ROOT`, `DEFAULT_*`, `CVE_PATTERN`, `NO_KNOWN_ALIASES` | Module constants. | Define safe defaults, object-ID validation, output names, retry policy, endpoint, and priority-label normalization. The API base is fixed in source except when constructing `GTIClient` directly. |
+| `PROJECT_ROOT`, `DEFAULT_*`, `CVE_PATTERN` | Module constants. | Define safe defaults, object-ID validation, output names, retry policy, and endpoint. Scoring weights/thresholds are centralized in `priority_scoring.py`. |
 | `load_project_dotenv(env_file=None)` | Optional `Path`; returns loaded resolved `Path` or `None`. | Searches candidate `.env` files and calls `load_dotenv(override=False)`, mutating process environment. It is called early by `main()`. |
 | `resolve_request_delay(cli_value=None)` | Optional number; returns `float`. | Enforces CLI-over-environment precedence. Invalid environment text logs a warning and falls back; a nonpositive value disables throttling later. |
 | `resolve_api_key(cli_value=None)` | Optional string; returns a nonplaceholder string or `None`. | Resolves the key without logging it. `main()` treats `None` as a configuration error. |
@@ -204,20 +206,20 @@ This is the repository's only Python source module and its executable entry poin
 
 | Name | Inputs and outputs | Behavior, side effects, dependencies, and workflow role |
 |---|---|---|
-| `CVERecord` | Dataclass constructed with a CVE and optional fields; produces an in-memory flat record. | Central contract shared by all renderers. Contains status/error, P0–P4 and risk, exploitation, KEV, EPSS/CVSS, products, narrative, dates, identifiers, counts, GUI URL, and a truncated debug JSON bag. Most missing/native values are converted to display strings. |
+| `CVERecord` | Dataclass constructed with a CVE and optional fields; produces an in-memory flat record. | Central contract shared by all renderers. Contains status/error, internal total/rating/component scores, labeled VT comparison data, risk, exploitation, KEV, EPSS/CVSS, products, narrative, dates, identifiers, counts, GUI URL, and a truncated debug JSON bag. |
 | `CSV_COLUMNS` | Ordered field-name list. | Fixes CSV schema/order and intentionally omits `extra_json`. Must be manually kept in sync with the dataclass. |
 | `na(value, default="N/A")` | Any value; returns a string. | Converts `None`, booleans, lists/tuples, floats, and text to common display forms. This creates consistent outputs but erases native types. |
 | `fmt_ts(value)` | Timestamp/date-like value; returns a date/display string. | Preserves nonempty strings, interprets large integers as milliseconds, formats numeric UTC timestamps, and tolerantly falls back on malformed values. |
 | `normalize_cve(raw)` | Raw string; returns canonical CVE string or `None`. | Removes spaces, converts underscores, uppercases, accepts bare `YYYY-NNNN`, and enforces at least four digits after the second hyphen. It does not extract CVEs from arbitrary natural-language sentences. |
 | `cve_api_id(cve)` | Canonical CVE; returns `vulnerability--cve-...`. | Creates the object identifier shared by API and GUI URLs. |
 | `_accept_cve(raw, cves, seen)` | Raw string and mutable accumulation containers; returns `None`. | Normalizes, de-duplicates in first-seen order, appends accepted IDs, and logs invalid values. |
-| `_norm_label(value)` / `_is_no_known(value)` | Strings; return normalized string/boolean. | Collapse whitespace/case and recognize absence/unknown exploit labels for the priority decision table. |
+| `_norm_label(value)` | String; returns normalized text. | Collapses whitespace/case for GTI categorical normalization and presentation helpers. |
 
 #### Priority and input logic
 
 | Name | Inputs and outputs | Behavior, side effects, dependencies, and workflow role |
 |---|---|---|
-| `derive_priority_rating(risk_rating, exploitation_state, exploit_availability)` | Three labels; returns `P0`–`P4` or `N/A`. | Encodes the documented GTI decision table, normalizes aliases, and applies best-effort fallbacks for combinations outside the exact table. It is deterministic and has no side effects. The output is a repository-derived rating, not necessarily an API-supplied P value. |
+| `calculate_internal_priority(...)` / `classify_priority(score)` | Five groups of enrichment inputs; returns an auditable assessment and `P0`–`P3`. | Lives in `priority_scoring.py`; applies the 40/25/15/10/10 policy, clamps totals to 0–100, and never accepts VirusTotal's native priority as an input. |
 | `load_cve_list(path)` | Input path; returns ordered unique `list[str]`. | Reads UTF-8 with BOM support, sniffs comma/semicolon/tab/pipe delimiters, detects headered vs headerless input, recognizes common CVE column names, falls back to the leftmost column, logs invalid cells, and raises for missing/empty schema conditions. It reads at most 4096 bytes for dialect detection, then parses the full file. |
 
 #### GTI client
@@ -235,7 +237,7 @@ This is the repository's only Python source module and its executable entry poin
 |---|---|---|
 | `_first(*values, default=None)` | Candidate values; first nonempty value. | Implements tolerant alias lookup across GTI schema variations. |
 | `_format_cpes(cpes)` | Expected list of CPE-range objects; returns flattened string and count. | Extracts vendor/product/version ranges, falls back to CPE URI, de-duplicates in first-seen order, and joins entries with ` | `. Structured CPE components are lost after flattening. |
-| `extract_record(cve, payload)` | Canonical CVE and response dict; returns `CVERecord`. | Validates `data`, tolerantly reads CVSS/EPSS/exploitation/KEV/risk/CPE/CWE/counters/narrative fields and aliases, formats values, derives priority, constructs the GUI URL, and stores a capped `extra_json` fragment. It deliberately does not infer in-the-wild exploitation from an exploitation-state label. Malformed top-level data becomes an error record. |
+| `extract_record(cve, payload)` | Canonical CVE and response dict; returns `CVERecord`. | Validates `data`, tolerantly reads CVSS/EPSS/exploitation/KEV/risk/CPE/CWE/counters/narrative fields and aliases, calls the internal scorer, constructs the GUI URL, and stores a capped `extra_json` fragment. It deliberately does not infer in-the-wild exploitation from an exploitation-state label. Malformed top-level data becomes an error record. |
 | `error_record(cve, status, message)` | CVE/error data; returns `CVERecord`. | Creates a non-success row with a GUI link so failed and skipped CVEs remain visible in output. |
 
 #### Output and presentation
@@ -277,7 +279,7 @@ The Python source is heavily documented. Comments are not merely restating synta
 | TLS comments and `resolve_ssl_verify()` docstring | Explain SSL inspection, root-CA use, `expanduser`, explicit missing-file failure, resolution order, and why `verify=False` is never acceptable. | This is the core security invariant and a prerequisite for any wrapper/service. | **Most important comment group in the module.** Preserve its substance in any architectural split. |
 | `CVERecord`/`CSV_COLUMNS` comments | Explain one flat shared model, sentinel strings, status values, field groups, and omission of `extra_json` from CSV. | Shows why presentation is consistent and why typed agent output now requires a boundary mapper. | Important. The claim that `extra_json` is for advanced/SIEM consumers is **ambiguous** because it is neither in CSV nor current HTML; only in-memory callers see it, while `--dump-raw` is a separate mechanism. |
 | Helper comments/docstrings | Explain float formatting, timestamp heuristics, input normalization, and first-seen de-duplication. | Prevents subtle display and input behavior from diverging across output formats. | Useful. The year-2286/millisecond heuristic is a pragmatic workaround and should be tested. |
-| Priority derivation block | Records the external GTI guidance URL and the complete P0–P4 decision table, aliases, and fallbacks. | This is decision logic that can affect operational urgency; the comments are effectively its specification. | **Critical and audit-sensitive.** The fallback rules are repository policy, not the exact table, and must be distinguished in tests and agent responses. |
+| `priority_scoring.py` | Defines weights, thresholds, normalized maturity states, the explicit EPSS 76th–79th fallback, component calculators, bounded total, and P0–P3 classification. | This is decision logic that can affect operational urgency; its constants/tests are the executable policy. | **Critical and audit-sensitive.** Preserve its separation from transport and HTML. |
 | CSV input block | Explains BOM/delimiter/header tolerance and the choice to skip one bad cell rather than fail a batch. | Documents a resilience/usability decision for analyst exports. | Important. Invalid IDs are logged but absent from result records, which conflicts with the future agent goal of accounting for every requested input unless the tool boundary reports validation rejections separately. |
 | `GTIClient` construction contract | States that verification cannot be false, proxies belong on the session, the key uses `x-apikey`, and the constructor rechecks invariants. | Protects outbound authentication and TLS when the client is reused outside `main()`. | **Especially important.** |
 | Retry/status comments | Explain which conditions retry, why 401/403 and 404 do not, how 429 honors `Retry-After`, and why jitter is used. | Makes quota and failure policy auditable. | Important. After retries, the returned tuple loses much of this detail, which is technical debt for agent-safe errors. |
@@ -293,7 +295,7 @@ The Python source is heavily documented. Comments are not merely restating synta
 
 - The module-level “Cleanup log” documents previously removed code. It is accurate historical context but belongs more naturally in version history; future edits may leave it stale.
 - The source and user docs repeatedly describe HTML as generated after “every run.” The implementation can only guarantee an attempt after successful imports, argument parsing, and logging setup, and the HTML write itself may fail.
-- The priority comments accurately separate the API's raw boolean-like value from the UI-style P0–P4 derivation. Any output that simply labels P0–P4 as “GTI priority” without “derived” would be ambiguous.
+- The priority implementation explicitly separates the internal 0–100/P0–P3 result from `vt_priority_raw`; the native field is comparison-only and cannot override classification.
 - The `extra_json` description suggests advanced consumption, but no current output exports it except via in-memory use; `--dump-raw` writes a different, full payload.
 - Comments recognize GTI field-name drift and use aliases, which is healthy defensive coding but also a clear signal that automated fixture/contract tests are needed.
 - No inline future-agent TODO exists. This avoids unfinished-code markers, but it means the agentic design document must remain the explicit source of planned behavior.
@@ -367,18 +369,18 @@ GTI JSON data.attributes
   ↓
 Tolerant key/alias lookup
   ↓
-Normalize CVSS, EPSS, exploitation, KEV, risk, products, narrative, dates
+Normalize CVSS, EPSS, exploitation, KEV, ransomware/malware-kit signals, risk, products, narrative, dates
   ↓
-Derive P0–P4 from risk + state + availability
+Calculate five weighted internal criteria and a bounded 0–100 total
   ↓
-Prefer an explicit API P0–P4 string if one is supplied
+Classify P0–P3; preserve native VT priority as comparison-only data
   ↓
 Create flat CVERecord and capped debug fragment
 ```
 
-Files/functions involved: `_first()`, `fmt_ts()`, `na()`, `_format_cpes()`, `derive_priority_rating()`, and `extract_record()`.
+Files/functions involved: `_first()`, `fmt_ts()`, `na()`, `_format_cpes()`, `calculate_internal_priority()`, `classify_priority()`, and `extract_record()`.
 
-Important correctness boundary: the code preserves an explicit/absent `exploited_in_the_wild` signal and does not infer it from exploitation state. Priority fallback heuristics are deterministic repository logic.
+Important correctness boundaries: the code preserves an explicit/absent `exploited_in_the_wild` signal and does not infer it from exploitation state; missing scoring evidence remains non-positive; native VT priority never enters the scoring call.
 
 ### Workflow E: Batch orchestration and complete accounting
 
@@ -507,7 +509,7 @@ For noninteractive use, add `--no-open`; add `--no-rich` if stdout cards are unw
 - Object-ID and GUI-link construction.
 - Sequential API lookup, session reuse, throttling, retry/backoff/jitter, selected `Retry-After` handling, and early privilege-stop behavior.
 - Tolerant extraction across known schema aliases.
-- Deterministic P0–P4 derivation and display normalization.
+- Deterministic five-criterion 0–100/P0–P3 scoring and display normalization.
 - Creation of per-CVE failure/skipped records.
 - CSV, terminal, and HTML rendering, including an attempted HTML failure report.
 - Optional browser launch and optional successful-response raw JSON dump.
@@ -515,7 +517,7 @@ For noninteractive use, add `--no-open`; add `--no-rich` if stdout cards are unw
 
 ### Partially automated
 
-- Vulnerability prioritization: the code calculates P0–P4, but it does not combine the result with asset criticality, exposure, compensating controls, ownership, business impact, patch availability, or an organizational SLA.
+- Vulnerability prioritization: the code calculates internal P0–P3, but it does not combine the result with asset criticality, exposure, compensating controls, ownership, business impact, patch availability, or an organizational SLA.
 - Error recovery: bounded network/429/5xx retry exists, but persistent failures need an operator and do not produce typed retry guidance for another system.
 - Report generation: artifacts are created, but distribution, access control, attachment, cleanup, and retention are manual.
 - Configuration validation: obvious missing keys/CA paths are caught, but there is no readiness check or proactive proxy/license test.
@@ -532,8 +534,8 @@ For noninteractive use, add `--no-open`; add `--no-rich` if stdout cards are unw
 
 ### Hard-coded mappings and decisions
 
-- VirusTotal API base, collections resource form, GUI-link form, user agent, 60-second request timeout, retry/backoff defaults, placeholder keys, CVE regex, accepted CSV column names, output column order, display colors, HTML limits, error wording, P0–P4 table, and fallback priority heuristics.
-- These are deterministic and often appropriate, but changes require editing the monolithic source and should be regression-tested.
+- VirusTotal API base, collections resource form, GUI-link form, user agent, 60-second request timeout, retry/backoff defaults, placeholder keys, CVE regex, accepted CSV column names, output column order, display colors, HTML limits, and error wording remain in the integration module. Scoring weights, bands, normalized maturity states, and P0–P3 thresholds are centralized in `priority_scoring.py`.
+- These are deterministic and regression-tested; scoring-policy changes should update the isolated constants and boundary tests together.
 
 ### Human-review boundary
 
@@ -563,7 +565,7 @@ Concrete repository implications:
 
 - Add a boundary mapper rather than changing current CSV/HTML semantics immediately.
 - Convert `"N/A"` to `null`, boolean strings to booleans, score strings to numbers, and delimited strings to lists/objects.
-- Preserve both derived `priority_rating` and raw API priority.
+- Preserve internal `priority_rating`/`priority_score` and separately labeled `vt_priority_raw` comparison data.
 - Report rejected raw inputs separately so every tool request is accounted for.
 - Version the schema and test it against current `CVERecord` fields and aliases.
 - Do not expose `extra_json`/raw payload by default.
@@ -654,7 +656,7 @@ Removes manual CSV preparation for interactive triage, standardizes evidence, an
 
 **Current behavior**
 
-The application derives GTI-style priority and renders intelligence, but analysts manually combine it with asset exposure, criticality, ownership, compensating controls, and local policy. No asset or policy source exists in this repository.
+The application calculates an internal intelligence-based priority and renders its breakdown, but analysts manually combine it with asset exposure, criticality, ownership, compensating controls, and local policy. No asset or policy source exists in this repository.
 
 **Proposed agent behavior**
 
@@ -663,7 +665,7 @@ After read-only GTI enrichment, an agent correlates the returned record with sep
 **Potential trigger**
 
 - New vulnerability finding linked to an asset.
-- Analyst asks why a CVE is P0–P4 or which findings need review first.
+- Analyst asks why a CVE is P0–P3 or which findings need review first.
 - Enrichment changes because new external intelligence is available.
 
 **Agent tools required**
@@ -690,7 +692,7 @@ Analyst approves disposition or requests more evidence
 
 **Human-in-the-loop requirements**
 
-Analyst approval is required before changing severity, accepting risk, paging a team, closing a finding, or stating that a deployed asset is exploitable. The model must clearly label GTI-derived priority separately from local remediation priority.
+Analyst approval is required before changing severity, accepting risk, paging a team, closing a finding, or stating that a deployed asset is exploitable. The model must clearly label the internal intelligence score separately from local remediation priority.
 
 **Risks**
 
@@ -965,7 +967,7 @@ This is a future plan only; no code is implemented by this document.
 ### Phase 0 — Decisions, baselines, and deterministic tests
 
 - Decide the first agent host, data-boundary policy, GTI key/license/quota model, and accountable owner.
-- Add fixture/unit tests for normalization, CSV variants, the complete P0–P4 table and fallbacks, timestamp handling, CPE mapping, schema aliases, retry/status behavior, redaction, and HTML escaping/failure behavior.
+- Maintain fixture/unit tests for normalization, the complete five-criterion score policy and P0–P3 boundaries, CSV variants, timestamp handling, CPE mapping, schema aliases, retry/status behavior, redaction, and HTML escaping/failure behavior.
 - Capture representative sanitized GTI responses for success, KEV, multiple CVSS forms, malformed data, 404, 401/403, 429, proxy/TLS, and schema drift.
 - Define accepted/rejected-input accounting and clarify the “always HTML” guarantee.
 
@@ -1018,12 +1020,12 @@ Likely existing components: typed records and `render_html_report()`. No downstr
 
 | Area | Observation and impact |
 |---|---|
-| Monolithic coupling | `cve_enricher.py` combines every layer in roughly 2,500 lines. Importing it as a service library also imports Rich and exposes global logging/console objects. Changes to one concern can affect CLI, network, data, and presentation behavior. |
-| No automated tests | No tests or test configuration are present. Priority/scoring, schema aliases, input tolerance, retry behavior, error guarantees, and HTML escaping are consequential and currently protected mainly by comments. Agent integration should not proceed without deterministic regression coverage. |
+| Integration-module coupling | `cve_enricher.py` still combines CLI, network, records, and presentation. Priority policy is now separated into a dependency-light pure module, but importing the integration module still imports Rich and exposes global logging/console objects. |
+| Test execution infrastructure | A substantial `unittest` suite and sanitized fixtures now cover priority/scoring, schema aliases, input tolerance, retry behavior, error guarantees, associations, cleanup, and HTML escaping. CI and a declarative test configuration are still absent. |
 | Display-oriented model | `CVERecord` stores booleans/numbers/missing values as strings and flattens structured products/lists. This is suitable for CSV but forces lossy reparsing at an agent boundary. |
 | Manual schema synchronization | `CSV_COLUMNS` must remain synchronized by hand with selected dataclass fields. `extra_json` has unclear consumer semantics. |
-| API schema drift | `extract_record()` already supports multiple key aliases, proving upstream variability. There is no contract version, fixture suite, or schema-change alert. Incorrect but noncrashing mappings may be hard to notice. |
-| Priority governance | The official-table comments plus fallback heuristics can drive urgency. Source provenance is a URL in comments, not a versioned policy/test artifact. The derived value can be confused with the raw API `priority`. |
+| API schema drift | `extract_record()` supports multiple key aliases, proving upstream variability. Sanitized fixtures and mapper tests cover current shapes, but there is no contract version or schema-change alert; incorrect but noncrashing new mappings may still be hard to notice. |
+| Priority governance | The weighted policy is isolated in `priority_scoring.py` and covered by boundary tests, including the explicit conservative EPSS 76th–79th fallback. Policy still needs organizational ownership/versioning; the UI and CSV clearly label `vt_priority_raw` as non-scoring comparison data. |
 | Error-detail loss | The client collapses network/proxy/TLS/JSON/upstream failures into coarse tuples. The eventual record often lacks exception class, safe message, retryability, or retry delay, preventing reliable agent behavior and precise monitoring. |
 | Broad exception/traceback exposure | Broad process-boundary catches are intentional, but `_format_fatal_error()` embeds traceback text and absolute paths in HTML. This is acceptable for a local diagnostic only after review; a shared agent response needs path/secret redaction and stable enums. |
 | No cache or shared quota | Throttle state is per `GTIClient`. Multiple CLI/agent processes can duplicate requests and create a retry storm. There is no single-flight, global concurrency cap, positive/negative cache, or documented quota enforcement. |
@@ -1049,14 +1051,14 @@ The items below are prioritized future recommendations. Items marked **Before ag
 
 ### Documentation
 
-1. **Before agents:** Define and version the existing CSV/data semantics, explicitly labeling `priority_rating` as derived and documenting fallback heuristics.
+1. **Before agents:** Version the CSV/data semantics and scoring policy; preserve explicit labels distinguishing internal `priority_rating`/`priority_score` from `vt_priority_raw`.
 2. **Before agents:** Clarify the limits of the “always HTML” guarantee and the behavior of explicit missing `--env-file`, working-directory-relative input/output paths, and rejected input values.
 3. Add `AGENTIC_INTEGRATION_IDEAS.md` and the future agent contract to the primary repository file map when implementation work is authorized.
 4. Move historical cleanup notes from the module docstring to normal version history and keep source documentation focused on lasting invariants.
 
 ### Architecture
 
-1. **Before agents:** Establish regression tests, then separate deterministic core logic from CLI/presentation/process behavior without changing semantics.
+1. **Before agents:** Keep regression coverage current and continue separating reusable normalization/DTO logic from CLI/presentation/process behavior; priority scoring is already isolated.
 2. Introduce a typed internal/agent DTO mapper at the boundary; do not force CSV/HTML consumers to migrate immediately.
 3. Replace raw-dump monkey-patching with an explicit diagnostic/artifact interface.
 4. Keep local stdio/function execution as the first transport; adopt an internal service only for a demonstrated multi-user/central-secret need.
@@ -1078,11 +1080,11 @@ The items below are prioritized future recommendations. Items marked **Before ag
 
 ### Testing
 
-1. **Before agents:** Unit-test every P0–P4 table row, aliases, fallback rules, normalization, timestamp heuristics, and CPE mapping.
+1. **Before agents:** Maintain tests for every scoring component, P0–P3 boundary, missing/malformed fallback, VT non-override guarantee, normalization, timestamp heuristic, and CPE mapping.
 2. **Before agents:** Add sanitized response fixtures covering CVSS aliases, KEV presence/absence, explicit false exploitation flags, malformed payloads, and long/untrusted text.
 3. Test 404, forbidden early-stop, 429 `Retry-After`, network/proxy/TLS failures, 5xx, invalid JSON, output failures, exit codes, and redaction.
 4. Add contract tests proving JSON uses native types, is emitted on nonzero exits, accounts for every request, stays compact, and never contains secrets.
-5. Add agent evaluations proving it selects the tool when appropriate, does not call repeatedly, never guesses absent scores, distinguishes GTI priority from local policy, and respects approval boundaries.
+5. Add agent evaluations proving it selects the tool when appropriate, does not call repeatedly, never guesses absent scores, distinguishes internal intelligence priority from local remediation policy, and respects approval boundaries.
 
 ### Agentic Integration
 

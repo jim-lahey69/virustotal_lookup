@@ -100,6 +100,26 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.table import Table
 from rich.text import Text
 
+from priority_scoring import (
+    ACTIVE_EXPLOITATION_WEIGHT,
+    EXPLOIT_AUTOMATABILITY_WEIGHT,
+    EXPLOIT_MATURITY_WEIGHT,
+    EXPLOITATION_PROBABILITY_WEIGHT,
+    SEVERITY_WEIGHT,
+    PriorityAssessment,
+    calculate_active_exploitation,
+    calculate_exploit_automatability,
+    calculate_exploit_maturity,
+    calculate_exploitation_probability,
+    calculate_internal_priority,
+    calculate_vulnerability_severity,
+    classify_priority,
+    normalize_evidence_flag,
+    normalize_epss_percentile,
+    normalize_exploit_maturity,
+    parse_cvss_vector,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration defaults
 # ---------------------------------------------------------------------------
@@ -137,10 +157,6 @@ MAX_IOC_PAGES = MAX_RELATIONSHIP_PAGES
 
 # Canonical CVE ID shape used for validation after normalization.
 CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
-
-# GTI priority derivation treats these labels as "no known exploit availability".
-# Values observed across GTI docs / UI wording variants.
-NO_KNOWN_ALIASES = {"no known", "no_known", "no-known", "noknown"}
 
 # Official Exploitation State labels and numeric levels (GTI docs).
 # Missing / unrecognized API values display as "Unknown" — never coerced to "No Known".
@@ -579,9 +595,24 @@ class CVERecord:
     status: str = "ok"
     error_message: str = ""
 
-    # Core prioritization (priority_rating is derived; priority_raw is API as-is)
-    priority_rating: str = "N/A"  # P0–P4 (derived)
-    priority_raw: str = "N/A"  # raw API field (may be bool / missing)
+    # Internal 0-100 prioritization. VirusTotal's native field is comparison-only.
+    priority_rating: str = "N/A"
+    priority_score: float = 0.0
+    vulnerability_severity_score: float = 0.0
+    vulnerability_severity_value: str = "Unavailable"
+    vulnerability_severity_cvss_version: str = "Unavailable"
+    active_exploitation_score: float = 0.0
+    active_exploitation: str = "No"
+    active_exploitation_sources: str = "N/A"
+    exploitation_probability_score: float = 0.0
+    exploitation_probability_value: str = "Unavailable"
+    exploit_maturity_score: float = 0.0
+    exploit_maturity_normalized: str = "NONE"
+    exploit_maturity_source: str = "N/A"
+    exploit_automatability_score: float = 0.0
+    exploit_automatability: str = "No"
+    exploit_automatability_source: str = "N/A"
+    vt_priority_raw: str = "N/A"  # never used by the internal scoring engine
     risk_rating: str = "N/A"
     risk_rating_level: str = "N/A"  # 0–4 visualization level
     predicted_risk_rating: str = "N/A"
@@ -607,6 +638,10 @@ class CVERecord:
     cisa_added_date: str = "N/A"
     cisa_due_date: str = "N/A"
     cisa_ransomware_use: str = "N/A"
+    ransomware_available: str = "Unknown"
+    ransomware_evidence_source: str = "N/A"
+    malware_kit_available: str = "Unknown"
+    malware_kit_evidence_source: str = "N/A"
 
     # Exploit Prediction Scoring System
     epss_score: str = "N/A"
@@ -674,7 +709,6 @@ class CVERecord:
     # Truncated JSON bag for advanced consumers (SIEM, custom parsers)
     extra_json: str = ""
 
-
 # Stable CSV column order — keep in sync with CVERecord fields used in write_csv.
 # extra_json is intentionally omitted (it is a debug bag, not a spreadsheet column).
 CSV_COLUMNS: list[str] = [
@@ -682,7 +716,22 @@ CSV_COLUMNS: list[str] = [
     "status",
     "error_message",
     "priority_rating",
-    "priority_raw",
+    "priority_score",
+    "vulnerability_severity_score",
+    "vulnerability_severity_value",
+    "vulnerability_severity_cvss_version",
+    "active_exploitation_score",
+    "active_exploitation",
+    "active_exploitation_sources",
+    "exploitation_probability_score",
+    "exploitation_probability_value",
+    "exploit_maturity_score",
+    "exploit_maturity_normalized",
+    "exploit_maturity_source",
+    "exploit_automatability_score",
+    "exploit_automatability",
+    "exploit_automatability_source",
+    "vt_priority_raw",
     "risk_rating",
     "predicted_risk_rating",
     "risk_factors",
@@ -699,6 +748,10 @@ CSV_COLUMNS: list[str] = [
     "cisa_added_date",
     "cisa_due_date",
     "cisa_ransomware_use",
+    "ransomware_available",
+    "ransomware_evidence_source",
+    "malware_kit_available",
+    "malware_kit_evidence_source",
     "epss_score",
     "epss_percentile",
     "cvss_v3_base",
@@ -902,11 +955,6 @@ def _accept_cve(raw: str, cves: list[str], seen: set[str]) -> None:
 def _norm_label(value: str) -> str:
     """Lowercase + collapse whitespace for fuzzy matching of GTI enum labels."""
     return re.sub(r"\s+", " ", (value or "").strip().lower())
-
-
-def _is_no_known(value: str) -> bool:
-    """True when exploit-availability wording means 'none / unknown'."""
-    return _norm_label(value) in NO_KNOWN_ALIASES
 
 
 def _as_nonneg_int(value: Any, default: int = 0) -> int:
@@ -1895,138 +1943,96 @@ def attach_associations(client: "GTIClient", rec: CVERecord) -> None:
         rec.association_error = "; ".join(failures)
     else:
         rec.association_status = "complete" if has_data else "none"
+    apply_association_priority_signals(rec)
 
 
 # ---------------------------------------------------------------------------
-# Priority derivation (GTI P0–P4 model)
+# Internal priority orchestration
 # ---------------------------------------------------------------------------
-#
-# Source: https://gtidocs.virustotal.com/docs/vulnerability-report
-#
-# Inputs: Risk Rating, Exploitation State, Exploit Availability
-#
-# P0:
-#   - Risk Critical (any)
-#   - Risk High  + Exploitation State in {Wide, Confirmed, Reported}
-#   - Risk Medium + Exploitation State == Wide
-# P1:
-#   - Risk High  + Exploitation State in {Suspected, No Known}
-#                 + Exploit Availability != No Known
-#   - Risk Medium + Exploitation State in {Confirmed, Reported, Suspected}
-#   - Risk Low   + Exploitation State in {Wide, Confirmed}
-# P2:
-#   - Risk High  + Exploitation State == No Known + Exploit Availability == No Known
-#   - Risk Medium + Exploitation State == No Known
-#                 + Exploit Availability in {Trivial, Publicly Available,
-#                                            Privately Held, Unverified}
-#   - Risk Low   + Exploitation State in {Reported, Suspected}
-# P3:
-#   - Risk Medium + Exploitation State == No Known
-#                 + Exploit Availability in {Interest Observed, No Known}
-#   - Risk Low   + Exploitation State == No Known
-#                 + Exploit Availability in {Trivial, Publicly Available,
-#                                            Privately Held, Unverified}
-# P4:
-#   - Risk Low   + Exploitation State == No Known
-#                 + Exploit Availability in {Interest Observed, No Known}
-#
-# Fallback: if fields are Unrated/N/A, attempt best-effort mapping; else "N/A".
 
 
-def derive_priority_rating(
-    risk_rating: str,
-    exploitation_state: str,
-    exploit_availability: str,
-) -> str:
+def _criterion_details(assessment: PriorityAssessment, criterion: str) -> str:
+    """Join one criterion's audit details for flat record/CSV presentation."""
+    value = getattr(assessment, criterion)
+    return "; ".join(value.details) or "N/A"
+
+
+def apply_internal_priority_assessment(
+    rec: CVERecord,
+    assessment: PriorityAssessment,
+) -> None:
+    """Copy a pure scoring result onto the shared output record."""
+    rec.priority_rating = assessment.priority_rating
+    rec.priority_score = assessment.total_score
+    rec.vulnerability_severity_score = assessment.vulnerability_severity.points
+    rec.vulnerability_severity_value = assessment.vulnerability_severity.normalized_value
+    rec.vulnerability_severity_cvss_version = (
+        assessment.vulnerability_severity.source or "Unavailable"
+    )
+    rec.active_exploitation_score = assessment.active_exploitation.points
+    rec.active_exploitation = assessment.active_exploitation.normalized_value
+    rec.active_exploitation_sources = _criterion_details(
+        assessment, "active_exploitation"
+    )
+    rec.exploitation_probability_score = assessment.exploitation_probability.points
+    rec.exploitation_probability_value = (
+        assessment.exploitation_probability.normalized_value
+    )
+    rec.exploit_maturity_score = assessment.exploit_maturity.points
+    rec.exploit_maturity_normalized = assessment.exploit_maturity.normalized_value
+    rec.exploit_maturity_source = _criterion_details(assessment, "exploit_maturity")
+    rec.exploit_automatability_score = assessment.exploit_automatability.points
+    rec.exploit_automatability = assessment.exploit_automatability.normalized_value
+    rec.exploit_automatability_source = _criterion_details(
+        assessment, "exploit_automatability"
+    )
+
+
+def recalculate_internal_priority(rec: CVERecord) -> PriorityAssessment:
+    """Recalculate after optional enrichment (including threat associations)."""
+    assessment = calculate_internal_priority(
+        cvss_v4_score=rec.cvss_v4_score,
+        cvss_v3_score=rec.cvss_v3_base,
+        cvss_v4_vector=rec.cvss_v4_vector,
+        cisa_kev=rec.cisa_kev,
+        ransomware_available=rec.ransomware_available,
+        malware_kit_available=rec.malware_kit_available,
+        epss_percentile=rec.epss_percentile,
+        cvss_v4_maturity=rec.cvss_v4_exploit_maturity,
+        exploit_availability=rec.exploit_availability,
+        exploitation_state=rec.exploitation_state,
+    )
+    apply_internal_priority_assessment(rec, assessment)
+    return assessment
+
+
+def apply_association_priority_signals(rec: CVERecord) -> None:
+    """Promote explicit ransomware/malware-kit VT associations, then rescore.
+
+    Generic malware families and software toolkits are not automatically called
+    malware kits. A positive association requires the returned VT text/tags to
+    say ``ransomware``, ``malware kit``, or ``exploit kit``.
     """
-    Derive GTI-style P0–P4 priority from risk + exploitation signals.
-
-    The collections API exposes ``priority`` as a boolean; the P0–P4 badge in
-    the GTI UI is a product of this combination table (documented above).
-    """
-    risk = _norm_label(risk_rating)
-    state = _norm_label(exploitation_state)
-    avail = _norm_label(exploit_availability)
-
-    # Collapse missing / synonym labels so the decision table stays small
-    if risk in {"n/a", "none", "unrated", ""}:
-        risk = "unrated"
-    if state in {"n/a", "none", "unknown", ""}:
-        state = "unknown"
-    if avail in {"n/a", "none", "unknown", ""}:
-        avail = "unknown"
-
-    # Older filter wording "Known" ≈ publicly available exploit code
-    if avail == "known":
-        avail = "publicly available"
-
-    # Pre-built sets for membership tests in the P0–P4 rules
-    wide_confirmed_reported = {"wide", "confirmed", "reported"}
-    suspected_no_known = {"suspected", "no known"}
-    confirmed_reported_suspected = {"confirmed", "reported", "suspected"}
-    wide_confirmed = {"wide", "confirmed"}
-    reported_suspected = {"reported", "suspected"}
-    exploit_code_present = {
-        "trivial",
-        "publicly available",
-        "privately held",
-        "unverified",
-    }
-    low_interest = {"interest observed", "no known"}
-
-    # --- P0 (highest urgency) ---
-    if risk == "critical":
-        return "P0"
-    # Every remaining published P0-P4 rule requires a known Exploitation State.
-    # Do not convert a missing field into the semantically different "No Known".
-    if state == "unknown":
-        return "N/A"
-    if risk == "high" and state in wide_confirmed_reported:
-        return "P0"
-    if risk == "medium" and state == "wide":
-        return "P0"
-
-    # These rules do not depend on exploit availability and remain valid when
-    # that separate API field is absent.
-    if risk == "medium" and state in confirmed_reported_suspected:
-        return "P1"
-    if risk == "low" and state in wide_confirmed:
-        return "P1"
-    if risk == "low" and state in reported_suspected:
-        return "P2"
-    if avail == "unknown":
-        return "N/A"
-
-    # --- P1 ---
-    if risk == "high" and state in suspected_no_known and not _is_no_known(avail):
-        return "P1"
-
-    # --- P2 ---
-    if risk == "high" and state == "no known" and _is_no_known(avail):
-        return "P2"
-    if risk == "medium" and state == "no known" and avail in exploit_code_present:
-        return "P2"
-
-    # --- P3 ---
-    if risk == "medium" and state == "no known" and avail in low_interest:
-        return "P3"
-    if risk == "low" and state == "no known" and avail in exploit_code_present:
-        return "P3"
-
-    # --- P4 ---
-    if risk == "low" and state == "no known" and avail in low_interest:
-        return "P4"
-
-    # Fallback heuristics when official table does not match (e.g. Unrated).
-    # Critical already returned P0 above; it is not repeated here.
-    if risk == "high":
-        return "P1" if not _is_no_known(avail) or state in wide_confirmed_reported else "P2"
-    if risk == "medium":
-        return "P2"
-    if risk == "low":
-        return "P3"
-
-    return "N/A"
+    for entity in rec.supporting_intelligence:
+        evidence_text = " ".join(
+            [
+                entity.name,
+                entity.description,
+                *entity.tags,
+                *entity.classifications,
+            ]
+        ).casefold()
+        if re.search(r"\bransomware\b", evidence_text):
+            rec.ransomware_available = "True"
+            rec.ransomware_evidence_source = (
+                f"VirusTotal association: {entity.name or entity.entity_id}"
+            )
+        if re.search(r"\b(?:malware|exploit)\s+kit\b", evidence_text):
+            rec.malware_kit_available = "True"
+            rec.malware_kit_evidence_source = (
+                f"VirusTotal association: {entity.name or entity.entity_id}"
+            )
+    recalculate_internal_priority(rec)
 
 
 # ---------------------------------------------------------------------------
@@ -2619,6 +2625,29 @@ def _first(*values: Any, default: Any = None) -> Any:
     return default
 
 
+def _first_evidence_value(*candidates: tuple[str, Any]) -> tuple[Any, str]:
+    """Return the first present security signal together with its field path."""
+    for source, value in candidates:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, (list, dict)) and not value:
+            continue
+        return value, source
+    return None, "Unavailable"
+
+
+def _display_evidence_flag(value: Any) -> str:
+    """Render a tri-state evidence value without treating missing as false."""
+    normalized = normalize_evidence_flag(value)
+    if normalized is True:
+        return "True"
+    if normalized is False:
+        return "False"
+    return "Unknown"
+
+
 def _format_cpes(cpes: Any) -> tuple[str, int]:
     """Flatten CPE ranges into readable 'vendor / product version-range' strings.
 
@@ -2753,6 +2782,29 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         cisa_due = "N/A"
         cisa_ransom = "N/A"
 
+    # Preserve the individual evidence inputs used by Active Exploitation.
+    # KEV ransomware_use is a VT-delivered association signal; explicit VT
+    # ransomware/malware-kit fields take precedence when the schema supplies them.
+    ransomware_raw, ransomware_source = _first_evidence_value(
+        ("attributes.ransomware_available", attrs.get("ransomware_available")),
+        ("attributes.ransomware_associated", attrs.get("ransomware_associated")),
+        ("attributes.ransomware_association", attrs.get("ransomware_association")),
+        ("attributes.exploitation.ransomware_available", exploitation.get("ransomware_available")),
+        ("attributes.exploitation.ransomware_associated", exploitation.get("ransomware_associated")),
+        (
+            "attributes.cisa_known_exploited.ransomware_use",
+            kev.get("ransomware_use") if isinstance(kev, dict) else None,
+        ),
+    )
+    malware_kit_raw, malware_kit_source = _first_evidence_value(
+        ("attributes.malware_kit_available", attrs.get("malware_kit_available")),
+        ("attributes.malware_kit_associated", attrs.get("malware_kit_associated")),
+        ("attributes.malware_kit", attrs.get("malware_kit")),
+        ("attributes.exploit_kit_available", attrs.get("exploit_kit_available")),
+        ("attributes.exploitation.malware_kit_available", exploitation.get("malware_kit_available")),
+        ("attributes.exploitation.malware_kit_associated", exploitation.get("malware_kit_associated")),
+    )
+
     # GUI "Exploited in the Wild" is not a documented top-level attribute
     # (do not default missing keys to False). Preserve any explicit object
     # value here; enrich_cves() then applies vulnerability_filter:
@@ -2766,24 +2818,29 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
     wild_status = "object_returned" if wild_sources else "not_returned"
 
     # --- Risk / priority ---
-    # API documents priority as boolean; the GTI UI shows P0–P4 — we derive that.
+    # Preserve the native API priority only for clearly labeled comparison/debug.
+    # It is never passed to the internal scoring engine or final classification.
     risk_level, risk_rating = normalize_risk_rating(attrs.get("risk_rating"))
     predicted = na(attrs.get("predicted_risk_rating"))
     risk_factors = na(attrs.get("risk_factors"))
-    priority_raw = attrs.get("priority")
-    if isinstance(priority_raw, bool):
-        priority_raw_str = "True" if priority_raw else "False"
+    vt_priority_raw = attrs.get("priority")
+    if isinstance(vt_priority_raw, bool):
+        vt_priority_raw_str = "True" if vt_priority_raw else "False"
     else:
-        priority_raw_str = na(priority_raw)
+        vt_priority_raw_str = na(vt_priority_raw)
 
-    priority_rating = derive_priority_rating(
-        risk_rating,
-        state_label,
-        exploit_availability,
+    priority_assessment = calculate_internal_priority(
+        cvss_v4_score=v4_score,
+        cvss_v3_score=v3_base,
+        cvss_v4_vector=v4_vector,
+        cisa_kev=cisa_kev,
+        ransomware_available=ransomware_raw,
+        malware_kit_available=malware_kit_raw,
+        epss_percentile=epss_pct,
+        cvss_v4_maturity=v4_maturity,
+        exploit_availability=exploit_availability,
+        exploitation_state=state_label,
     )
-    # Prefer an explicit P0–P4 string if the API ever supplies one
-    if isinstance(priority_raw, str) and re.match(r"^P[0-4]$", priority_raw.strip(), re.I):
-        priority_rating = priority_raw.strip().upper()
 
     # --- Products (CPE ranges) ---
     products_str, products_count = _format_cpes(attrs.get("cpes"))
@@ -2803,8 +2860,7 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
     rec = CVERecord(
         cve=cve,
         status="ok",
-        priority_rating=priority_rating,
-        priority_raw=priority_raw_str,
+        vt_priority_raw=vt_priority_raw_str,
         risk_rating=risk_rating,
         risk_rating_level="N/A" if risk_level is None else str(risk_level),
         predicted_risk_rating=predicted,
@@ -2828,6 +2884,10 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         cisa_added_date=cisa_added,
         cisa_due_date=cisa_due,
         cisa_ransomware_use=cisa_ransom,
+        ransomware_available=_display_evidence_flag(ransomware_raw),
+        ransomware_evidence_source=ransomware_source,
+        malware_kit_available=_display_evidence_flag(malware_kit_raw),
+        malware_kit_evidence_source=malware_kit_source,
         epss_score=na(epss_score),
         epss_percentile=na(epss_pct),
         cvss_v3_base=na(v3_base),
@@ -2862,6 +2922,7 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         ioc_ip_addresses_total=ioc_counts["ip_addresses"],
         vt_url=f"https://www.virustotal.com/gui/collection/{cve_api_id(cve)}",
     )
+    apply_internal_priority_assessment(rec, priority_assessment)
 
     # Compact raw fragments for advanced consumers (capped to keep CSV rows sane)
     extra = {
@@ -2873,6 +2934,13 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         "cvss_raw": cvss,
         "epss_raw": epss,
         "cisa_known_exploited_raw": kev if isinstance(kev, dict) else None,
+        "ransomware_evidence_raw": ransomware_raw,
+        "ransomware_evidence_source": ransomware_source,
+        "malware_kit_evidence_raw": malware_kit_raw,
+        "malware_kit_evidence_source": malware_kit_source,
+        "vt_priority_raw_comparison_only": vt_priority_raw,
+        "internal_priority_score": priority_assessment.total_score,
+        "internal_priority_rating": priority_assessment.priority_rating,
         "exploitation_raw": exploitation,
         "exploited_in_the_wild_normalized": exploited_in_wild,
         "exploited_in_the_wild_status": wild_status,
@@ -2935,12 +3003,12 @@ def write_csv(records: Iterable[CVERecord], path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Color-coded panels for interactive console review (optional via --no-rich).
 # Priority colors mirror the HTML badges so an analyst who glances at the
-# terminal sees the same P0–P4 language as in the browser report.
+# terminal sees the same internal P0–P3 language as in the browser report.
 # ---------------------------------------------------------------------------
 
 
 def _risk_style(risk: str) -> str:
-    """Rich style for a risk rating or P0–P4 badge (aligned with HTML colors)."""
+    """Rich style for a risk rating or P0–P3 badge (aligned with HTML colors)."""
     r = _norm_label(risk)
     if r == "critical" or risk.upper() == "P0":
         return "bold white on dark_red"
@@ -2948,20 +3016,19 @@ def _risk_style(risk: str) -> str:
         return "bold white on dark_orange3"
     if r == "medium" or risk.upper() == "P2":
         return "bold black on gold3"
-    if r in {"low", "p3", "p4"} or risk.upper() in {"P3", "P4"}:
+    if r in {"low", "p3"} or risk.upper() == "P3":
         return "bold white on dark_green"
     return "bold white on grey37"
 
 
 def _priority_color(priority: str) -> str:
-    """Border/label color for a P0–P4 badge; grey if unknown."""
+    """Border/label color for a P0–P3 badge; grey if unknown."""
     p = priority.upper()
     return {
         "P0": "dark_red",
         "P1": "dark_orange3",
         "P2": "gold3",
         "P3": "dark_green",
-        "P4": "cyan",
     }.get(p, "grey50")
 
 
@@ -2973,6 +3040,14 @@ def _bool_badge(value: str, true_style: str = "bold red", false_style: str = "di
     if v in {"false", "no", "0"}:
         return Text("no", style=false_style)
     return Text(str(value), style="dim")
+
+
+def _format_points(value: Any) -> str:
+    """Format score precision for presentation without changing calculations."""
+    try:
+        return f"{float(value):.4f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return "0"
 
 
 def render_rich_card(rec: CVERecord) -> Panel:
@@ -2999,20 +3074,42 @@ def render_rich_card(rec: CVERecord) -> Panel:
     header = Table.grid(padding=(0, 2))
     header.add_column(style="bold")
     header.add_column()
-    header.add_row("Priority", Text(pri, style=f"bold {_priority_color(pri)}"))
+    header.add_row("Internal Priority", Text(pri, style=f"bold {_priority_color(pri)}"))
+    header.add_row("Internal Score", f"{_format_points(rec.priority_score)} / 100")
     header.add_row("Risk Rating", Text(risk, style=_risk_style(risk)))
     header.add_row("Predicted Risk", rec.predicted_risk_rating)
-    header.add_row("API priority field", rec.priority_raw)
+    header.add_row("VirusTotal priority (not used)", rec.vt_priority_raw)
 
     scores = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan", expand=True)
     scores.add_column("Metric")
     scores.add_column("Value", justify="right")
     scores.add_column("Detail")
-    scores.add_row("EPSS", rec.epss_score, f"percentile {rec.epss_percentile}")
-    scores.add_row("CVSSv3.1 Base", rec.cvss_v3_base, rec.cvss_v3_vector)
-    scores.add_row("CVSSv3.1 Temporal", rec.cvss_v3_temporal, "")
-    scores.add_row("CVSSv4.0 BT", rec.cvss_v4_score, rec.cvss_v4_vector)
-    scores.add_row("CVSSv4 Exploit Maturity", rec.cvss_v4_exploit_maturity, "")
+    scores.add_row(
+        "Vulnerability Severity",
+        f"{_format_points(rec.vulnerability_severity_score)} / 40",
+        rec.vulnerability_severity_value,
+    )
+    scores.add_row(
+        "Active Exploitation",
+        f"{_format_points(rec.active_exploitation_score)} / 25",
+        f"{rec.active_exploitation} — {rec.active_exploitation_sources}",
+    )
+    scores.add_row(
+        "Exploitation Probability",
+        f"{_format_points(rec.exploitation_probability_score)} / 15",
+        rec.exploitation_probability_value,
+    )
+    scores.add_row(
+        "Exploit Maturity",
+        f"{_format_points(rec.exploit_maturity_score)} / 10",
+        f"{rec.exploit_maturity_normalized} — {rec.exploit_maturity_source}",
+    )
+    scores.add_row(
+        "Exploit Automatability",
+        f"{_format_points(rec.exploit_automatability_score)} / 10",
+        f"{rec.exploit_automatability} — {rec.exploit_automatability_source}",
+    )
+    scores.add_row("Total Internal Priority", f"{_format_points(rec.priority_score)} / 100", pri)
 
     exploit = Table(box=box.SIMPLE, show_header=False, expand=True)
     exploit.add_column("K", style="bold")
@@ -3127,7 +3224,7 @@ def _html_risk_class(risk_or_priority: str) -> str:
         return "high"
     if v in {"MEDIUM", "P2"}:
         return "medium"
-    if v in {"LOW", "P3", "P4"}:
+    if v in {"LOW", "P3"}:
         return "low"
     return "unknown"
 
@@ -3210,9 +3307,9 @@ EXPLOITATION_STATE_LEGEND = (
     "0 = No known | 1 = Suspected | 2 = Reported | 3 = Confirmed | 4 = Wide"
 )
 PRIORITY_VIZ_CAPTION = (
-    "Vulnerability severity visualization is based on (1) its potential impact, "
-    "(2) whether a functional exploit exists and is accessible to potential attackers, "
-    "(3) whether it is being actively used by attackers in real-world attacks."
+    "Supporting VirusTotal intelligence visualization. These three categorical "
+    "signals remain useful analyst context but do not calculate or override the "
+    "application's Internal Priority Score."
 )
 
 
@@ -3328,21 +3425,52 @@ def _html_priority_svg(rec: CVERecord) -> str:
 """
 
 
-def _html_priority_viz(rec: CVERecord) -> str:
-    """Dynamic Y-axis visualization plus the three GTI priority inputs."""
+def _html_internal_priority_breakdown(rec: CVERecord) -> str:
+    """Render the auditable five-criterion internal score calculation."""
     pri_cls = _html_risk_class(rec.priority_rating)
+    maturity_label = {
+        "NONE": "None",
+        "POC": "Proof of Concept / PoC",
+        "PUBLIC_OR_ATTACKED": "Public or Attacked",
+    }.get(rec.exploit_maturity_normalized, rec.exploit_maturity_normalized)
+    return f"""
+  <section class="priority-breakdown" aria-label="Internal priority score breakdown">
+    <div class="priority-viz-head">
+      <h3>Internal Priority Score</h3>
+      <span class="badge badge-{pri_cls} badge-lg">{_html_escape(rec.priority_rating)}</span>
+    </div>
+    <p class="priority-viz-caption">Deterministic application score. VirusTotal's native priority field is not used.</p>
+    <div class="score-total">{_format_points(rec.priority_score)} <span>/ 100</span></div>
+    <div class="score-table-wrap">
+      <table class="score-table">
+        <thead><tr><th>Criterion</th><th>Normalized input</th><th>Score</th></tr></thead>
+        <tbody>
+          <tr><td>Vulnerability Severity</td><td>{_html_escape(rec.vulnerability_severity_value)}</td><td>{_format_points(rec.vulnerability_severity_score)} / 40</td></tr>
+          <tr><td>Active Exploitation</td><td>{_html_escape(rec.active_exploitation)} — {_html_escape(rec.active_exploitation_sources)}</td><td>{_format_points(rec.active_exploitation_score)} / 25</td></tr>
+          <tr><td>Exploitation Probability</td><td>{_html_escape(rec.exploitation_probability_value)}</td><td>{_format_points(rec.exploitation_probability_score)} / 15</td></tr>
+          <tr><td>Exploit Maturity</td><td>{_html_escape(maturity_label)} — {_html_escape(rec.exploit_maturity_source)}</td><td>{_format_points(rec.exploit_maturity_score)} / 10</td></tr>
+          <tr><td>Exploit Automatability</td><td>{_html_escape(rec.exploit_automatability)} — {_html_escape(rec.exploit_automatability_source)}</td><td>{_format_points(rec.exploit_automatability_score)} / 10</td></tr>
+        </tbody>
+        <tfoot><tr><th>Total Internal Priority Score</th><th>Priority Rating: {_html_escape(rec.priority_rating)}</th><th>{_format_points(rec.priority_score)} / 100</th></tr></tfoot>
+      </table>
+    </div>
+  </section>
+"""
+
+
+def _html_priority_viz(rec: CVERecord) -> str:
+    """Render the legacy three-axis VT context without using it for priority."""
     cvss_bits = []
     if rec.cvss_v3_base != "N/A":
         cvss_bits.append(f"CVSSv3.1 {_html_escape(rec.cvss_v3_base)}")
     if rec.cvss_v4_score != "N/A":
         cvss_bits.append(f"CVSSv4 {_html_escape(rec.cvss_v4_score)}")
     cvss_line = " · ".join(cvss_bits) if cvss_bits else "N/A"
-    tip = _html_info_icon(PRIORITY_VIZ_CAPTION, aria_label="Priority visualization criteria")
+    tip = _html_info_icon(PRIORITY_VIZ_CAPTION, aria_label="Supporting intelligence visualization")
     return f"""
-  <section class="priority-viz" aria-label="Priority visualization">
+  <section class="priority-viz" aria-label="Supporting VirusTotal intelligence visualization">
     <div class="priority-viz-head">
-      <h3>Priority visualization {tip}</h3>
-      <span class="badge badge-{pri_cls} badge-lg">{_html_escape(rec.priority_rating)}</span>
+      <h3>Supporting VirusTotal intelligence {tip}</h3>
     </div>
     <p class="priority-viz-caption">{_html_escape(PRIORITY_VIZ_CAPTION)}</p>
     <div class="priority-viz-body">
@@ -4268,7 +4396,7 @@ def render_html_report(
         wild_note = _html_wild_status_note(rec)
         ioc_section = _html_ioc_summary(rec, ioc_report_href)
         associations_section = _html_associations_summary(rec, associations_report_href)
-        priority_viz = _html_priority_viz(rec)
+        priority_viz = _html_internal_priority_breakdown(rec) + _html_priority_viz(rec)
 
         cards.append(
             f"""
@@ -4279,7 +4407,7 @@ def render_html_report(
       <p class="subtitle">{_html_escape(rec.name if rec.name != rec.cve else "")}</p>
     </div>
     <div class="badges">
-      <span class="badge badge-{pri_cls} badge-lg">{_html_escape(rec.priority_rating)}</span>
+      <span class="badge badge-{pri_cls} badge-lg" title="Internal Priority Rating">{_html_escape(rec.priority_rating)}</span>
       <span class="badge badge-{risk_cls}">{_html_escape(rec.risk_rating)}</span>
     </div>
   </header>
@@ -4331,11 +4459,13 @@ def render_html_report(
         <tr><th>KEV Added</th><td>{_html_escape(rec.cisa_added_date)}</td></tr>
         <tr><th>KEV Due</th><td>{_html_escape(rec.cisa_due_date)}</td></tr>
         <tr><th>Ransomware</th><td>{_html_escape(rec.cisa_ransomware_use)}</td></tr>
+        <tr><th>Ransomware scoring signal</th><td>{_html_escape(rec.ransomware_available)} <span class="muted">({_html_escape(rec.ransomware_evidence_source)})</span></td></tr>
+        <tr><th>Malware-kit scoring signal</th><td>{_html_escape(rec.malware_kit_available)} <span class="muted">({_html_escape(rec.malware_kit_evidence_source)})</span></td></tr>
         <tr><th>CWE</th><td>{_html_escape(rec.cwe_id)} — {_html_escape(rec.cwe_title)}</td></tr>
         <tr><th>Disclosure</th><td>{_html_escape(rec.date_of_disclosure)}</td></tr>
         <tr><th>Last Modified</th><td>{_html_escape(rec.last_modification_date)}</td></tr>
         <tr><th>IoCs</th><td>{_html_escape(rec.ioc_count)}</td></tr>
-        <tr><th>API priority</th><td>{_html_escape(rec.priority_raw)}</td></tr>
+        <tr><th>VirusTotal priority (comparison only; not used)</th><td>{_html_escape(rec.vt_priority_raw)}</td></tr>
         <tr><th>VT collection</th><td>{_html_vt_anchor(rec.vt_url, "Open in VirusTotal")}</td></tr>
       </table>
     </div>
@@ -4646,13 +4776,37 @@ def render_html_report(
   .exploit-state.exploit-suspected {{ color: #93c5fd; }}
   .exploit-state.exploit-noknown,
   .exploit-state.exploit-unknown {{ color: var(--muted); }}
-  .priority-viz {{
+  .priority-viz, .priority-breakdown {{
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 0.85rem 1rem 1rem;
     margin-bottom: 1rem;
   }}
+  .priority-breakdown {{
+    background: linear-gradient(135deg, #14213a 0%, var(--surface-2) 70%);
+  }}
+  .score-total {{
+    margin: 0.25rem 0 0.8rem;
+    font-size: 2rem;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+  }}
+  .score-total span {{ color: var(--muted); font-size: 1rem; font-weight: 600; }}
+  .score-table-wrap {{ overflow-x: auto; }}
+  table.score-table {{ width: 100%; border-collapse: collapse; font-size: 0.86rem; }}
+  table.score-table th, table.score-table td {{
+    text-align: left;
+    padding: 0.5rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }}
+  table.score-table th {{ color: var(--muted); font-weight: 700; }}
+  table.score-table td:last-child, table.score-table th:last-child {{
+    text-align: right;
+    white-space: nowrap;
+  }}
+  table.score-table tfoot th {{ color: var(--text); border-bottom: 0; }}
   .priority-viz-head {{
     display: flex;
     justify-content: space-between;
@@ -4784,8 +4938,10 @@ def render_html_report(
     <footer class="page">
       Data source: Google Threat Intelligence / VirusTotal Vulnerability collections API
       (<code>/api/v3/collections/vulnerability--&lt;cve&gt;</code>).
-      Priority (P0–P4) is derived from Risk Rating + Exploitation State + Exploit Availability
-      per GTI vulnerability report guidance. Requires GTI Enterprise / Enterprise Plus.
+      Internal Priority (P0–P3) is calculated locally from CVSS severity, active-exploitation
+      evidence, EPSS percentile, exploit maturity, and CVSS v4 automatability. The native
+      VirusTotal priority field is comparison-only and cannot override this result.
+      Data enrichment requires GTI Enterprise / Enterprise Plus.
       This report is always generated and opened after each run, including failures.
     </footer>
   </div>

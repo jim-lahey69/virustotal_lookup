@@ -28,8 +28,9 @@ It is built for **corporate Windows environments**: API key and proxy live in a 
 ## Features
 
 - **VirusTotal / GTI CVE enrichment** — risk rating, EPSS, CVSS, CISA KEV, exploitation state, affected products, and more  
-- **Derived priority (P0–P4)** — GTI-style priority from risk + exploitation signals (the raw API `priority` field is also preserved)  
-- **Dynamic priority visualization** — offline inline SVG driven by the same normalized Risk Rating, Exploit Availability, and Exploitation State values as the text report
+- **Internal priority (P0–P3)** — deterministic local 0–100 score from CVSS severity, active-exploitation evidence, EPSS percentile, exploit maturity, and CVSS v4 automatability
+- **Auditable score breakdown** — every report and CSV exposes the five component scores, normalized inputs, total, and final rating; VirusTotal's native `priority` is retained only as `vt_priority_raw` comparison data and cannot override the result
+- **Supporting intelligence visualization** — offline inline SVG of normalized Risk Rating, Exploit Availability, and Exploitation State; these contextual axes no longer calculate priority
 - **Separate IOC workflow** — complete, paginated IOC rows live in a companion report; its visible count is the number of unique rows actually rendered
 - **Associated-threat workflow** — paginated direct associations are filtered into threat actors, campaigns, malware/tools, reports, and relevant IOC collections
 - **Evidence-backed attack-chain view** — direct VirusTotal Tcodes are mapped to returned MITRE ATT&CK tactics; mapped stages are explicitly distinguished from observed relationships and are never presented as observed chronology
@@ -281,7 +282,7 @@ EOF (closed input) or Ctrl+C at the review prompt exits without deleting reports
 **On success / partial success:**
 
 - Summary chips (counts by priority)  
-- Per-CVE cards: dynamic Y-axis priority visualization, priority, risk, EPSS, CVSS, exploitation, CISA KEV, products, summary, IOC and Associated Threats deep links, and link to VirusTotal
+- Per-CVE cards: internal 0–100 priority breakdown, P0–P3 rating, supporting VirusTotal intelligence visualization, risk, EPSS, CVSS, exploitation, CISA KEV, products, summary, IOC and Associated Threats deep links, and link to VirusTotal
 - Associations report sections: threat actors, campaigns, supporting threat intelligence, Tcodes, ATT&CK-aligned attack-chain mapping, and evidence/provenance
 
 **On failure (missing key, SSL, proxy, network, etc.):**
@@ -294,7 +295,7 @@ For automation/CI, use `--no-open` with closed standard input to retain reports 
 
 ### Report mapping notes
 
-These rules are implemented in `cve_enricher.py` (extraction + HTML template). They exist because the GTI GUI and the collections JSON do not always share a 1:1 field.
+Scoring rules are isolated in `priority_scoring.py`; `cve_enricher.py` handles acquisition, normalization, record mapping, and presentation. The separation keeps the priority calculation reusable and prevents report code from changing policy.
 
 **CVE identifier.** CVE is the canonical vulnerability identifier in the API mapping, internal record, CSV, terminal output, and HTML report. Context still includes CWE, disclosure/last-modified dates, products, risk factors, and the VirusTotal collection URL.
 
@@ -308,7 +309,11 @@ These rules are implemented in `cve_enricher.py` (extraction + HTML template). T
 
 **Exploitation State.** The value is shown with the existing color treatment plus an info icon. Tooltip text is the official definition (“Indicates our knowledge of the current exploitation landscape…”) and the level legend: 0 = No Known, 1 = Suspected, 2 = Reported, 3 = Confirmed, 4 = Wide. Missing or unrecognized API values render as **Unknown**, not “No Known”.
 
-**Priority visualization.** The supported Vulnerability API schema exposes categorical inputs but no visualization image/asset or separate numeric graph fields, so the report recreates the GTI Y-axis graphic as inline SVG. Normalization happens once in the `CVERecord`, and both SVG markers and text consume those same labels/levels. Mapping: Risk Rating `Unrated=0`, `Low=1`, `Medium=2`, `High=3`, `Critical=4`; Exploit Availability `No Known/None=0`, `Interest Observed=1`, `Unverified=2`, `Privately Held=3`, `Publicly Available/Known/Trivial=4`; Exploitation State `No Known=0`, `Suspected=1`, `Reported=2`, `Confirmed=3`, `Wide=4`. Missing/unrecognized values remain unavailable and are not silently plotted at zero. Publicly Available and Trivial share the endpoint because the official graph stops at level 4, while the distinct text label is preserved.
+**Internal Priority Score.** The application calculates 0–100 locally: CVSS v4.0 base score (or v3.1 fallback) contributes up to 40; CISA KEV, ransomware association, or malware-kit association contributes 25 when any one is positive; EPSS percentile contributes 0, 4.95, 9.90, or 15; normalized exploit maturity contributes 0, 5, or 10; and an explicitly parsed CVSS v4 `AU:Y` contributes 10. Ratings are `P0 >= 90`, `P1 >= 70`, `P2 >= 50`, and `P3 < 50`. Missing or malformed optional inputs score zero without becoming positive evidence. The undefined EPSS 76th–79th percentile range is isolated in `EPSS_PERCENTILE_BANDS` and temporarily receives the conservative adjacent 4.95-point tier. Calculations retain full precision and totals are bounded to 0–100.
+
+**VirusTotal priority.** The native API `priority` field is stored as `vt_priority_raw` for comparison/debug only. It is explicitly labeled “not used” in reports and is never passed to `calculate_internal_priority()` or `classify_priority()`; even a native value such as `P0` cannot override the application's rating.
+
+**Supporting intelligence visualization.** The supported Vulnerability API schema exposes categorical inputs but no visualization image/asset or separate numeric graph fields, so the report retains the GTI-style Y-axis graphic as contextual inline SVG. It is explicitly non-scoring. Normalization happens once in the `CVERecord`, and both SVG markers and text consume those same labels/levels. Mapping: Risk Rating `Unrated=0`, `Low=1`, `Medium=2`, `High=3`, `Critical=4`; Exploit Availability `No Known/None=0`, `Interest Observed=1`, `Unverified=2`, `Privately Held=3`, `Publicly Available/Known/Trivial=4`; Exploitation State `No Known=0`, `Suspected=1`, `Reported=2`, `Confirmed=3`, `Wide=4`. Missing/unrecognized values remain unavailable and are not silently plotted at zero.
 
 **Exploited in the Wild.** GTI’s Vulnerability object does not document a top-level `exploited_in_the_wild` attribute. The client therefore queries the documented `vulnerability_filter:"Observed In The Wild"` search filter for the exact CVE. A successful match maps to **Yes**, a successful empty result maps to **No**, and request/parsing failure maps to **Unknown**. Exploitation State, CISA KEV, and exploit availability remain independent metrics and are not substituted for this filter.
 
@@ -374,6 +379,7 @@ The HTML failure report always includes the same error detail for sharing with t
 ```text
 virustotal/
 ├── cve_enricher.py      # Main tool: config, API client, CSV/HTML/Rich output
+├── priority_scoring.py   # Pure internal 0–100 scoring and P0–P3 classification
 ├── cve_list.csv         # Example input CVE list
 ├── requirements.txt     # Python dependencies
 ├── .env.example         # Template for secrets/proxy/CA (safe to commit)
@@ -382,7 +388,7 @@ virustotal/
 ├── certs/
 │   ├── .gitkeep
 │   └── README.md        # How to export and place corporate-ca.pem
-├── tests/               # Mapping fixtures (incl. CVE-2026-34621 in-the-wild)
+├── tests/               # CLI/report regressions, fixtures, and priority policy tests
 ├── README.md            # This document
 └── SETUP.md             # Extended first-time setup (API key, proxy, CA)
 ```

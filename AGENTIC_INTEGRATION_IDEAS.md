@@ -21,12 +21,12 @@ Non-negotiable constraints. Any integration path that violates these is a non-st
 - **Secrets stay out of code, tickets, prompts, logs, and HTML.** The GTI key (`VIRUSTOTAL_API_KEY` / `VT_API_KEY`) and any proxy credentials never appear in source, function-call arguments, agent transcripts, or the report. Prefer env / secret manager over `--api-key` (CLI args land in shell history).
 - **Structured output is primary for agents.** The current CLI is human-first (Rich on stdout, HTML always opened). An agent needs a stable JSON contract on stdout or over HTTP. HTML is a *side artifact*, not the tool result.
 - **HTML report remains optional, not deleted.** Humans still want the card layout (priority chips, EPSS, CVSS, KEV, products, VirusTotal link). Agents request it with a flag; default for agent invocations is **do not open a browser**.
-- **Reuse the existing core, do not reimplement GTI parsing.** `GTIClient`, `extract_record()`, `derive_priority_rating()`, `normalize_cve()`, `build_proxies()`, and `resolve_ssl_verify()` are the product. Wrappers should call them, not scrape HTML or re-walk the collections schema.
+- **Reuse the existing core, do not reimplement GTI parsing or scoring.** `GTIClient`, `extract_record()`, `calculate_internal_priority()`, `normalize_cve()`, `build_proxies()`, and `resolve_ssl_verify()` are the product. Wrappers should call them, not scrape HTML or re-walk the collections schema.
 - **Per-CVE structured errors, never silent drops.** Status values already exist: `ok`, `not_found`, `forbidden`, `rate_limited`, `error`. Agents must see a row for every requested CVE, including skips after early-stop on 401/403.
 - **Respect GTI quota.** Vulnerability Intelligence rate-limits aggressively (HTTP 429). Default 1.0s inter-request delay, retries with jitter, and early-stop on privilege errors must survive. A multi-user agent must **share one throttle and a cache**, not spawn unbounded parallel CLI processes.
 - **Enterprise license is a hard dependency.** Free / public VirusTotal keys return 401/403 on this endpoint. The capability must fail clearly (`forbidden`) rather than hallucinating enrichment.
 - **No secrets in the data contract.** `vt_url` is a GUI deep-link (`https://www.virustotal.com/gui/collection/vulnerability--cve-…`). Raw API key, proxy password, and CA path never appear in the JSON the agent sees.
-- **Idempotent, deterministic records.** Same CVE + same GTI payload → same flattened fields and same derived P0–P4. Agents and caches rely on this.
+- **Idempotent, deterministic records.** Same CVE + same GTI payload → same flattened fields, 0–100 score, and P0–P3 rating. Agents and caches rely on this.
 - **Least privilege for the agent.** The agent can request enrichment of CVE IDs. It cannot dump the API key, change TLS verification, or issue arbitrary VirusTotal queries beyond this capability.
 
 ---
@@ -167,7 +167,7 @@ Example tool definition (OpenAI / MCP style):
 ```json
 {
   "name": "enrich_cves",
-  "description": "Enrich CVE IDs via Google Threat Intelligence Vulnerability Intelligence. Returns priority (P0–P4), EPSS, CVSS, CISA KEV, exploitation, affected products, mitigations, and a VirusTotal collection URL. Use when a detection, advisory, or ticket mentions a CVE and triage/priority is needed. Do not guess CVSS or KEV; call this tool.",
+  "description": "Enrich CVE IDs via Google Threat Intelligence Vulnerability Intelligence. Returns an internally calculated 0–100 priority score and P0–P3 rating, EPSS, CVSS, CISA KEV, exploitation, affected products, mitigations, and a VirusTotal collection URL. Use when a detection, advisory, or ticket mentions a CVE and triage/priority is needed. Do not guess CVSS or KEV; call this tool.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -347,7 +347,7 @@ Agents should not receive CSV strings or HTML. They should receive JSON with **n
 
 - Use `null` for missing values, not `"N/A"`.
 - Use JSON booleans and numbers for KEV, EPSS, CVSS, counts.
-- Keep derived `priority` (`P0`–`P4` | `null`) as a first-class field; also keep `priority_raw` from the API (boolean-ish) so nothing is lost.
+- Keep internal `priority` (`P0`–`P3` | `null`), numeric `priority_score`, and component scores as first-class fields; keep `vt_priority_raw` only as clearly labeled comparison data.
 - Always include `status` so the agent can branch (`ok` vs `not_found` vs `forbidden`).
 - Default **compact** payload for the LLM; put long narrative and full CPE lists behind flags or a `detail` object the tool layer can omit.
 - Version the contract (`contract_version`) so agents can detect breaking changes.
@@ -374,7 +374,6 @@ class Priority(str, Enum):
     P1 = "P1"
     P2 = "P2"
     P3 = "P3"
-    P4 = "P4"
 
 
 class RunError(BaseModel):
@@ -440,8 +439,9 @@ class CveEnrichment(BaseModel):
     error_message: Optional[str] = None
 
     name: Optional[str] = None
-    priority: Optional[Priority] = None          # derived P0–P4 (GTI-style table)
-    priority_raw: Optional[str] = None           # API field as string
+    priority: Optional[Priority] = None          # internal P0–P3 rating
+    priority_score: Optional[float] = None       # internal 0–100 total
+    vt_priority_raw: Optional[str] = None        # comparison only; never scoring input
     risk_rating: Optional[str] = None            # Critical / High / Medium / Low
     predicted_risk_rating: Optional[str] = None
     risk_factors: list[str] = Field(default_factory=list)
@@ -552,8 +552,9 @@ Enough to triage, small enough for a context window:
 
 | Agent field | Source today |
 |-------------|--------------|
-| `priority` | `priority_rating` (derived P0–P4) |
-| `priority_raw` | `priority_raw` |
+| `priority` | `priority_rating` (internal P0–P3) |
+| `priority_score` | `priority_score` (internal 0–100 total) |
+| `vt_priority_raw` | `vt_priority_raw` (comparison only) |
 | `risk_rating`, `predicted_risk_rating`, `risk_factors` | same names (`risk_factors` split on `;`) |
 | `epss.score` / `percentile` | `epss_score`, `epss_percentile` parsed as float |
 | `cvss_v3.*`, `cvss_v4.*`, `cvss_v2.*` | existing CVSS fields |
@@ -1070,7 +1071,8 @@ If `include_html: true`, `render_html_report()` still writes the existing failur
 
 ```text
 Enrich CVE IDs via Google Threat Intelligence (VirusTotal Vulnerability
-Intelligence). Returns priority (P0–P4), EPSS, CVSS, CISA KEV, exploitation,
+Intelligence). Returns an internal priority score (0–100) and rating (P0–P3),
+EPSS, CVSS, CISA KEV, exploitation,
 affected products, mitigations, and a VirusTotal collection URL.
 
 On failure the JSON still conforms to the same schema:
@@ -1094,7 +1096,7 @@ If the org already has OpenTelemetry: one span per tool call, child span per GTI
 
 Ordered by **value vs risk**. Each phase is shippable on its own. Do not skip Phase 1 — FastAPI on top of Rich-on-stdout is still not agent-safe. Do not start with a message bus.
 
-Reuse what already exists: `enrich_cves()`, `GTIClient`, `extract_record()`, `derive_priority_rating()`, `render_html_report()`, `build_proxies()`, `resolve_ssl_verify()`. This document is not an implementation; the steps below are the intended sequence.
+Reuse what already exists: `enrich_cves()`, `GTIClient`, `extract_record()`, `calculate_internal_priority()`, `render_html_report()`, `build_proxies()`, `resolve_ssl_verify()`. This document is not an implementation; the steps below are the intended sequence.
 
 | Phase | Outcome | Risk | Effort |
 |-------|---------|------|--------|
@@ -1199,4 +1201,4 @@ These block Phase 2–3 more than Phase 1. Phase 1 can proceed on a single works
 
 Until 1–3 are answered, **ship Phase 1** on the workstation that already has proxy, `%USERPROFILE%\certs\corporate_trust_bundle.pem` (or `certs/corporate-ca.pem`), and `.env` working. That is the highest-value, lowest-risk move: the agent gets structured enrichment without relocating secrets or opening a new network surface.
 
-The product is already in this repo — `GTIClient`, flattening, P0–P4, proxy/CA handling, and the HTML renderer. Agentic integration is a JSON contract, honest errors, and adapters. It is not a new enricher.
+The product is already in this repo — `GTIClient`, flattening, internal 0–100/P0–P3 scoring, proxy/CA handling, and the HTML renderer. Agentic integration is a JSON contract, honest errors, and adapters. It is not a new enricher.

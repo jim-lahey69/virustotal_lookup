@@ -295,10 +295,12 @@ class HtmlFeatureTests(unittest.TestCase):
         )
         self.assertIn("exploit-confirmed", html)
 
-    def test_priority_visualization_and_raw_value(self) -> None:
+    def test_internal_priority_breakdown_and_labeled_vt_value(self) -> None:
         rec = ce.extract_record("CVE-2021-44228", _load("cve-2021-44228.json"))
         html = _html_for(rec)
-        self.assertIn("Priority visualization", html)
+        self.assertIn("Internal Priority Score", html)
+        self.assertIn("Total Internal Priority Score", html)
+        self.assertIn("Supporting VirusTotal intelligence", html)
         self.assertIn("Potential impact", html)
         self.assertIn("Exploit accessibility", html)
         self.assertIn("Real-world use", html)
@@ -308,11 +310,15 @@ class HtmlFeatureTests(unittest.TestCase):
         self.assertIn('data-axis="state" data-level="4"', html)
         self.assertIn('<polygon class="priority-shape"', html)
         self.assertIn(
-            "Vulnerability severity visualization is based on (1) its potential impact",
+            "Supporting VirusTotal intelligence visualization",
             html,
         )
-        self.assertEqual(rec.priority_raw, "True")
-        self.assertIn("<th>API priority</th><td>True</td>", html)
+        self.assertEqual(rec.vt_priority_raw, "True")
+        self.assertIn(
+            "VirusTotal priority (comparison only; not used)</th><td>True</td>",
+            html,
+        )
+        self.assertEqual(rec.priority_score, 90.0)
         self.assertEqual(rec.priority_rating, "P0")
 
     def test_priority_svg_changes_with_normalized_values(self) -> None:
@@ -347,15 +353,12 @@ class HtmlFeatureTests(unittest.TestCase):
             high_html.split('<polygon class="priority-shape"', 1)[1].split("/>", 1)[0],
         )
 
-    def test_missing_state_does_not_create_priority(self) -> None:
-        self.assertEqual(
-            ce.derive_priority_rating("High", "Unknown", "Publicly Available"),
-            "N/A",
-        )
-        self.assertEqual(
-            ce.derive_priority_rating("High", "No Known", "Unknown"),
-            "N/A",
-        )
+    def test_missing_scoring_inputs_use_explicit_zero_point_fallbacks(self) -> None:
+        rec = ce.extract_record("CVE-1900-0043", {"data": {"attributes": {}}})
+        self.assertEqual(rec.priority_score, 0.0)
+        self.assertEqual(rec.priority_rating, "P3")
+        self.assertEqual(rec.vulnerability_severity_value, "Unavailable")
+        self.assertEqual(rec.active_exploitation, "No")
 
     def test_api_text_is_html_escaped(self) -> None:
         payload = {"data": {"attributes": {"description": "<script>alert(1)</script>"}}}
