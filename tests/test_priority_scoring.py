@@ -296,11 +296,19 @@ class PriorityPipelineIntegrationTests(unittest.TestCase):
             path = Path(tmp) / "report.html"
             ce.render_html_report([rec], path)
             report = path.read_text(encoding="utf-8")
-        self.assertIn("Internal Priority Score", report)
+        self.assertIn("Internal Vulnerability Risk Score", report)
         self.assertIn("99.2 <span>/ 100</span>", report)
         self.assertIn("Vulnerability Severity", report)
         self.assertIn("Exploit Automatability", report)
-        self.assertIn("VirusTotal priority (comparison only; not used)</th><td>P3", report)
+        self.assertIn('<details class="vrs-breakdown">', report)
+        vrs, gti = report.split('class="score-card score-vrs"', 1)[1].split(
+            'class="score-card score-gti"', 1
+        )
+        self.assertIn("99.2 <span>/ 100</span>", vrs)
+        self.assertIn(">P0<", vrs)
+        self.assertIn(">P3<", gti)
+        self.assertNotIn("99.2", gti)
+        self.assertNotIn(">P0<", gti)
 
     def test_csv_exports_internal_components_and_labeled_vt_value(self) -> None:
         rec = ce.extract_record(

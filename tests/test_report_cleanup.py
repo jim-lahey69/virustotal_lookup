@@ -217,7 +217,7 @@ class ReportSessionTests(unittest.TestCase):
             self.assert_linked_pair(
                 "CVE-2021-44228", self.primary, self.ioc, self.associations
             )
-            self.open_browser.assert_called_once_with(self.primary)
+            self.open_browser.assert_called_once_with(self.primary.resolve())
             return next(responses)
 
         with patch("builtins.input", side_effect=review) as read_input:
@@ -255,7 +255,10 @@ class ReportSessionTests(unittest.TestCase):
             self.assertEqual(ce.main(["-i", str(source)] + self.args[2:]), 0)
         generated = {path for pair in paths for path in pair}
         self.cleanup.assert_called_once_with(generated)
-        self.assertEqual([call.args[0] for call in self.open_browser.call_args_list], [report_set[0] for report_set in paths])
+        self.assertEqual(
+            [call.args[0] for call in self.open_browser.call_args_list],
+            [report_set[0].resolve() for report_set in paths],
+        )
         self.assertTrue(all(not path.exists() for path in generated))
         self.assertEqual(set(self.root.glob("*.html")), {self.static})
 

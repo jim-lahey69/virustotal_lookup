@@ -14,7 +14,7 @@ GET https://www.virustotal.com/api/v3/collections/vulnerability--{cve-lowercase}
 
 - A structured **CSV** for tickets, SIEM, or spreadsheets  
 - **Rich terminal cards** for interactive review  
-- A self-contained primary **HTML report** per CVE; the first opens automatically
+- A self-contained primary **HTML report** per CVE; every successful primary report opens in its own browser tab
 - A companion **IOC report** per CVE with a working link from its primary report
 - A companion **Associations / Associated Threats report** per CVE with actors,
   campaigns, supporting intelligence, Tcodes, and an evidence-labeled ATT&CK mapping
@@ -33,8 +33,8 @@ It is built for **corporate Windows environments**: API key and proxy live in a 
 - **Supporting intelligence visualization** — offline inline SVG of normalized Risk Rating, Exploit Availability, and Exploitation State; these contextual axes no longer calculate priority
 - **Separate IOC workflow** — complete, paginated IOC rows live in a companion report; its visible count is the number of unique rows actually rendered
 - **Associated-threat workflow** — paginated direct associations are filtered into threat actors, campaigns, malware/tools, reports, and relevant IOC collections
-- **Evidence-backed attack-chain view** — direct VirusTotal Tcodes are mapped to returned MITRE ATT&CK tactics; mapped stages are explicitly distinguished from observed relationships and are never presented as observed chronology
-- **Lightweight report selection** — multi-CVE runs create one three-report set per CVE and offer a numbered CLI selector in input order
+- **Associations report** — threat actors, campaigns, and MITRE ATT&CK techniques returned by GTI, with vulnerability-level techniques kept distinct from actor- or campaign-level IDs. No attack chain is generated.
+- **Multi-CVE browser workflow** — one three-report set per CVE; each successful primary report opens in its own tab, in input order, with no numbered selector
 - **`.env` configuration** — single source of truth for API key, HTTP proxy, and corporate CA path (loaded via `python-dotenv`)  
 - **Corporate proxy support** — `HTTP_PROXY` / `HTTPS_PROXY` applied to the `requests` session  
 - **Corporate SSL inspection** — use a PEM/CRT root CA (`CORPORATE_CA_BUNDLE` or `./certs/corporate-ca.pem`); TLS verification is always on  
@@ -271,9 +271,9 @@ For a single CVE, after **every** run—success, partial success, or complete fa
 3. Writes its companion Associations report (default `associations_report.html`)
 4. Opens the primary report in the default browser; companion reports open from their links
 
-For a CSV with multiple CVEs, the tool writes `CVE-…_report.html`, `CVE-…_iocs.html`, and `CVE-…_associations.html` for every record in the original input order. It opens the first CVE report, prints the numbered list, and accepts repeated selections until Enter is pressed. Invalid and out-of-range selections are reported without ending the enrichment run. `--no-open` skips both the automatic open and numbered selector.
+For a CSV with multiple CVEs, the tool writes `CVE-…_report.html`, `CVE-…_iocs.html`, and `CVE-…_associations.html` for every record in the original input order. After generation it opens every successfully enriched primary report in its own browser tab. Duplicate CVE IDs are collapsed before lookup, and failed or empty reports are not opened. `--no-open` skips the browser without skipping report generation. No numbered report selector is shown.
 
-Reports stay available throughout review. Press Enter at the final prompt (`Press Enter to exit and remove generated HTML reports...`, or the equivalent numbered selector prompt) to delete only the primary, IOC, and Associations HTML files written by that invocation. This also applies to single-CVE runs, failure reports, custom output paths, and manual review with `--no-open`. CSV and raw JSON exports, older reports at other paths, and unrelated HTML files are preserved. Missing files are skipped; a deletion failure identifies the file in a warning and cleanup continues.
+Reports stay available throughout review. Press Enter at the prompt `Press Enter to exit and remove generated HTML reports...` to delete only the primary, IOC, and Associations HTML files written by that invocation. This also applies to single-CVE runs, failure reports, custom output paths, and manual review with `--no-open`. CSV and raw JSON exports, older reports at other paths, and unrelated HTML files are preserved. Missing files are skipped; a deletion failure identifies the file in a warning and cleanup continues.
 
 EOF (closed input) or Ctrl+C at the review prompt exits without deleting reports, since cleanup requires Enter. Files left by interrupted runs may need manual removal. The default report names and per-CVE report patterns are gitignored as an additional safeguard; custom filenames may need their own ignore rules.
 
@@ -282,8 +282,8 @@ EOF (closed input) or Ctrl+C at the review prompt exits without deleting reports
 **On success / partial success:**
 
 - Summary chips (counts by priority)  
-- Per-CVE cards: internal 0–100 priority breakdown, P0–P3 rating, supporting VirusTotal intelligence visualization, risk, EPSS, CVSS, exploitation, CISA KEV, products, summary, IOC and Associated Threats deep links, and link to VirusTotal
-- Associations report sections: threat actors, campaigns, supporting threat intelligence, Tcodes, ATT&CK-aligned attack-chain mapping, and evidence/provenance
+- Per-CVE cards: internal Vulnerability Risk Score beside GTI's native priority, a collapsed VRS breakdown, a compact supporting VirusTotal intelligence visualization, risk, EPSS, CVSS, exploitation, CISA KEV, products, summary, IOC and Associated Threats deep links, and link to VirusTotal
+- Associations report sections: threat actors, MITRE ATT&CK techniques, campaigns, and supporting threat intelligence. The report does not build an attack chain.
 
 **On failure (missing key, SSL, proxy, network, etc.):**
 
@@ -297,23 +297,23 @@ For automation/CI, use `--no-open` with closed standard input to retain reports 
 
 Scoring rules are isolated in `priority_scoring.py`; `cve_enricher.py` handles acquisition, normalization, record mapping, and presentation. The separation keeps the priority calculation reusable and prevents report code from changing policy.
 
-**CVE identifier.** CVE is the canonical vulnerability identifier in the API mapping, internal record, CSV, terminal output, and HTML report. Context still includes CWE, disclosure/last-modified dates, products, risk factors, and the VirusTotal collection URL.
+**CVE identifier.** CVE is the canonical vulnerability identifier in the API mapping, internal record, CSV, terminal output, and HTML report. Mandiant MVE aliases (`MVE-YYYY-NNNN`) are removed from analyst-facing text and are not a report field. Context still includes CWE, disclosure/last-modified dates, products, risk factors, and the VirusTotal collection URL.
 
 **IOCs.** `counters.iocs` / `files_count` / etc. are counts only. When a count is greater than zero the client fetches relationship objects (`files`, `urls`, `domains`, `ip_addresses`) once as part of enrichment using the same proxy, corporate CA bundle, throttle, and retry path as the collection GET. Each relationship uses a 40-object page size and follows VirusTotal's supported `links.next` pagination; next-page URLs are restricted to the configured API origin and relationship path before the API key-bearing request is sent. The IOC report groups files, URLs, domains, IPv4, IPv6, and unclassified values, preserves full values, and removes only identical indicators within the same relationship type. It does not slice the returned collection. The visible `Indicators of Compromise` count is computed from the unique table rows actually rendered, and report generation verifies that the collected and rendered row totals match. A counter/relationship shortfall is marked partial and explained in the report. Explicit zero, absent counters, request failure, partial pagination, and response-parsing failure remain distinct statuses.
 
 **Associations.** The client requests complete, paginated objects from `GET /api/v3/collections/vulnerability--<cve-lowercase>/associations?limit=40`. That documented relationship can return heterogeneous Reports, Campaigns, IOC Collections, Malware Families, Software/Toolkits, Vulnerabilities, and Threat Actors. The report filters out other vulnerabilities and unknown types, groups direct threat actors and campaigns separately, and retains malware/toolkit/report/IOC-collection objects only as supporting intelligence. This single broad request avoids duplicate actor- and campaign-specific calls. The same origin/path checks, session cache, request delay, proxy/CA configuration, retry rules, and 50-page safety guard used by the IOC workflow apply here.
 
-**Tcodes and attack-chain mapping.** “Tcodes” are not read from an assumed `tcodes` property. They are the MITRE technique IDs returned by `GET /api/v3/collections/vulnerability--<cve-lowercase>/attack_techniques?limit=40` (for example, `T1190`). For each returned technique, the client requests its documented `GET /api/v3/attack_techniques/<Tcode>/attack_tactics?limit=40` relationship. A stage is created only when VirusTotal returns that technique-to-tactic edge. Recognized Enterprise tactics are displayed in canonical ATT&CK lifecycle order; unfamiliar Mobile/ICS/other tactics retain API order. The sequence is labeled **Analytical Mapping** and **not observed chronology**. Direct VirusTotal objects remain labeled as observed relationship data. CVE-level actors, campaigns, malware, tools, and IOCs are not assigned to an individual stage because co-association alone does not prove that attribution.
+**Techniques and campaigns.** MITRE technique IDs are the identifiers returned by `GET /api/v3/collections/vulnerability--<cve-lowercase>/attack_techniques?limit=40` (for example, `T1190` or `T1059.001`). For each returned ID, the client requests `GET /api/v3/attack_techniques/<id>/attack_tactics?limit=40` and shows the tactic names GTI returns. A description without an ID is displayed with the ID marked not supplied; the application does not invent an ATT&CK ID from CWE or from the vulnerability category. Technique IDs explicitly present on an associated actor or campaign are listed separately and are not treated as confirmed exploitation of the CVE. The report does not assemble those relationships into an attack chain.
 
-**Missing data and licensing.** Empty direct associations produce the explicit no-associations state, and missing usable tactic evidence produces the explicit insufficient-intelligence state instead of a fabricated chain. Partial pagination, parsing failures, 401/403 privilege failures, 429 rate limits, and other request errors are retained in the Associations report without preventing the primary or IOC report from being generated. Vulnerabilities, Threat Actors, and Campaigns require Google TI Enterprise or Enterprise Plus access; object coverage and relationship visibility can vary by license and by the intelligence available for a CVE. Data visible in the web interface may therefore be absent from the API response available to the configured key.
+**Missing data and licensing.** Empty sections say that no actors, TTPs, or campaigns were identified. Partial pagination, parsing failures, 401/403 privilege failures, 429 rate limits, and other request errors are labeled incomplete and are not presented as a full dataset. The same limits apply to the primary and IOC reports: an association failure does not suppress them. Vulnerabilities, Threat Actors, and Campaigns require Google TI Enterprise or Enterprise Plus access; object coverage and relationship visibility can vary by license and by the intelligence available for a CVE. Data visible in the web interface may therefore be absent from the API response available to the configured key. The Vulnerability API `priority` field is a remediation flag unless the response itself contains a P0–P4 token. The report shows `Not available` for the GTI priority in that case and does not calculate a P-rating from risk, exploitation state, and exploit availability.
 
 **Exploitation State.** The value is shown with the existing color treatment plus an info icon. Tooltip text is the official definition (“Indicates our knowledge of the current exploitation landscape…”) and the level legend: 0 = No Known, 1 = Suspected, 2 = Reported, 3 = Confirmed, 4 = Wide. Missing or unrecognized API values render as **Unknown**, not “No Known”.
 
 **Internal Priority Score.** The application calculates 0–100 locally: CVSS v4.0 base score (or v3.1 fallback) contributes up to 40; CISA KEV, ransomware association, or malware-kit association contributes 25 when any one is positive; EPSS percentile contributes 0, 4.95, 9.90, or 15; normalized exploit maturity contributes 0, 5, or 10; and an explicitly parsed CVSS v4 `AU:Y` contributes 10. Ratings are `P0 >= 90`, `P1 >= 70`, `P2 >= 50`, and `P3 < 50`. Missing or malformed optional inputs score zero without becoming positive evidence. The undefined EPSS 76th–79th percentile range is isolated in `EPSS_PERCENTILE_BANDS` and temporarily receives the conservative adjacent 4.95-point tier. Calculations retain full precision and totals are bounded to 0–100.
 
-**VirusTotal priority.** The native API `priority` field is stored as `vt_priority_raw` for comparison/debug only. It is explicitly labeled “not used” in reports and is never passed to `calculate_internal_priority()` or `classify_priority()`; even a native value such as `P0` cannot override the application's rating.
+**VirusTotal priority.** The native API `priority` field is stored as `vt_priority_raw` for comparison only. The HTML report shows it beside the internal VRS. An explicit `P0`–`P4` token is displayed as GTI prioritization. A boolean remediation flag stays a flag and is not relabeled as a P-rating; the GTI priority then reads `Not available`. Neither value is passed to `calculate_internal_priority()` or `classify_priority()`.
 
-**Supporting intelligence visualization.** The supported Vulnerability API schema exposes categorical inputs but no visualization image/asset or separate numeric graph fields, so the report retains the GTI-style Y-axis graphic as contextual inline SVG. It is explicitly non-scoring. Normalization happens once in the `CVERecord`, and both SVG markers and text consume those same labels/levels. Mapping: Risk Rating `Unrated=0`, `Low=1`, `Medium=2`, `High=3`, `Critical=4`; Exploit Availability `No Known/None=0`, `Interest Observed=1`, `Unverified=2`, `Privately Held=3`, `Publicly Available/Known/Trivial=4`; Exploitation State `No Known=0`, `Suspected=1`, `Reported=2`, `Confirmed=3`, `Wide=4`. Missing/unrecognized values remain unavailable and are not silently plotted at zero.
+**Supporting intelligence visualization.** The supported Vulnerability API schema exposes categorical inputs but no visualization image/asset or separate numeric graph fields, so the report retains the GTI-style Y-axis graphic as contextual inline SVG. It is explicitly non-scoring and is constrained to 280px wide so it does not dominate the card. The viewBox aspect ratio is unchanged. Normalization happens once in the `CVERecord`, and both SVG markers and text consume those same labels/levels. Mapping: Risk Rating `Unrated=0`, `Low=1`, `Medium=2`, `High=3`, `Critical=4`; Exploit Availability `No Known/None=0`, `Interest Observed=1`, `Unverified=2`, `Privately Held=3`, `Publicly Available/Known/Trivial=4`; Exploitation State `No Known=0`, `Suspected=1`, `Reported=2`, `Confirmed=3`, `Wide=4`. Missing/unrecognized values remain unavailable and are not silently plotted at zero.
 
 **Exploited in the Wild.** GTI’s Vulnerability object does not document a top-level `exploited_in_the_wild` attribute. The client therefore queries the documented `vulnerability_filter:"Observed In The Wild"` search filter for the exact CVE. A successful match maps to **Yes**, a successful empty result maps to **No**, and request/parsing failure maps to **Unknown**. Exploitation State, CISA KEV, and exploit availability remain independent metrics and are not substituted for this filter.
 
@@ -362,6 +362,36 @@ The HTML failure report always includes the same error detail for sharing with t
 | No valid CVEs | Check CSV format and `CVE-YYYY-NNNN` pattern |
 
 ---
+
+## Important Functionality Line Map
+
+There is no separate `enrich_cve.py`. The standalone script is `cve_enricher.py`. Line numbers below match that file after the current cleanup. Scoring weights live in `priority_scoring.py` and are not part of these three paths.
+
+### 1. GTI / VirusTotal API call
+
+| File | Lines | What that block does |
+|------|-------|----------------------|
+| `cve_enricher.py` | 2284–2344 | `GTIClient.__init__` builds one `requests.Session`, sets the `x-apikey` header, applies the proxy dict, and sets `verify` to `True` or a CA bundle path. `verify=False` raises. The key and proxy password are kept only for later redaction. |
+| `cve_enricher.py` | 2358–2402 | Same-origin checks and manual redirect handling. Redirects that leave the configured VirusTotal API host are refused, and the redirect cap is `MAX_REDIRECTS` (5). |
+| `cve_enricher.py` | 2404–2537 | `_get_json` throttles, retries 429 and 5xx with backoff and `Retry-After`, does not retry 401/403, caches a successful body by full URL for the run, and redacts secrets in network errors. |
+| `cve_enricher.py` | 2539–2683 | CVE, Observed In The Wild, IOC relationship, association, and ATT&CK tactic requests. CVE IDs and relationship names are validated before they are placed in a URL. |
+
+### 2. CVE enrichment
+
+| File | Lines | What that block does |
+|------|-------|----------------------|
+| `cve_enricher.py` | 1129–1278 | `derive_exploited_in_the_wild` reads an explicit in-the-wild field or wild tag when the object actually has one. A missing field stays `Unknown`. It does not infer the flag from Exploitation State or CISA KEV. |
+| `cve_enricher.py` | 2549–2583 and 5366–5408 | The enrichment loop calls `get_observed_in_the_wild`, which queries `vulnerability_filter:"Observed In The Wild"`. A match is Yes, an empty success is No, and a failed lookup stays Unknown. |
+| `cve_enricher.py` | 2851–3104 | `extract_record` maps the Vulnerability object into `CVERecord`: CVSS, EPSS, exploitation state, KEV, products, and narrative text. IoC counters are counts only. |
+| `cve_enricher.py` | 1460–1552 and 2004–2092 | `attach_iocs` and `attach_associations` walk `files`, `urls`, `domains`, `ip_addresses`, `associations`, and `attack_techniques`, following `links.next` up to 50 pages. |
+
+### 3. Corporate proxy and CA bundle
+
+| File | Lines | What that block does |
+|------|-------|----------------------|
+| `cve_enricher.py` | 366–475 | `resolve_ssl_verify` never returns `False`. An explicit missing bundle fails. Otherwise it uses `Path.home() / "certs" / "corporate_trust_bundle.pem"` when that file exists, then `certs/corporate-ca.pem`, then certifi (`True`). |
+| `cve_enricher.py` | 5308–5348 | `build_proxies` reads CLI flags, then `VT_HTTP(S)_PROXY`, then `HTTP(S)_PROXY`. One configured scheme is copied to the other so HTTPS is not sent direct. |
+| `cve_enricher.py` | 891–927 and 5768–5790 | Proxy passwords and the API key are redacted before proxy settings, exceptions, or the HTML failure banner are shown. |
 
 ## Security Notes
 

@@ -27,6 +27,13 @@ def _success_record(cve: str) -> ce.CVERecord:
     )
 
 
+def _write_primary_report(records, path, *args, **kwargs) -> None:
+    """Stand in for report rendering while still producing a file the browser can open."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("<!DOCTYPE html><title>ok</title>", encoding="utf-8")
+
+
 class InputValidationTests(unittest.TestCase):
     def test_valid_identifier_is_accepted(self) -> None:
         self.assertEqual(ce.validate_input_cve("CVE-2026-12345"), "CVE-2026-12345")
@@ -193,49 +200,118 @@ class SecretRedactionTests(unittest.TestCase):
         html = ce._format_fatal_error(RuntimeError("proxy http://u:p@host:1 failed"))
         self.assertNotIn("u:p@", html)
         self.assertIn("u:***@", html)
-
-
-class ReportSelectionTests(unittest.TestCase):
-    def test_repeated_selection_and_invalid_input(self) -> None:
-        reports = [
-            ("CVE-2026-12345", Path("first.html")),
-            ("CVE-2026-56789", Path("second.html")),
-            ("CVE-2026-09876", Path("third.html")),
-        ]
-        output = io.StringIO()
-        with (
-            patch("builtins.input", side_effect=["8", "abc", "2", "3", ""]),
-            patch.object(ce, "open_report_in_browser") as open_browser,
-            redirect_stdout(output),
-        ):
-            ce.select_report_to_open(reports)
-
-        self.assertEqual(
-            [call.args[0] for call in open_browser.call_args_list],
-            [Path("second.html"), Path("third.html")],
+        fragments = ce.sensitive_fragments(
+            "super-secret-key",
+            {"https": "http://user:hunter2@webproxy:8080"},
         )
+        leaked = ce.redact_secrets(
+            "request failed super-secret-key hunter2",
+            fragments,
+        )
+        self.assertNotIn("super-secret-key", leaked)
+        self.assertNotIn("hunter2", leaked)
+
+
+class BrowserWorkflowTests(unittest.TestCase):
+    def _write(self, directory: Path, name: str, contents: str = "<!DOCTYPE html><title>report</title>") -> Path:
+        path = directory / name
+        path.write_text(contents, encoding="utf-8")
+        return path
+
+    def test_opens_every_existing_report_in_input_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reports = [
+                ("CVE-2026-12345", self._write(root, "first.html")),
+                ("CVE-2026-56789", self._write(root, "second.html")),
+                ("CVE-2026-09876", self._write(root, "third.html")),
+            ]
+            output = io.StringIO()
+            with (
+                patch.object(ce, "open_report_in_browser") as open_browser,
+                redirect_stdout(output),
+            ):
+                ce.open_reports_in_browser(reports)
+            self.assertEqual(
+                [call.args[0] for call in open_browser.call_args_list],
+                [path.resolve() for _, path in reports],
+            )
         text = output.getvalue()
-        self.assertLess(text.index("1: CVE-2026-12345"), text.index("2: CVE-2026-56789"))
-        self.assertLess(text.index("2: CVE-2026-56789"), text.index("3: CVE-2026-09876"))
-        self.assertEqual(
-            text.count("Invalid selection. Enter a number between 1 and 3."),
-            2,
-        )
-        self.assertIn("Opening report for CVE-2026-56789...", text)
-        self.assertIn("Opening report for CVE-2026-09876...", text)
+        self.assertIn("Opening 3 CVE report(s) in separate browser tabs:", text)
+        self.assertLess(text.index("CVE-2026-12345"), text.index("CVE-2026-56789"))
+        self.assertLess(text.index("CVE-2026-56789"), text.index("CVE-2026-09876"))
+        self.assertNotIn("Invalid selection", text)
 
-    def test_blank_input_exits_without_opening(self) -> None:
-        reports = [
-            ("CVE-2026-12345", Path("first.html")),
-            ("CVE-2026-56789", Path("second.html")),
-        ]
-        with (
-            patch("builtins.input", return_value=""),
-            patch.object(ce, "open_report_in_browser") as open_browser,
-            redirect_stdout(io.StringIO()),
-        ):
-            ce.select_report_to_open(reports)
-        open_browser.assert_not_called()
+    def test_duplicate_cves_and_paths_open_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(Path(tmp), "report.html")
+            with patch.object(ce, "open_report_in_browser") as open_browser:
+                ce.open_reports_in_browser(
+                    [
+                        ("CVE-2026-12345", path),
+                        ("cve-2026-12345", path),
+                        ("CVE-2026-12345", Path(tmp) / "report.html"),
+                    ]
+                )
+        open_browser.assert_called_once()
+        self.assertEqual(open_browser.call_args.args[0], path.resolve())
+
+    def test_missing_empty_and_failed_reports_are_not_opened(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ready = self._write(root, "ready.html")
+            empty = self._write(root, "empty.html", "")
+            with (
+                patch.object(ce, "open_report_in_browser") as open_browser,
+                redirect_stdout(io.StringIO()),
+            ):
+                ce.open_reports_in_browser(
+                    [
+                        ("CVE-2026-12345", ready),
+                        ("CVE-2026-56789", root / "missing.html"),
+                        ("CVE-2026-09876", empty),
+                    ]
+                )
+        open_browser.assert_called_once_with(ready.resolve())
+
+    def test_browser_failure_keeps_the_report_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._write(root, "first.html")
+            second = self._write(root, "second.html")
+
+            def fail_first(path: Path) -> None:
+                if path == first.resolve():
+                    raise OSError("browser unavailable")
+
+            with (
+                patch.object(ce, "open_report_in_browser", side_effect=fail_first) as open_browser,
+                self.assertLogs(level="WARNING") as logs,
+                redirect_stdout(io.StringIO()),
+            ):
+                ce.open_reports_in_browser(
+                    [("CVE-2026-12345", first), ("CVE-2026-56789", second)]
+                )
+            self.assertEqual(
+                [call.args[0] for call in open_browser.call_args_list],
+                [first.resolve(), second.resolve()],
+            )
+            self.assertIn("browser unavailable", "\n".join(logs.output))
+            self.assertTrue(first.is_file())
+            self.assertTrue(second.is_file())
+
+    def test_open_uses_an_absolute_file_uri_and_survives_a_browser_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(Path(tmp), "report.html")
+            with patch("cve_enricher.webbrowser.open_new_tab", return_value=True) as open_tab:
+                ce.open_report_in_browser(path)
+            open_tab.assert_called_once_with(path.resolve().as_uri())
+            with (
+                patch("cve_enricher.webbrowser.open_new_tab", side_effect=OSError("no display")),
+                self.assertLogs(level="WARNING"),
+            ):
+                ce.open_report_in_browser(path)
+            self.assertTrue(path.is_file())
 
 
 class InputMainTests(unittest.TestCase):
@@ -546,15 +622,13 @@ class InputMainTests(unittest.TestCase):
                 patch.object(ce, "print_rich_report"),
                 patch.object(ce, "render_ioc_report"),
                 patch.object(ce, "render_associations_report"),
-                patch.object(ce, "render_html_report"),
+                patch.object(ce, "render_html_report", side_effect=_write_primary_report),
                 patch.object(ce, "open_report_in_browser") as open_browser,
-                patch.object(ce, "select_report_to_open") as select_report,
             ):
                 exit_code = ce.main(["--input", cve, "--html", str(html)])
 
         self.assertEqual(exit_code, 0)
-        open_browser.assert_called_once_with(html)
-        select_report.assert_not_called()
+        open_browser.assert_called_once_with(html.resolve())
 
     def test_multiple_cves_write_individual_reports_and_select_in_input_order(self) -> None:
         cves = ["CVE-2026-12345", "CVE-2026-56789", "CVE-2026-09876"]
@@ -571,16 +645,16 @@ class InputMainTests(unittest.TestCase):
             primary_text: list[str] = []
             ioc_text: list[str] = []
             associations_text: list[str] = []
-            selections = iter(["8", "abc", "2", "3", ""])
 
             def review_reports(prompt: str) -> str:
                 self.assertIn("remove generated HTML reports", prompt)
+                self.assertNotIn("Select a report", prompt)
                 primary_text[:] = [path.read_text(encoding="utf-8") for path in expected_primary]
                 ioc_text[:] = [path.read_text(encoding="utf-8") for path in expected_ioc]
                 associations_text[:] = [
                     path.read_text(encoding="utf-8") for path in expected_associations
                 ]
-                return next(selections)
+                return ""
 
             with (
                 patch.object(ce, "load_project_dotenv", return_value=None),
@@ -608,10 +682,10 @@ class InputMainTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             [call.args[0] for call in open_browser.call_args_list],
-            [expected_primary[0], expected_primary[1], expected_primary[2]],
+            [path.resolve() for path in expected_primary],
         )
-        self.assertIn("Available CVE reports:", output.getvalue())
-        self.assertEqual(output.getvalue().count("Invalid selection."), 2)
+        self.assertIn("Opening 3 CVE report(s) in separate browser tabs:", output.getvalue())
+        self.assertNotIn("Invalid selection", output.getvalue())
         for index, cve in enumerate(cves):
             self.assertTrue(expected_primary[index].name.endswith("_report.html"))
             self.assertTrue(expected_ioc[index].name.endswith("_iocs.html"))
@@ -625,6 +699,44 @@ class InputMainTests(unittest.TestCase):
             self.assertIn(cve, ioc_text[index])
             self.assertIn(f'href="{cve}_report.html"', ioc_text[index])
             self.assertIn(cve, associations_text[index])
+            self.assertIn('class="score-compare"', primary_text[index])
+            self.assertIn(f'href="{cve}_associations.html#{cve}"', primary_text[index])
+
+    def test_failed_lookup_in_a_batch_does_not_open_a_tab(self) -> None:
+        success = "CVE-2026-12345"
+        failed = "CVE-2026-56789"
+        records = [
+            _success_record(success),
+            ce.error_record(failed, "not_found", "Vulnerability not found"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            html = root / "report.html"
+            source = root / "input.csv"
+            source.write_text(f"CVE\n{success}\n{failed}\n", encoding="utf-8")
+            with (
+                patch.object(ce, "load_project_dotenv", return_value=None),
+                patch.object(ce, "resolve_api_key", return_value="test-api-key"),
+                patch.object(ce, "build_proxies", return_value=None),
+                patch.object(ce, "resolve_ssl_verify", return_value=True),
+                patch.object(ce, "resolve_request_delay", return_value=0.0),
+                patch.object(ce, "GTIClient", return_value=object()),
+                patch.object(ce, "enrich_cves", return_value=records),
+                patch.object(ce, "write_csv"),
+                patch.object(ce, "print_rich_report"),
+                patch.object(ce, "open_report_in_browser") as open_browser,
+                redirect_stdout(io.StringIO()),
+            ):
+                exit_code = ce.main(["-i", str(source), "--html", str(html), "--no-rich"])
+
+            success_report = root / f"{success}_report.html"
+            failed_report = root / f"{failed}_report.html"
+            self.assertTrue(success_report.is_file())
+            self.assertTrue(failed_report.is_file())
+            self.assertIn(failed, failed_report.read_text(encoding="utf-8"))
+            open_browser.assert_called_once_with(success_report.resolve())
+
+        self.assertEqual(exit_code, 0)
 
     def test_cve_propagates_into_generated_html(self) -> None:
         cve = "CVE-2026-12345"

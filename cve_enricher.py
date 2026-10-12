@@ -43,9 +43,9 @@ HTML report
 Single-CVE runs write the primary HTML report (default ``report.html``) and
 companion IOC report (default ``ioc_report.html``). Multi-CVE runs write one
 ``CVE-..._report.html`` / ``CVE-..._iocs.html`` / ``CVE-..._associations.html``
-report set per input record, open the
-first primary report automatically, and offer a lightweight numbered selector
-for additional reports. Failure reports include a prominent error section.
+report set per input record and open every successful primary report in its
+own browser tab, in input order. Failure reports include a prominent error
+section and remain available for manual review without opening extra tabs.
 Reports remain available until Enter confirms exit and cleanup; EOF or Ctrl+C
 leaves them on disk.
 
@@ -58,13 +58,6 @@ all consume those records; report rendering never repeats an enrichment query.
 
 from __future__ import annotations
 
-# --- Standard library ---
-# argparse: CLI surface for operators who prefer flags over editing .env
-# csv / html / json: input parsing and report serialization
-# logging: operational visibility without printing secrets
-# os / subprocess / webbrowser: env access and reliable browser open on Windows
-# random / time: jittered backoff so concurrent clients do not thundering-herd the API
-# traceback: captured into the HTML failure banner so SSL/proxy issues are visible offline
 import argparse
 import csv
 import html
@@ -75,49 +68,37 @@ import os
 import posixpath
 import random
 import re
-import subprocess
 import sys
 import time
 import traceback
 import urllib.parse
 import webbrowser
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Optional, Union
 
-# --- Third party ---
-# requests: HTTP client; verify= path-or-True supports corporate MITM CAs
-# dotenv: load project .env so PowerShell session variables are not required
-# rich: progress bars and color cards on the terminal (stderr for logs)
 import requests
 from dotenv import load_dotenv
 from rich import box
 from rich.console import Console, Group
 from rich.logging import RichHandler
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
 from priority_scoring import (
-    ACTIVE_EXPLOITATION_WEIGHT,
-    EXPLOIT_AUTOMATABILITY_WEIGHT,
-    EXPLOIT_MATURITY_WEIGHT,
-    EXPLOITATION_PROBABILITY_WEIGHT,
-    SEVERITY_WEIGHT,
     PriorityAssessment,
-    calculate_active_exploitation,
-    calculate_exploit_automatability,
-    calculate_exploit_maturity,
-    calculate_exploitation_probability,
     calculate_internal_priority,
-    calculate_vulnerability_severity,
-    classify_priority,
     normalize_evidence_flag,
-    normalize_epss_percentile,
-    normalize_exploit_maturity,
-    parse_cvss_vector,
 )
 
 # ---------------------------------------------------------------------------
@@ -157,6 +138,8 @@ MAX_IOC_PAGES = MAX_RELATIONSHIP_PAGES
 
 # Canonical CVE ID shape used for validation after normalization.
 CVE_PATTERN = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+# Mandiant Vulnerability Explorer alias. Reports identify the CVE only.
+MVE_ID_PATTERN = re.compile(r"\bMVE-\d{4}-\d+\b", re.IGNORECASE)
 
 # Official Exploitation State labels and numeric levels (GTI docs).
 # Missing / unrecognized API values display as "Unknown" — never coerced to "No Known".
@@ -256,30 +239,11 @@ RELEVANT_ASSOCIATION_TYPES = frozenset(
     }
 )
 
-# ATT&CK stage names always come from VirusTotal objects. This map controls
-# display ordering only for recognized Enterprise ATT&CK tactic identifiers;
-# it never creates a stage. Mobile/ICS/unknown tactics retain API order.
-MITRE_ENTERPRISE_TACTIC_ORDER: dict[str, int] = {
-    tactic_id: index
-    for index, tactic_id in enumerate(
-        (
-            "TA0043",  # Reconnaissance
-            "TA0042",  # Resource Development
-            "TA0001",  # Initial Access
-            "TA0002",  # Execution
-            "TA0003",  # Persistence
-            "TA0004",  # Privilege Escalation
-            "TA0005",  # Defense Evasion
-            "TA0006",  # Credential Access
-            "TA0007",  # Discovery
-            "TA0008",  # Lateral Movement
-            "TA0009",  # Collection
-            "TA0011",  # Command and Control
-            "TA0010",  # Exfiltration
-            "TA0040",  # Impact
-        )
-    )
-}
+# GTI's Vulnerability API ``priority`` attribute is a remediation flag or, on
+# some responses, an explicit P-rating. Only an explicit P0–P4 token is shown
+# as GTI prioritization. The internal VRS is never substituted for it.
+GTI_PRIORITY_PATTERN = re.compile(r"^P[0-4]$", re.IGNORECASE)
+ATTACK_TECHNIQUE_ID_PATTERN = re.compile(r"^T\d{4}(?:\.\d{3})?$", re.IGNORECASE)
 
 # Fallback delay; actual value is resolved after .env load (see resolve_request_delay).
 DEFAULT_DELAY = 1.0
@@ -553,11 +517,21 @@ class AssociationEntity:
     references: list[dict[str, str]] = field(default_factory=list)
     vt_url: str = ""
     context: str = ""
+    # ``associated`` or ``reported_exploitation``. The latter is set only when
+    # GTI relationship context explicitly describes exploitation.
+    association_basis: str = "associated"
+    related_actors: list[str] = field(default_factory=list)
+    related_techniques: list[str] = field(default_factory=list)
 
 
 @dataclass
 class AttackTechnique:
-    """VirusTotal-associated MITRE ATT&CK technique (the requested Tcode)."""
+    """VirusTotal-associated MITRE ATT&CK technique.
+
+    ``scope`` distinguishes a vulnerability-level ``attack_techniques``
+    relationship from a technique documented only on an associated actor or
+    campaign. Missing IDs stay blank; they are never inferred from CWE.
+    """
 
     technique_id: str
     name: str
@@ -566,19 +540,9 @@ class AttackTechnique:
     link: str = ""
     sources: list[str] = field(default_factory=list)
     tactics: list[dict[str, str]] = field(default_factory=list)
-
-
-@dataclass
-class AttackChainStage:
-    """Analytical tactic placement backed by direct VirusTotal technique data."""
-
-    stage_id: str
-    stage: str
-    techniques: list[AttackTechnique] = field(default_factory=list)
-    evidence_type: str = "Analytical Mapping"
-    confidence: str = "Mapped — not observed chronology"
-    evidence: list[str] = field(default_factory=list)
-    notes: str = ""
+    scope: str = "vulnerability"
+    scope_name: str = ""
+    context: str = ""
 
 
 @dataclass
@@ -694,7 +658,7 @@ class CVERecord:
     ioc_domains: list[dict[str, str]] = field(default_factory=list)
     ioc_ip_addresses: list[dict[str, str]] = field(default_factory=list)
 
-    # Direct GTI threat-object associations plus ATT&CK-derived chain mapping.
+    # Direct GTI threat-object associations and ATT&CK techniques.
     # These fields are deliberately excluded from CSV; they belong to the
     # separate analyst-oriented Associations report.
     association_status: str = "not_returned"
@@ -703,8 +667,6 @@ class CVERecord:
     campaigns: list[AssociationEntity] = field(default_factory=list)
     supporting_intelligence: list[AssociationEntity] = field(default_factory=list)
     attack_techniques: list[AttackTechnique] = field(default_factory=list)
-    attack_chain: list[AttackChainStage] = field(default_factory=list)
-    attack_chain_note: str = ""
 
     # Truncated JSON bag for advanced consumers (SIEM, custom parsers)
     extra_json: str = ""
@@ -805,8 +767,30 @@ def setup_logging(verbose: bool = False) -> None:
         level=level,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(console=log_console, rich_tracebacks=True, show_path=False)],
+        handlers=[
+            RichHandler(
+                console=log_console,
+                rich_tracebacks=True,
+                show_path=False,
+                # Locals can hold the API key or proxy URL (CWE-532).
+                tracebacks_show_locals=False,
+            )
+        ],
     )
+
+
+def strip_mve_ids(value: str) -> str:
+    """Remove Mandiant MVE identifiers from analyst-facing text.
+
+    GTI objects sometimes echo an MVE alias next to the CVE. This tool's
+    reports, CSV, and HTML use the CVE as the only vulnerability identifier.
+    """
+    if not value or "mve-" not in value.casefold():
+        return value
+    cleaned = MVE_ID_PATTERN.sub("", value)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+    return cleaned.strip(" \t-;,")
 
 
 def na(value: Any, default: str = "N/A") -> str:
@@ -823,11 +807,13 @@ def na(value: Any, default: str = "N/A") -> str:
     if isinstance(value, (list, tuple)):
         if not value:
             return default
-        return "; ".join(str(v) for v in value if v is not None and str(v).strip() != "")
+        joined = "; ".join(str(v) for v in value if v is not None and str(v).strip() != "")
+        cleaned = strip_mve_ids(joined)
+        return cleaned if cleaned else default
     if isinstance(value, float):
         # Enough precision for EPSS/CVSS without scientific notation noise
         return f"{value:.6f}".rstrip("0").rstrip(".") if value != 0 else "0"
-    text = str(value).strip()
+    text = strip_mve_ids(str(value).strip())
     return text if text else default
 
 
@@ -865,10 +851,9 @@ def normalize_cve(raw: str) -> Optional[str]:
     cleaned = raw.strip().upper().replace(" ", "")
     # Tolerate underscore separators from some export tools
     cleaned = cleaned.replace("_", "-")
-    if not cleaned.startswith("CVE-"):
-        # Accept bare "2024-3400" and promote to CVE-YYYY-NNNN
-        if re.match(r"^\d{4}-\d{4,}$", cleaned):
-            cleaned = f"CVE-{cleaned}"
+    # Accept bare "2024-3400" and promote to CVE-YYYY-NNNN.
+    if not cleaned.startswith("CVE-") and re.match(r"^\d{4}-\d{4,}$", cleaned):
+        cleaned = f"CVE-{cleaned}"
     if not CVE_PATTERN.match(cleaned):
         return None
     return cleaned
@@ -903,12 +888,43 @@ _ASSIGNED_SECRET_RE = re.compile(
 )
 
 
-def redact_secrets(text: str) -> str:
+def sensitive_fragments(
+    api_key: Optional[str] = None,
+    proxies: Optional[dict[str, str]] = None,
+) -> tuple[str, ...]:
+    """Collect secret literals that logs and HTML must not echo (CWE-532).
+
+    The proxy userinfo regex covers the common ``user:pass@`` form. These
+    extra literals catch the same key or password when an exception prints
+    it outside that pattern. Short strings are ignored so redaction cannot
+    blank ordinary words.
+    """
+    found: list[str] = []
+
+    def add(value: Optional[str], minimum: int) -> None:
+        text = (value or "").strip()
+        if len(text) >= minimum and text not in found:
+            found.append(text)
+
+    add(api_key, 8)
+    for url in (proxies or {}).values():
+        add(url, 12)
+        match = _PROXY_CREDS_RE.search(url or "")
+        if match:
+            add(match.group(2), 4)
+    return tuple(found)
+
+
+def redact_secrets(text: str, extra: Iterable[str] = ()) -> str:
     """Strip proxy passwords and API-key-like assignments from log/HTML text."""
     if not text:
         return text
     redacted = _PROXY_CREDS_RE.sub(r"\1:***@", text)
-    return _ASSIGNED_SECRET_RE.sub(r"\1=***", redacted)
+    redacted = _ASSIGNED_SECRET_RE.sub(r"\1=***", redacted)
+    for secret in extra:
+        if secret and secret in redacted:
+            redacted = redacted.replace(secret, "***")
+    return redacted
 
 
 def _safe_child_path(directory: Path, filename: str) -> Path:
@@ -1292,7 +1308,7 @@ def exploitation_debug_snapshot(attrs: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(v, (dict, list))
         ],
         "attr_keys_matching_exploit": sorted(
-            k for k in attrs.keys() if "exploit" in str(k).lower() or "wild" in str(k).lower()
+            k for k in attrs if "exploit" in str(k).lower() or "wild" in str(k).lower()
         ),
     }
     return snap
@@ -1625,6 +1641,78 @@ def _association_references(attrs: dict[str, Any]) -> list[dict[str, str]]:
     return result
 
 
+def _explicit_technique_ids(value: Any) -> list[str]:
+    """Return MITRE technique IDs that an object itself supplies.
+
+    Descriptions and CWE categories are not mapped to technique IDs.
+    """
+    items = [value] if isinstance(value, str) else value
+    if not isinstance(items, list):
+        return []
+    result: list[str] = []
+    for item in items:
+        raw = item.get("id") if isinstance(item, dict) else item
+        if not isinstance(raw, str):
+            continue
+        technique_id = raw.strip().upper()
+        if ATTACK_TECHNIQUE_ID_PATTERN.fullmatch(technique_id):
+            result.append(technique_id)
+    return list(dict.fromkeys(result))
+
+
+def _explicit_actor_references(value: Any) -> list[str]:
+    """Return actor names or object IDs explicitly present on a campaign."""
+    items = [value] if isinstance(value, str) else value
+    if not isinstance(items, list):
+        return []
+    result: list[str] = []
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            result.append(item.strip())
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("id") or "").strip()
+            if name:
+                result.append(name)
+    return list(dict.fromkeys(result))
+
+
+def _association_basis(context_attributes: dict[str, Any]) -> tuple[str, str]:
+    """Classify relationship context without treating co-association as exploitation."""
+    statements: list[str] = []
+    for key in ("relationship", "relationship_type", "association_type", "description", "confidence"):
+        value = context_attributes.get(key)
+        if isinstance(value, str) and value.strip():
+            statements.append(value.strip())
+        elif isinstance(value, dict):
+            label = value.get("value") or value.get("name") or value.get("description")
+            if isinstance(label, str) and label.strip():
+                statements.append(label.strip())
+    detail = "; ".join(dict.fromkeys(statements))
+    folded = detail.casefold()
+    negated = re.search(r"\b(?:no|not|without)\b[\w\s]{0,24}\bexploit", folded)
+    explicit = re.search(r"\b(?:exploited|exploits|exploitation)\b", folded)
+    if explicit and not negated:
+        return "reported_exploitation", detail
+    return "associated", detail
+
+
+def _related_actor_references(context_attributes: dict[str, Any]) -> list[str]:
+    """Collect actor names or IDs that GTI places on this relationship."""
+    result: list[str] = []
+    related = context_attributes.get("related_from")
+    if isinstance(related, list):
+        for item in related:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("type") or item.get("collection_type") or "").replace("_", "-").lower()
+            if "threat-actor" not in kind and not str(item.get("id") or "").lower().startswith("threat-actor--"):
+                continue
+            label = str(item.get("name") or item.get("id") or "").strip()
+            if label:
+                result.append(label)
+    return list(dict.fromkeys(result))
+
+
 def _association_classifications(attrs: dict[str, Any]) -> list[str]:
     """Collect concise documented classification/context values when present."""
     result: list[str] = []
@@ -1703,7 +1791,7 @@ def parse_associations(payload: Optional[dict[str, Any]]) -> dict[str, list[Asso
             if isinstance(obj.get("context_attributes"), dict)
             else {}
         )
-        context = ""
+        context_parts: list[str] = []
         if context_attributes:
             # Keep provenance useful without dumping arbitrary raw JSON.
             related_from = context_attributes.get("related_from")
@@ -1713,7 +1801,24 @@ def parse_associations(payload: Optional[dict[str, Any]]) -> dict[str, list[Asso
                     for item in related_from
                     if isinstance(item, dict) and item.get("id")
                 ]
-                context = ", ".join(descriptors)
+                if descriptors:
+                    context_parts.append(", ".join(descriptors))
+        basis, basis_detail = _association_basis(context_attributes)
+        if basis_detail:
+            context_parts.append(basis_detail)
+        related_actors = list(
+            dict.fromkeys(
+                _explicit_actor_references(attrs.get("threat_actors"))
+                + _explicit_actor_references(attrs.get("associated_threat_actors"))
+                + _related_actor_references(context_attributes)
+            )
+        )
+        related_techniques = list(
+            dict.fromkeys(
+                _explicit_technique_ids(attrs.get("attack_techniques"))
+                + _explicit_technique_ids(attrs.get("mitre_techniques"))
+            )
+        )
 
         entity = AssociationEntity(
             entity_id=entity_id,
@@ -1743,7 +1848,10 @@ def parse_associations(payload: Optional[dict[str, Any]]) -> dict[str, list[Asso
             classifications=_association_classifications(attrs),
             references=_association_references(attrs),
             vt_url=str(links.get("self") or "").strip(),
-            context=context,
+            context="; ".join(context_parts),
+            association_basis=basis,
+            related_actors=related_actors,
+            related_techniques=related_techniques,
         )
         if entity_type == "threat-actor":
             groups["threat_actors"].append(entity)
@@ -1755,30 +1863,57 @@ def parse_associations(payload: Optional[dict[str, Any]]) -> dict[str, list[Asso
 
 
 def parse_attack_techniques(payload: Optional[dict[str, Any]]) -> list[AttackTechnique]:
-    """Normalize VirusTotal ATT&CK technique objects; IDs are the Tcodes."""
+    """Normalize VirusTotal ATT&CK technique objects.
+
+    A technique ID is kept only when GTI supplies a MITRE-shaped identifier.
+    Objects that have a name or description but no ID are retained with a
+    blank ID so the report can show that the identifier was not supplied.
+    """
     if not isinstance(payload, dict):
         raise ValueError("attack_techniques response is not an object")
     rows = payload.get("data")
     if not isinstance(rows, list):
         raise ValueError("attack_techniques response has no data list")
     result: list[AttackTechnique] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str]] = set()
     for obj in rows:
         if not isinstance(obj, dict) or obj.get("error"):
             continue
-        technique_id = str(obj.get("id") or "").strip().upper()
-        if not re.fullmatch(r"T\d{4}(?:\.\d{3})?", technique_id) or technique_id in seen:
-            continue
-        seen.add(technique_id)
+        raw_id = str(obj.get("id") or "").strip()
+        technique_id = raw_id.upper() if ATTACK_TECHNIQUE_ID_PATTERN.fullmatch(raw_id) else ""
         attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
-        context = obj.get("context_attributes") if isinstance(obj.get("context_attributes"), dict) else {}
+        name = str(attrs.get("name") or "").strip()
+        description = str(attrs.get("description") or "").strip()
+        if not technique_id and not name and not description:
+            continue
+        identity = (technique_id, name.casefold(), description.casefold())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        context_attributes = (
+            obj.get("context_attributes") if isinstance(obj.get("context_attributes"), dict) else {}
+        )
+        if technique_id:
+            context = (
+                "Vulnerability-level association returned by Google Threat Intelligence. "
+                "This records the CVE relationship and is not an inferred attack step."
+            )
+        else:
+            context = (
+                "GTI returned technique text without a MITRE ATT&CK technique ID. "
+                "No identifier was inferred from the description or from the CVE category."
+            )
+            if raw_id:
+                context += f" Returned identifier: {raw_id}."
         result.append(
             AttackTechnique(
                 technique_id=technique_id,
-                name=str(attrs.get("name") or technique_id).strip(),
-                description=str(attrs.get("description") or "").strip(),
+                name=name,
+                description=description,
                 link=str(attrs.get("link") or "").strip(),
-                sources=_string_list(context.get("source")) + _string_list(attrs.get("source")),
+                sources=_string_list(context_attributes.get("source")) + _string_list(attrs.get("source")),
+                scope="vulnerability",
+                context=context,
             )
         )
     return result
@@ -1812,66 +1947,58 @@ def parse_attack_tactics(payload: Optional[dict[str, Any]]) -> list[dict[str, st
     return result
 
 
-def build_attack_chain(techniques: list[AttackTechnique]) -> tuple[list[AttackChainStage], str]:
-    """Map direct CVE Tcodes into VirusTotal-returned ATT&CK tactics.
+def _techniques_from_entities(
+    entities: list[AssociationEntity],
+    scope: str,
+) -> list[AttackTechnique]:
+    """Surface technique IDs explicitly attached to an actor or campaign.
 
-    Tactic grouping is observed data; ordering across recognized Enterprise
-    tactics is analytical. The representation intentionally does not attach
-    CVE-level actors, campaigns, malware, tools, or IOCs to an individual
-    technique because the vulnerability relationships do not prove that edge.
+    These rows stay labeled as actor- or campaign-level. Sharing a CVE with
+    an actor is not treated as confirmation that the actor used the technique
+    against that CVE.
     """
-    grouped: dict[str, AttackChainStage] = {}
-    order_seen: dict[str, int] = {}
-    unplaced: list[str] = []
-    for technique in techniques:
-        if not technique.tactics:
-            unplaced.append(technique.technique_id)
-            continue
-        for tactic in technique.tactics:
-            tactic_id = tactic.get("id", "")
-            if not tactic_id:
+    result: list[AttackTechnique] = []
+    seen: set[tuple[str, str, str]] = set()
+    scope_label = "threat actor" if scope == "threat-actor" else "campaign"
+    for entity in entities:
+        for technique_id in entity.related_techniques:
+            key = (technique_id, scope, entity.entity_id)
+            if key in seen:
                 continue
-            if tactic_id not in grouped:
-                order_seen[tactic_id] = len(order_seen)
-                grouped[tactic_id] = AttackChainStage(
-                    stage_id=tactic_id,
-                    stage=tactic.get("name") or tactic_id,
-                    notes=(
-                        "Stage placement uses VirusTotal's technique-to-tactic relationship. "
-                        "The displayed sequence is ATT&CK lifecycle ordering, not an observed "
-                        "chronology for this vulnerability."
+            seen.add(key)
+            result.append(
+                AttackTechnique(
+                    technique_id=technique_id,
+                    name="",
+                    relationship=entity.relationship,
+                    scope=scope,
+                    scope_name=entity.name,
+                    context=(
+                        f"Documented for associated {scope_label} {entity.name}. "
+                        "Not confirmed as a technique used to exploit this CVE unless "
+                        "the vulnerability attack_techniques relationship also returns it."
                     ),
+                    sources=[entity.origin] if entity.origin else [],
                 )
-            stage = grouped[tactic_id]
-            if all(existing.technique_id != technique.technique_id for existing in stage.techniques):
-                stage.techniques.append(technique)
-                stage.evidence.append(
-                    f"VirusTotal directly associates {technique.technique_id} with the CVE; "
-                    f"VirusTotal maps it to {tactic_id}."
-                )
+            )
+    return result
 
-    stages = list(grouped.values())
-    stages.sort(
-        key=lambda stage: (
-            0 if stage.stage_id in MITRE_ENTERPRISE_TACTIC_ORDER else 1,
-            MITRE_ENTERPRISE_TACTIC_ORDER.get(stage.stage_id, order_seen[stage.stage_id]),
-        )
-    )
-    if not stages:
-        return (
-            [],
-            "Insufficient VirusTotal intelligence is available to construct a defensible "
-            "attack chain for this vulnerability.",
-        )
-    note = (
-        "This is an ATT&CK-aligned analytical mapping of VirusTotal-associated techniques, "
-        "not an observed intrusion chronology. Actors, campaigns, malware, tools, and IOCs "
-        "shown elsewhere are CVE-level context and are not attributed to a stage without a "
-        "direct VirusTotal relationship."
-    )
-    if unplaced:
-        note += " Tactic placement was unavailable for: " + ", ".join(unplaced) + "."
-    return stages, note
+
+def _append_unique_techniques(
+    destination: list[AttackTechnique],
+    additions: list[AttackTechnique],
+) -> None:
+    """Keep distinct scopes and drop only identical technique rows."""
+    seen = {
+        (item.technique_id, item.scope, item.scope_name.casefold(), item.name.casefold())
+        for item in destination
+    }
+    for item in additions:
+        key = (item.technique_id, item.scope, item.scope_name.casefold(), item.name.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        destination.append(item)
 
 
 def attach_associations(client: "GTIClient", rec: CVERecord) -> None:
@@ -1913,11 +2040,29 @@ def attach_associations(client: "GTIClient", rec: CVERecord) -> None:
         except (TypeError, ValueError) as exc:
             failures.append(f"attack_techniques: response parsing failed ({exc})")
 
+    _append_unique_techniques(
+        rec.attack_techniques,
+        _techniques_from_entities(rec.threat_actors, "threat-actor"),
+    )
+    _append_unique_techniques(
+        rec.attack_techniques,
+        _techniques_from_entities(rec.campaigns, "campaign"),
+    )
+
+    tactic_cache: dict[str, Optional[list[dict[str, str]]]] = {}
     for technique in rec.attack_techniques:
+        if not technique.technique_id:
+            continue
+        if technique.technique_id in tactic_cache:
+            cached = tactic_cache[technique.technique_id]
+            if cached is not None:
+                technique.tactics = list(cached)
+            continue
         tactic_body, tactic_err, tactic_status = client.get_attack_technique_tactics(
             technique.technique_id
         )
         if tactic_err or not isinstance(tactic_body, dict):
+            tactic_cache[technique.technique_id] = None
             failures.append(
                 f"{technique.technique_id}/attack_tactics: request failed "
                 f"(HTTP {tactic_status or 'n/a'}, {tactic_err or 'error'})"
@@ -1925,13 +2070,14 @@ def attach_associations(client: "GTIClient", rec: CVERecord) -> None:
             continue
         try:
             technique.tactics = parse_attack_tactics(tactic_body)
+            tactic_cache[technique.technique_id] = technique.tactics
             pagination_error = str(tactic_body.get("_pagination_error") or "").strip()
             if pagination_error:
                 failures.append(f"{technique.technique_id}/attack_tactics: {pagination_error}")
         except (TypeError, ValueError) as exc:
+            tactic_cache[technique.technique_id] = None
             failures.append(f"{technique.technique_id}/attack_tactics: parsing failed ({exc})")
 
-    rec.attack_chain, rec.attack_chain_note = build_attack_chain(rec.attack_techniques)
     has_data = bool(
         rec.threat_actors
         or rec.campaigns
@@ -2193,6 +2339,8 @@ class GTIClient:
             self.session.proxies.update(proxies)
         # True = certifi/system trust; str path = corporate root CA for MITM inspection
         self.session.verify = verify
+        # Held only to redact later exception text. Never logged or written to HTML.
+        self._sensitive = sensitive_fragments(api_key, proxies)
         logging.info("TLS verification: %s", describe_ssl_verify(verify))
 
     def _throttle(self) -> None:
@@ -2291,7 +2439,7 @@ class GTIClient:
                     error_kind = "timeout"
                 else:
                     error_kind = "network_error"
-                detail = redact_secrets(str(exc))
+                detail = redact_secrets(str(exc), self._sensitive)
                 if attempt >= self.max_retries:
                     logging.error(
                         "Network error for %s after %d attempt(s): %s",
@@ -2948,7 +3096,8 @@ def extract_record(cve: str, payload: dict[str, Any]) -> CVERecord:
         "ioc_status": ioc_status,
     }
     try:
-        rec.extra_json = json.dumps(extra, default=str)[:4000]
+        # Strip MVE tokens before the length cap so a cut cannot leave a partial ID.
+        rec.extra_json = strip_mve_ids(json.dumps(extra, default=str))[:4000]
     except (TypeError, ValueError):
         rec.extra_json = ""
 
@@ -3230,8 +3379,12 @@ def _html_risk_class(risk_or_priority: str) -> str:
 
 
 def _html_escape(value: str) -> str:
-    """Escape text for safe embedding in HTML attributes and body content."""
-    return html.escape(value or "", quote=True)
+    """Escape text for safe embedding in HTML attributes and body content.
+
+    MVE aliases are removed first so an identifier cannot survive inside an
+    attribute or text node (CWE-79 still requires escaping the remainder).
+    """
+    return html.escape(strip_mve_ids(value or ""), quote=True)
 
 
 def _ioc_anchor_id(cve: str) -> str:
@@ -3425,35 +3578,104 @@ def _html_priority_svg(rec: CVERecord) -> str:
 """
 
 
-def _html_internal_priority_breakdown(rec: CVERecord) -> str:
-    """Render the auditable five-criterion internal score calculation."""
-    pri_cls = _html_risk_class(rec.priority_rating)
+def gti_priority_display(raw: str) -> str:
+    """Return a native P0–P4 token, or ``Not available`` when GTI did not supply one.
+
+    Boolean remediation flags and the internal VRS rating are not converted
+    into a GTI priority.
+    """
+    text = (raw or "").strip().upper()
+    if GTI_PRIORITY_PATTERN.fullmatch(text):
+        return text
+    return "Not available"
+
+
+def _vrs_meaning(rating: str) -> str:
+    """Describe the existing internal classification without changing its thresholds."""
+    return {
+        "P0": "Internal priority P0: the VRS is 90 or higher on the 0–100 scale.",
+        "P1": "Internal priority P1: the VRS is 70–89 on the 0–100 scale.",
+        "P2": "Internal priority P2: the VRS is 50–69 on the 0–100 scale.",
+        "P3": "Internal priority P3: the VRS is below 50 on the 0–100 scale.",
+    }.get(rating, "Internal 0–100 Vulnerability Risk Score calculated by this application.")
+
+
+def _gti_priority_context(rec: CVERecord) -> str:
+    """List GTI fields that inform prioritization without recomputing a P-rating."""
+    raw = (rec.vt_priority_raw or "N/A").strip() or "N/A"
+    if raw.lower() in {"true", "false"}:
+        flag = "Yes" if raw.lower() == "true" else "No"
+        api_line = f"Remediation priority flag: {flag}"
+    elif gti_priority_display(raw) == "Not available":
+        api_line = "API priority field: Not available" if raw in {"N/A", ""} else f"API priority field: {raw}"
+    else:
+        api_line = f"API priority field: {gti_priority_display(raw)}"
+    rows = (
+        api_line,
+        f"Risk rating: {rec.risk_rating}",
+        f"Predicted risk rating: {rec.predicted_risk_rating}",
+        f"Exploitation state: {rec.exploitation_state}",
+        f"Exploit availability: {rec.exploit_availability}",
+    )
+    return "".join(f"<li>{_html_escape(row)}</li>" for row in rows)
+
+
+def _html_vrs_breakdown(rec: CVERecord) -> str:
+    """Render the existing five-criterion breakdown. Presentation only."""
     maturity_label = {
         "NONE": "None",
         "POC": "Proof of Concept / PoC",
         "PUBLIC_OR_ATTACKED": "Public or Attacked",
     }.get(rec.exploit_maturity_normalized, rec.exploit_maturity_normalized)
     return f"""
-  <section class="priority-breakdown" aria-label="Internal priority score breakdown">
-    <div class="priority-viz-head">
-      <h3>Internal Priority Score</h3>
-      <span class="badge badge-{pri_cls} badge-lg">{_html_escape(rec.priority_rating)}</span>
-    </div>
-    <p class="priority-viz-caption">Deterministic application score. VirusTotal's native priority field is not used.</p>
-    <div class="score-total">{_format_points(rec.priority_score)} <span>/ 100</span></div>
-    <div class="score-table-wrap">
-      <table class="score-table">
-        <thead><tr><th>Criterion</th><th>Normalized input</th><th>Score</th></tr></thead>
-        <tbody>
-          <tr><td>Vulnerability Severity</td><td>{_html_escape(rec.vulnerability_severity_value)}</td><td>{_format_points(rec.vulnerability_severity_score)} / 40</td></tr>
-          <tr><td>Active Exploitation</td><td>{_html_escape(rec.active_exploitation)} — {_html_escape(rec.active_exploitation_sources)}</td><td>{_format_points(rec.active_exploitation_score)} / 25</td></tr>
-          <tr><td>Exploitation Probability</td><td>{_html_escape(rec.exploitation_probability_value)}</td><td>{_format_points(rec.exploitation_probability_score)} / 15</td></tr>
-          <tr><td>Exploit Maturity</td><td>{_html_escape(maturity_label)} — {_html_escape(rec.exploit_maturity_source)}</td><td>{_format_points(rec.exploit_maturity_score)} / 10</td></tr>
-          <tr><td>Exploit Automatability</td><td>{_html_escape(rec.exploit_automatability)} — {_html_escape(rec.exploit_automatability_source)}</td><td>{_format_points(rec.exploit_automatability_score)} / 10</td></tr>
-        </tbody>
-        <tfoot><tr><th>Total Internal Priority Score</th><th>Priority Rating: {_html_escape(rec.priority_rating)}</th><th>{_format_points(rec.priority_score)} / 100</th></tr></tfoot>
-      </table>
-    </div>
+    <details class="vrs-breakdown">
+      <summary>View VRS Scoring Breakdown</summary>
+      <div class="score-table-wrap">
+        <table class="score-table">
+          <thead><tr><th>Criterion</th><th>Normalized input</th><th>Score</th></tr></thead>
+          <tbody>
+            <tr><td>Vulnerability Severity</td><td>{_html_escape(rec.vulnerability_severity_value)} — {_html_escape(rec.vulnerability_severity_cvss_version)}</td><td>{_format_points(rec.vulnerability_severity_score)} / 40</td></tr>
+            <tr><td>Active Exploitation</td><td>{_html_escape(rec.active_exploitation)} — {_html_escape(rec.active_exploitation_sources)}</td><td>{_format_points(rec.active_exploitation_score)} / 25</td></tr>
+            <tr><td>Exploitation Probability</td><td>{_html_escape(rec.exploitation_probability_value)}</td><td>{_format_points(rec.exploitation_probability_score)} / 15</td></tr>
+            <tr><td>Exploit Maturity</td><td>{_html_escape(maturity_label)} — {_html_escape(rec.exploit_maturity_source)}</td><td>{_format_points(rec.exploit_maturity_score)} / 10</td></tr>
+            <tr><td>Exploit Automatability</td><td>{_html_escape(rec.exploit_automatability)} — {_html_escape(rec.exploit_automatability_source)}</td><td>{_format_points(rec.exploit_automatability_score)} / 10</td></tr>
+          </tbody>
+          <tfoot><tr><th>Total Vulnerability Risk Score</th><th>Internal priority: {_html_escape(rec.priority_rating)}</th><th>{_format_points(rec.priority_score)} / 100</th></tr></tfoot>
+        </table>
+      </div>
+    </details>
+"""
+
+
+def _html_score_comparison(rec: CVERecord) -> str:
+    """Place the internal VRS beside GTI's native priority without merging them."""
+    pri_cls = _html_risk_class(rec.priority_rating)
+    gti_priority = gti_priority_display(rec.vt_priority_raw)
+    if gti_priority == "Not available":
+        gti_meaning = (
+            "GTI did not return a P0–P4 priority rating for this CVE. "
+            "The remediation flag and context below are shown as returned."
+        )
+    else:
+        gti_meaning = "Native priority value returned by Google Threat Intelligence."
+    return f"""
+  <section class="score-compare" aria-label="Internal Vulnerability Risk Score and GTI prioritization">
+    <article class="score-card score-vrs">
+      <h3>Internal Vulnerability Risk Score</h3>
+      <p class="score-source">Application VRS. Independent of Google Threat Intelligence prioritization.</p>
+      <div class="score-total">{_format_points(rec.priority_score)} <span>/ 100</span></div>
+      <p class="score-rating">Internal priority: <span class="badge badge-{pri_cls}">{_html_escape(rec.priority_rating)}</span></p>
+      <p class="score-meaning">{_html_escape(_vrs_meaning(rec.priority_rating))}</p>
+      {_html_vrs_breakdown(rec)}
+    </article>
+    <article class="score-card score-gti">
+      <h3>GTI Prioritization</h3>
+      <p class="score-source">Source: Google Threat Intelligence / VirusTotal. Not the application's internal Vulnerability Risk Score.</p>
+      <div class="score-kicker">Priority</div>
+      <div class="score-total">{_html_escape(gti_priority)}</div>
+      <p class="score-meaning">{_html_escape(gti_meaning)}</p>
+      <ul class="score-context">{_gti_priority_context(rec)}</ul>
+    </article>
   </section>
 """
 
@@ -3962,9 +4184,14 @@ def _association_type_label(entity_type: str) -> str:
 
 def _html_association_entity(entity: AssociationEntity) -> str:
     """Render one normalized association without exposing arbitrary raw JSON."""
+    basis = (
+        "Reported exploitation"
+        if entity.association_basis == "reported_exploitation"
+        else "Associated"
+    )
     rows: list[str] = [
         f"<tr><th>Entity ID</th><td class='mono'>{_html_escape(entity.entity_id)}</td></tr>",
-        f"<tr><th>Relationship</th><td>{_html_escape(entity.relationship)}</td></tr>",
+        f"<tr><th>Relationship</th><td>{_html_escape(basis)} · {_html_escape(entity.relationship)}</td></tr>",
     ]
     optional_rows = (
         ("Origin / source", entity.origin),
@@ -3974,6 +4201,8 @@ def _html_association_entity(entity: AssociationEntity) -> str:
         ("Last seen", entity.last_seen),
         ("Created", entity.creation_date),
         ("Last modified", entity.last_modification_date),
+        ("Associated threat actors", ", ".join(entity.related_actors)),
+        ("Associated technique IDs", ", ".join(entity.related_techniques)),
         ("Relationship context", entity.context),
     )
     for label, value in optional_rows:
@@ -4009,74 +4238,49 @@ def _html_association_entity(entity: AssociationEntity) -> str:
 
 
 def _html_techniques_table(techniques: list[AttackTechnique]) -> str:
+    """Render vulnerability, actor, and campaign TTPs without inferring a chain."""
     if not techniques:
-        return '<p class="muted">No MITRE ATT&amp;CK techniques were returned by VirusTotal.</p>'
+        return '<p class="muted">No associated TTPs identified.</p>'
     rows: list[str] = []
     for technique in techniques:
-        tactic_names = ", ".join(
-            f"{tactic.get('id', '')} {tactic.get('name', '')}".strip()
+        tactic_bits = [
+            " ".join(part for part in (tactic.get("id", ""), tactic.get("name", "")) if part).strip()
             for tactic in technique.tactics
-        ) or "Tactic mapping unavailable"
-        technique_label = _html_web_anchor(
-            technique.link,
-            f"{technique.technique_id} — {technique.name}",
-        )
-        sources = ", ".join(technique.sources) or "Direct VirusTotal relationship"
+        ]
+        tactic_names = ", ".join(bit for bit in tactic_bits if bit) or "Tactic mapping unavailable"
+        technique_id = technique.technique_id or "Not supplied"
+        if technique.link and technique.technique_id:
+            id_html = _html_web_anchor(technique.link, technique.technique_id)
+        else:
+            id_html = _html_escape(technique_id)
+        name = technique.name or "Not supplied"
+        if technique.link and technique.name and not technique.technique_id:
+            name_html = _html_web_anchor(technique.link, technique.name)
+        else:
+            name_html = _html_escape(name)
+        description = f"<div class='muted'>{_html_escape(technique.description)}</div>" if technique.description else ""
+        scope = "Vulnerability-level"
+        if technique.scope == "threat-actor":
+            scope = f"Threat actor: {technique.scope_name or 'associated actor'}"
+        elif technique.scope == "campaign":
+            scope = f"Campaign: {technique.scope_name or 'associated campaign'}"
+        context = technique.context or scope
+        sources = ", ".join(technique.sources) or "Google Threat Intelligence"
         rows.append(
             "<tr class='technique-record'>"
-            f"<td>{technique_label}</td>"
+            f"<td class='mono'>{id_html}</td>"
+            f"<td>{name_html}{description}</td>"
             f"<td>{_html_escape(tactic_names)}</td>"
+            f"<td>{_html_escape(scope)}. {_html_escape(context)}</td>"
             f"<td>{_html_escape(sources)}</td>"
             "</tr>"
         )
     return (
         '<div class="table-wrap"><table class="data"><thead><tr>'
-        '<th>Tcode / Technique</th><th>VirusTotal tactic mapping</th><th>Evidence source</th>'
+        "<th>Technique ID</th><th>MITRE ATT&amp;CK Technique</th><th>Tactic</th>"
+        "<th>Context</th><th>Reference</th>"
         f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
     )
-
-
-def _html_attack_chain(rec: CVERecord) -> str:
-    if not rec.attack_chain:
-        message = rec.attack_chain_note or (
-            "Insufficient VirusTotal intelligence is available to construct a defensible "
-            "attack chain for this vulnerability."
-        )
-        return f'<p class="chain-empty">{_html_escape(message)}</p>'
-
-    nodes = "".join(
-        f"<span class='chain-node'><span class='stage-id'>{_html_escape(stage.stage_id)}</span>"
-        f"{_html_escape(stage.stage)}</span>"
-        + ("<span class='chain-arrow' aria-hidden='true'>→</span>" if index < len(rec.attack_chain) - 1 else "")
-        for index, stage in enumerate(rec.attack_chain)
-    )
-    details: list[str] = []
-    for index, stage in enumerate(rec.attack_chain, start=1):
-        techniques = "".join(
-            f"<li><span class='mono'>{_html_escape(technique.technique_id)}</span> — "
-            f"{_html_escape(technique.name)}</li>"
-            for technique in stage.techniques
-        )
-        evidence = "".join(f"<li>{_html_escape(item)}</li>" for item in stage.evidence)
-        details.append(
-            f"""
-        <details class="stage-detail" open>
-          <summary>Stage {index}: {_html_escape(stage.stage)} <span class="mono">{_html_escape(stage.stage_id)}</span></summary>
-          <dl>
-            <dt>Evidence type</dt><dd>{_html_escape(stage.evidence_type)}</dd>
-            <dt>Confidence</dt><dd>{_html_escape(stage.confidence)}</dd>
-          </dl>
-          <h5>VirusTotal-associated Tcodes</h5><ul>{techniques}</ul>
-          <h5>Evidence</h5><ul>{evidence}</ul>
-          <p class="muted">{_html_escape(stage.notes)}</p>
-        </details>
-"""
-        )
-    return f"""
-      <p class="integrity-note">{_html_escape(rec.attack_chain_note)}</p>
-      <div class="chain" aria-label="ATT&amp;CK-aligned analytical attack-chain mapping">{nodes}</div>
-      {''.join(details)}
-"""
 
 
 def render_associations_report(
@@ -4089,7 +4293,7 @@ def render_associations_report(
     fatal_error: Optional[str] = None,
     generated_report_files: Optional[set[Path]] = None,
 ) -> None:
-    """Write a self-contained associations and evidence-backed chain report."""
+    """Write a self-contained associations report for actors, TTPs, and campaigns."""
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     primary_path = primary_report_path or path.with_name(DEFAULT_HTML)
     ioc_path = ioc_report_path or default_ioc_report_path(primary_path)
@@ -4113,63 +4317,59 @@ def render_associations_report(
             if rec.threat_actors:
                 actors_html = "".join(_html_association_entity(item) for item in rec.threat_actors)
             else:
-                actors_html = '<p class="muted">No associated threat actors were returned.</p>'
+                actors_html = '<p class="muted">No associated threat actors identified.</p>'
             if rec.campaigns:
                 campaigns_html = "".join(_html_association_entity(item) for item in rec.campaigns)
             else:
-                campaigns_html = '<p class="muted">No associated campaigns were returned.</p>'
+                campaigns_html = '<p class="muted">No associated campaigns identified.</p>'
             if rec.supporting_intelligence:
                 supporting_html = "".join(
                     _html_association_entity(item) for item in rec.supporting_intelligence
                 )
             else:
-                supporting_html = '<p class="muted">No relevant supporting threat objects were returned.</p>'
+                supporting_html = '<p class="muted">No related malware, toolkit, or report objects were returned.</p>'
 
-            no_actor_campaign = ""
-            if not rec.threat_actors and not rec.campaigns:
-                no_actor_campaign = (
-                    '<p class="notice">No threat actor or campaign associations were returned '
-                    'by VirusTotal for this vulnerability.</p>'
-                )
-            association_error = ""
-            if rec.association_error:
+            if rec.association_status == "partial":
+                detail = rec.association_error or "One or more association requests did not complete."
                 association_error = (
-                    '<p class="error" role="alert">Association retrieval was incomplete: '
-                    f'{_html_escape(rec.association_error)}</p>'
+                    '<p class="error" role="alert">Association retrieval was incomplete. '
+                    "The sections below are not a complete dataset. "
+                    f"{_html_escape(detail)}</p>"
                 )
-            actor_names = ", ".join(item.name for item in rec.threat_actors) or "None returned"
-            campaign_names = ", ".join(item.name for item in rec.campaigns) or "None returned"
-            malware_tools = ", ".join(
-                item.name
-                for item in rec.supporting_intelligence
-                if item.entity_type in {"malware-family", "software-toolkit"}
-            ) or "None returned"
+            elif rec.association_status == "error":
+                detail = rec.association_error or "Google Threat Intelligence did not return association records."
+                association_error = (
+                    '<p class="error" role="alert">Association retrieval failed. '
+                    f"{_html_escape(detail)}</p>"
+                )
+            elif rec.association_error:
+                association_error = (
+                    '<p class="error" role="alert">Association retrieval was incomplete. '
+                    "The sections below are not a complete dataset. "
+                    f"{_html_escape(rec.association_error)}</p>"
+                )
+            else:
+                association_error = ""
             ioc_anchor = urllib.parse.quote(anchor, safe="-._~")
-            evidence_rows = f"""
-              <tr><th>Observed actor context</th><td>{_html_escape(actor_names)}</td></tr>
-              <tr><th>Observed campaign context</th><td>{_html_escape(campaign_names)}</td></tr>
-              <tr><th>Observed malware/tool context</th><td>{_html_escape(malware_tools)}</td></tr>
-              <tr><th>Observed IOCs</th><td><a href="{_html_escape(ioc_href)}#{_html_escape(ioc_anchor)}" target="_blank" rel="noopener noreferrer">{_ioc_record_count(rec)} IOC record(s) in the IOC report ↗</a></td></tr>
-              <tr><th>Observed Tcodes</th><td>{len(rec.attack_techniques)} direct <code>attack_techniques</code> relationship object(s)</td></tr>
-              <tr><th>Stage inference</th><td>Technique-to-tactic placement from VirusTotal; recognized Enterprise tactics are displayed in canonical ATT&amp;CK lifecycle order. This is not observed event chronology.</td></tr>
-            """
             content = f"""
         {association_error}
-        {no_actor_campaign}
-        <section><h3>Associated Threat Actors</h3>{actors_html}</section>
-        <section><h3>Associated Campaigns</h3>{campaigns_html}</section>
-        <section><h3>Related Threat Intelligence</h3>{supporting_html}</section>
         <section>
-          <h3>Tcodes / MITRE ATT&amp;CK Techniques</h3>
-          <p class="muted">“Tcodes” are the IDs returned by VirusTotal's <code>attack_techniques</code> relationship; no separate Tcodes field is assumed.</p>
+          <h3>Associated Threat Actors</h3>
+          <p class="integrity-note">Actors listed here are associated with this CVE in Google Threat Intelligence. Association alone does not establish that the actor exploited the vulnerability. Rows marked Reported exploitation use explicit relationship context returned by GTI.</p>
+          {actors_html}
+        </section>
+        <section>
+          <h3>Associated TTPs / MITRE ATT&amp;CK</h3>
+          <p class="muted">Technique IDs come from GTI. A description without an ID is shown as returned, and no technique is inferred from the CVE category. Actor-level and campaign-level IDs stay labeled separately from vulnerability-level associations.</p>
           {_html_techniques_table(rec.attack_techniques)}
         </section>
-        <section><h3>Attack Chain</h3>{_html_attack_chain(rec)}</section>
         <section>
-          <h3>Evidence / Data Sources</h3>
-          <div class="table-wrap"><table class="kv">{evidence_rows}</table></div>
-          <p class="integrity-note">CVE-level co-association does not prove technique-level attribution. The report therefore does not assign actors, campaigns, malware, tools, or IOCs to an individual stage unless VirusTotal supplies that direct relationship.</p>
+          <h3>Associated Campaigns</h3>
+          <p class="integrity-note">A campaign is described as exploiting this CVE only when GTI relationship context says so. Otherwise the row records an association.</p>
+          {campaigns_html}
         </section>
+        <section><h3>Related Threat Intelligence</h3>{supporting_html}</section>
+        <p class="meta"><a href="{_html_escape(ioc_href)}#{_html_escape(ioc_anchor)}" target="_blank" rel="noopener noreferrer">IOC report ↗</a></p>
 """
         sections.append(
             f"""
@@ -4227,17 +4427,11 @@ def render_associations_report(
   th,td {{ padding:.45rem .55rem; text-align:left; vertical-align:top; border-bottom:1px solid #1e293b; word-break:break-word; }}
   th {{ color:var(--muted); font-weight:600; }} table.kv th {{ width:26%; }} tr:last-child th,tr:last-child td {{ border-bottom:0; }}
   ul {{ margin:.25rem 0; padding-left:1.2rem; }}
-  .notice,.integrity-note,.chain-empty {{ padding:.7rem .85rem; border:1px solid #4c3d73; border-radius:9px; background:#211a35; color:#ddd6fe; }}
+  .integrity-note {{ padding:.7rem .85rem; border:1px solid #4c3d73; border-radius:9px; background:#211a35; color:#ddd6fe; }}
   .error,.fatal-banner {{ color:#fecaca; background:#3f0d0d; border:1px solid #7f1d1d; border-radius:10px; padding:.7rem .85rem; }}
   .fatal-banner {{ margin-bottom:1.25rem; }} .fatal-banner pre {{ white-space:pre-wrap; word-break:break-word; font-size:.78rem; }}
-  .chain {{ display:flex; flex-wrap:wrap; align-items:center; gap:.55rem; margin:1rem 0; }}
-  .chain-node {{ display:inline-flex; flex-direction:column; min-width:9rem; padding:.65rem .8rem; border:1px solid var(--mapped); border-radius:10px; background:#211a35; font-weight:700; }}
-  .stage-id {{ color:#c4b5fd; font-size:.72rem; }} .chain-arrow {{ color:var(--accent); font-size:1.35rem; }}
-  .stage-detail {{ margin:.65rem 0; padding:.65rem .8rem; border:1px solid var(--border); border-radius:9px; background:#0d1628; }}
-  .stage-detail summary {{ cursor:pointer; font-weight:700; }}
-  dl {{ display:grid; grid-template-columns:max-content 1fr; gap:.25rem .7rem; }} dt {{ color:var(--muted); }} dd {{ margin:0; }}
   footer {{ margin-top:2rem; padding-top:1rem; border-top:1px solid var(--border); color:var(--muted); font-size:.8rem; }}
-  @media (max-width:700px) {{ .card-header,.entity-heading {{ flex-direction:column; }} .report-links {{ justify-content:flex-start; }} .chain-arrow {{ transform:rotate(90deg); }} table.kv th {{ width:38%; }} }}
+  @media (max-width:700px) {{ .card-header,.entity-heading {{ flex-direction:column; }} .report-links {{ justify-content:flex-start; }} table.kv th {{ width:38%; }} }}
 </style>
 </head>
 <body>
@@ -4251,8 +4445,8 @@ def render_associations_report(
     {''.join(sections) if sections else empty}
     <footer>
       Direct threat objects: <code>/api/v3/collections/vulnerability--&lt;cve&gt;/associations</code>.
-      Tcodes: <code>/attack_techniques</code>. Tactic placement: <code>/api/v3/attack_techniques/&lt;Tcode&gt;/attack_tactics</code>.
-      Availability depends on Google TI licensing and object coverage.
+      Techniques: <code>/attack_techniques</code>. Tactic names: <code>/api/v3/attack_techniques/&lt;id&gt;/attack_tactics</code>.
+      Availability depends on Google TI licensing and object coverage. This report does not construct an attack chain.
     </footer>
   </main>
 </body>
@@ -4396,7 +4590,7 @@ def render_html_report(
         wild_note = _html_wild_status_note(rec)
         ioc_section = _html_ioc_summary(rec, ioc_report_href)
         associations_section = _html_associations_summary(rec, associations_report_href)
-        priority_viz = _html_internal_priority_breakdown(rec) + _html_priority_viz(rec)
+        priority_viz = _html_score_comparison(rec) + _html_priority_viz(rec)
 
         cards.append(
             f"""
@@ -4465,7 +4659,6 @@ def render_html_report(
         <tr><th>Disclosure</th><td>{_html_escape(rec.date_of_disclosure)}</td></tr>
         <tr><th>Last Modified</th><td>{_html_escape(rec.last_modification_date)}</td></tr>
         <tr><th>IoCs</th><td>{_html_escape(rec.ioc_count)}</td></tr>
-        <tr><th>VirusTotal priority (comparison only; not used)</th><td>{_html_escape(rec.vt_priority_raw)}</td></tr>
         <tr><th>VT collection</th><td>{_html_vt_anchor(rec.vt_url, "Open in VirusTotal")}</td></tr>
       </table>
     </div>
@@ -4776,23 +4969,70 @@ def render_html_report(
   .exploit-state.exploit-suspected {{ color: #93c5fd; }}
   .exploit-state.exploit-noknown,
   .exploit-state.exploit-unknown {{ color: var(--muted); }}
-  .priority-viz, .priority-breakdown {{
+  .score-compare {{
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.75rem;
+    align-items: start;
+    margin-bottom: 0.75rem;
+  }}
+  .score-card {{
+    min-width: 0;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: 12px;
-    padding: 0.85rem 1rem 1rem;
-    margin-bottom: 1rem;
+    padding: 0.75rem 0.9rem 0.85rem;
   }}
-  .priority-breakdown {{
+  .score-card h3 {{ margin: 0; font-size: 0.98rem; }}
+  .score-vrs {{
     background: linear-gradient(135deg, #14213a 0%, var(--surface-2) 70%);
   }}
+  .score-source, .score-meaning {{
+    color: var(--muted);
+    font-size: 0.8rem;
+    margin: 0.35rem 0 0;
+  }}
+  .score-kicker {{
+    margin-top: 0.45rem;
+    color: var(--muted);
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }}
+  .score-rating {{ margin: 0.15rem 0 0.35rem; }}
+  .score-context {{
+    margin: 0.55rem 0 0;
+    padding-left: 1.1rem;
+    color: var(--text);
+    font-size: 0.82rem;
+  }}
+  .score-context li {{ margin: 0.15rem 0; overflow-wrap: anywhere; }}
+  .vrs-breakdown {{ margin-top: 0.65rem; }}
+  .vrs-breakdown summary {{
+    cursor: pointer;
+    font-weight: 700;
+    color: var(--accent);
+  }}
+  .vrs-breakdown summary:focus {{
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }}
+  .vrs-breakdown .score-table-wrap {{ margin-top: 0.55rem; }}
+  .priority-viz {{
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0.7rem 0.85rem 0.8rem;
+    margin-bottom: 1rem;
+  }}
   .score-total {{
-    margin: 0.25rem 0 0.8rem;
-    font-size: 2rem;
+    margin: 0.2rem 0 0.35rem;
+    font-size: 1.55rem;
     font-weight: 800;
     letter-spacing: -0.03em;
+    overflow-wrap: anywhere;
   }}
-  .score-total span {{ color: var(--muted); font-size: 1rem; font-weight: 600; }}
+  .score-total span {{ color: var(--muted); font-size: 0.95rem; font-weight: 600; }}
   .score-table-wrap {{ overflow-x: auto; }}
   table.score-table {{ width: 100%; border-collapse: collapse; font-size: 0.86rem; }}
   table.score-table th, table.score-table td {{
@@ -4821,18 +5061,26 @@ def render_html_report(
   }}
   .priority-viz-body {{
     display: grid;
-    grid-template-columns: minmax(320px, 1.25fr) minmax(260px, 0.75fr);
-    gap: 1rem;
-    align-items: center;
+    grid-template-columns: minmax(0, 280px) minmax(0, 1fr);
+    gap: 0.75rem;
+    align-items: start;
   }}
   .priority-chart-wrap {{
     min-width: 0;
+    max-width: 280px;
+    width: 100%;
     background: #111b30;
     border: 1px solid #334361;
     border-radius: 10px;
-    padding: 0.35rem;
+    padding: 0.25rem;
   }}
-  .priority-chart {{ display: block; width: 100%; height: auto; max-height: 26rem; }}
+  .priority-chart {{
+    display: block;
+    width: 100%;
+    max-width: 280px;
+    height: auto;
+    aspect-ratio: 500 / 380;
+  }}
   .priority-axis {{ stroke: #435777; stroke-width: 7; stroke-linecap: square; }}
   .priority-shape {{
     fill: rgba(255, 93, 83, 0.13);
@@ -4842,8 +5090,8 @@ def render_html_report(
   }}
   .priority-marker {{ fill: #ff5d53; stroke: #ffd2cf; stroke-width: 1.5; }}
   .priority-origin {{ fill: #435777; }}
-  .priority-tick {{ fill: #d8e1f1; font-size: 17px; }}
-  .priority-axis-label {{ fill: #f4f7ff; font-size: 20px; font-weight: 500; }}
+  .priority-tick {{ fill: #d8e1f1; font-size: 22px; }}
+  .priority-axis-label {{ fill: #f4f7ff; font-size: 24px; font-weight: 500; }}
   .priority-inputs {{
     display: grid;
     grid-template-columns: 1fr;
@@ -4861,7 +5109,8 @@ def render_html_report(
     margin-top: 0.2rem;
   }}
   @media (max-width: 800px) {{
-    .priority-viz-body {{ grid-template-columns: 1fr; }}
+    .score-compare, .priority-viz-body {{ grid-template-columns: minmax(0, 1fr); }}
+    .priority-chart-wrap {{ max-width: 280px; }}
   }}
   .debug-note {{
     margin-top: 0.35rem;
@@ -4938,11 +5187,12 @@ def render_html_report(
     <footer class="page">
       Data source: Google Threat Intelligence / VirusTotal Vulnerability collections API
       (<code>/api/v3/collections/vulnerability--&lt;cve&gt;</code>).
-      Internal Priority (P0–P3) is calculated locally from CVSS severity, active-exploitation
-      evidence, EPSS percentile, exploit maturity, and CVSS v4 automatability. The native
-      VirusTotal priority field is comparison-only and cannot override this result.
+      The Internal Vulnerability Risk Score (P0–P3) is calculated locally from CVSS severity,
+      active-exploitation evidence, EPSS percentile, exploit maturity, and CVSS v4 automatability.
+      GTI prioritization is shown separately and cannot override this result.
       Data enrichment requires GTI Enterprise / Enterprise Plus.
-      This report is always generated and opened after each run, including failures.
+      Successful CVE reports open in separate browser tabs. Companion IOC and Associations
+      reports open from their links.
     </footer>
   </div>
 </body>
@@ -4953,79 +5203,76 @@ def render_html_report(
 
 
 def open_report_in_browser(path: Path) -> None:
+    """Open one completed report using an absolute file URI in a new tab.
+
+    Browser errors only produce a warning; reports stay available for manual
+    review until the analyst confirms cleanup with Enter.
     """
-    Open the HTML report in the default browser (prefer a new window/tab).
-
-    Uses ``webbrowser`` first; on Windows falls back to ``os.startfile`` /
-    ``cmd /c start`` if needed so the report still surfaces after a failed run.
-
-    Why we open even on failure
-    ---------------------------
-    Analysts running this from a locked-down Windows desktop often miss
-    stderr in a flashing console window. A browser tab is the reliable
-    place to read SSL/proxy/key errors, screenshot them, and attach them
-    to a ticket. ``--no-open`` exists only for CI/automation; the file is
-    still written by ``render_html_report``.
-
-    Failures here are logged, never raised — a browser-helper error must
-    not mask a successful enrichment (or replace the real exit code).
-    """
-    resolved = path.resolve()
-    if not resolved.is_file():
-        logging.warning("Cannot open report — file missing: %s", resolved)
-        return
-
-    uri = resolved.as_uri()
-    logging.info("Opening HTML report in browser: %s", resolved)
-
     try:
-        # new=1 asks for a new window; autoraise brings the browser forward
-        opened = webbrowser.open(uri, new=1, autoraise=True)
-        if opened:
+        resolved = path.resolve()
+        if not resolved.is_file() or resolved.stat().st_size == 0:
+            logging.warning("Cannot open report — file missing or empty: %s", resolved)
+            return
+        logging.info("Opening HTML report in browser: %s", resolved)
+        if webbrowser.open_new_tab(resolved.as_uri()):
             return
     except Exception as exc:  # noqa: BLE001 — best-effort UI helper
-        logging.debug("webbrowser.open failed: %s", exc)
-
-    # Windows-reliable fallbacks when webbrowser is misconfigured or restricted
-    if sys.platform == "win32":
-        try:
-            os.startfile(str(resolved))  # type: ignore[attr-defined]
-            return
-        except Exception as exc:  # noqa: BLE001
-            logging.debug("os.startfile failed: %s", exc)
-        try:
-            # Empty title argument after "start" is required when the path is quoted
-            subprocess.run(
-                ["cmd", "/c", "start", "", str(resolved)],
-                check=False,
-                shell=False,
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to open report via cmd start: %s", exc)
-            return
-
+        logging.debug("Opening the browser failed: %s", exc)
     logging.warning(
-        "Could not open the report automatically. Open manually: %s", resolved
+        "Could not open the report automatically. Open manually: %s", path
     )
 
 
-def select_report_to_open(reports: list[tuple[str, Path]]) -> bool:
-    """Review reports; return True only when Enter confirms exit and cleanup.
+def open_reports_in_browser(reports: Iterable[tuple[str, Path]]) -> None:
+    """Open each completed primary report once, in input order, in its own tab.
 
-    Zero/one selectable reports use the same exit flow without a numbered menu.
-    An empty list also supports manual review with ``--no-open``.
+    Duplicate CVE identifiers and duplicate file paths are skipped. Missing,
+    empty, and unreadable reports are not opened. A browser failure is logged
+    and does not discard the remaining reports.
     """
-    prompt = "\nPress Enter to exit and remove generated HTML reports... "
-    if len(reports) > 1:
-        print("\nAvailable CVE reports:\n")
-        for index, (cve, _) in enumerate(reports, start=1):
-            print(f"{index}: {cve}")
-        prompt = (
-            "\nSelect a report to open by number, or press Enter to exit "
-            "and remove generated HTML reports: "
-        )
+    seen_cves: set[str] = set()
+    seen_paths: set[Path] = set()
+    queued: list[tuple[str, Path]] = []
+    for cve, path in reports:
+        try:
+            resolved = path.resolve()
+            normalized_cve = cve.strip().upper()
+            if not normalized_cve or normalized_cve in seen_cves or resolved in seen_paths:
+                logging.info("Skipping duplicate report for %s (%s).", cve, resolved)
+                continue
+            if not resolved.is_file() or resolved.stat().st_size == 0:
+                logging.warning(
+                    "Cannot open report for %s — file missing or empty: %s",
+                    cve,
+                    resolved,
+                )
+                continue
+            seen_cves.add(normalized_cve)
+            seen_paths.add(resolved)
+            queued.append((cve, resolved))
+        except Exception as exc:  # noqa: BLE001 — keep opening the other reports
+            logging.warning("Could not open report for %s (%s). Open manually: %s", cve, exc, path)
 
+    if not queued:
+        print("No completed CVE reports were opened.")
+        return
+    print(f"Opening {len(queued)} CVE report(s) in separate browser tabs:")
+    for cve, resolved in queued:
+        print(f"  {cve}: {resolved}")
+        try:
+            open_report_in_browser(resolved)
+        except Exception as exc:  # noqa: BLE001 — one browser failure must not skip the rest
+            logging.warning(
+                "Could not open report for %s (%s). Open manually: %s",
+                cve,
+                exc,
+                resolved,
+            )
+
+
+def wait_for_report_review() -> bool:
+    """Keep every report available until Enter explicitly confirms cleanup."""
+    prompt = "\nPress Enter to exit and remove generated HTML reports... "
     while True:
         try:
             selection = input(prompt).strip()
@@ -5036,21 +5283,7 @@ def select_report_to_open(reports: list[tuple[str, Path]]) -> bool:
 
         if not selection:
             return True
-        if len(reports) <= 1:
-            print("Press Enter when you have finished reviewing the reports.")
-            continue
-        try:
-            selected_index = int(selection)
-        except ValueError:
-            selected_index = 0
-
-        if not 1 <= selected_index <= len(reports):
-            print(f"Invalid selection. Enter a number between 1 and {len(reports)}.")
-            continue
-
-        cve, report_path = reports[selected_index - 1]
-        print(f"Opening report for {cve}...")
-        open_report_in_browser(report_path)
+        print("Press Enter when you have finished reviewing the reports.")
 
 
 # ---------------------------------------------------------------------------
@@ -5065,7 +5298,7 @@ def select_report_to_open(reports: list[tuple[str, Path]]) -> bool:
 #   4. resolve API key, --input CVE or input CSV, proxies, CA bundle
 #   5. GTIClient(...)  with those resolved values
 #   6. enrich + CSV + optional Rich
-#   7. ALWAYS render HTML and (unless --no-open) launch the browser
+#   7. ALWAYS render HTML and (unless --no-open) open successful CVE reports
 #   8. Wait for Enter at the review prompt, then clean up this run's HTML
 # Step 7 lives outside the enrichment try so missing keys, missing CA
 # files, and SSL errors still produce a browsable failure page.
@@ -5115,18 +5348,19 @@ def build_proxies(
     return proxies or None
 
 
-def _format_fatal_error(exc: BaseException) -> str:
+def _format_fatal_error(exc: BaseException, extra: Iterable[str] = ()) -> str:
     """Human-readable exception + short traceback for the HTML error panel.
 
     Kept off the console by default (full text is DEBUG / ``-v``) so a
     missing CA file is one clear line in the terminal and the detail lives
-    in the report that we always open.
+    in the generated report available for manual review. Secrets are
+    redacted before this string is escaped into HTML (CWE-532, CWE-79).
     """
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     # Cap size so the HTML stays readable in constrained browser windows
     if len(tb) > 8000:
         tb = tb[:8000] + "\n… [traceback truncated]"
-    return redact_secrets(f"{type(exc).__name__}: {exc}\n\n{tb}")
+    return redact_secrets(f"{type(exc).__name__}: {exc}\n\n{tb}", extra)
 
 
 def enrich_cves(
@@ -5187,11 +5421,6 @@ def enrich_cves(
                 except (TypeError, ValueError, AttributeError, KeyError, OSError) as assoc_exc:
                     rec.association_status = "error"
                     rec.association_error = "Unexpected associations processing failure"
-                    rec.attack_chain = []
-                    rec.attack_chain_note = (
-                        "Insufficient VirusTotal intelligence is available to construct a "
-                        "defensible attack chain for this vulnerability."
-                    )
                     logging.warning(
                         "Associations processing failed for %s (%s)",
                         cve,
@@ -5328,8 +5557,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     Flags are overrides, not the primary config surface. ``--html`` always
     has a path (default ``report.html``); on multi-CVE runs its directory is
     used for the individual ``CVE-..._report.html`` files.
-    ``--no-open`` is the only way to skip the browser, and it does not skip
-    the write.
+    ``--no-open`` skips browser tabs without skipping report generation.
     """
     p = argparse.ArgumentParser(
         prog="cve_enricher.py",
@@ -5337,7 +5565,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Enrich CVE IDs via Google Threat Intelligence / VirusTotal "
             "vulnerability collections (Enterprise required). "
             "Config: project .env (API key, proxies, CORPORATE_CA_BUNDLE). "
-            "HTML report is always written and opened, including on failure."
+            "HTML reports are always written; successful CVE reports open in browser tabs."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -5387,7 +5615,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-open",
         action="store_true",
-        help="Do not open the HTML report in a browser (report is still written)",
+        help="Do not open HTML reports in browser tabs (reports are still written)",
     )
     p.add_argument(
         "--no-rich",
@@ -5458,8 +5686,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     Guarantees: after parse + logging setup, primary, IOC, and Associations HTML reports are
     always generated, even when the run fails with a missing key, SSL error,
     bad input, or unexpected exception. Multi-CVE runs generate one report set per
-    record. The first primary report opens automatically and a numbered selector
-    can open more reports (unless ``--no-open``). Enter at the review prompt
+    record. Every successful primary report opens automatically in a separate
+    browser tab (unless ``--no-open``). Enter at the review prompt
     removes only this invocation's generated HTML files.
 
     Exit codes (unchanged): 0 = at least one success; 1 = no successes /
@@ -5498,6 +5726,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     exit_code = 0
     output_path = Path(args.output)
     generated_report_files: set[Path] = set()
+    # Filled once the key and proxies are known. The HTML writer sits outside
+    # the try, so this must exist even when startup fails first.
+    sensitive: tuple[str, ...] = ()
 
     try:
         if report_path_error:
@@ -5539,6 +5770,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             logging.info("Loaded %d unique CVE(s) from %s", len(cves), input_path)
 
         api_key = resolve_api_key(args.api_key)
+        sensitive = sensitive_fragments(api_key, None)
         if not api_key:
             raise RuntimeError(
                 "No API key. Set VIRUSTOTAL_API_KEY (or VT_API_KEY) in the project "
@@ -5549,11 +5781,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Proxies and CA bundle are applied on the Session inside GTIClient.
         # Redact user:password@ in logs if operators put creds in the proxy URL.
         proxies = build_proxies(args.http_proxy, args.https_proxy)
+        sensitive = sensitive_fragments(api_key, proxies)
         if proxies:
-            safe_proxies = {
-                k: re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:***@", v)
-                for k, v in proxies.items()
-            }
+            safe_proxies = {k: redact_secrets(v, sensitive) for k, v in proxies.items()}
             logging.info("Using proxies: %s", safe_proxies)
         else:
             logging.info("No HTTP(S) proxy configured (direct connection).")
@@ -5650,11 +5880,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Do not re-raise: we still write/open the HTML report below.
         # That is the always-open guarantee — a missing key or SSL failure
         # must not exit before the operator gets a browsable error page.
-        fatal_error = _format_fatal_error(exc)
-        logging.error("%s", redact_secrets(str(exc)))
+        fatal_error = _format_fatal_error(exc, sensitive)
+        logging.error("%s", redact_secrets(str(exc), sensitive))
         if args.verbose:
             logging.debug("%s", fatal_error)
-        log_console.print(f"[bold red]Error:[/bold red] {redact_secrets(str(exc))}")
+        log_console.print(
+            f"[bold red]Error:[/bold red] {redact_secrets(str(exc), sensitive)}"
+        )
         # Prefer exit 2 for config/input problems; 1 for other runtime failures
         msg = str(exc).lower()
         if any(
@@ -5690,7 +5922,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     # ------------------------------------------------------------------
     report_failed = False
     written_primary_reports: list[tuple[str, Path]] = []
-    fallback_primary_path: Optional[Path] = None
     targets = _report_targets(records, html_path, ioc_path, associations_path)
     for target_records, target_primary_path, target_ioc_path, target_associations_path in targets:
         cve_label = target_records[0].cve if target_records else ""
@@ -5718,7 +5949,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             logging.info("IOC report: %s", target_ioc_path.resolve())
         except Exception as report_exc:  # noqa: BLE001
             report_failed = True
-            logging.error("Failed to write IOC report for %s: %s", cve_label or "run", report_exc)
+            logging.error(
+                "Failed to write IOC report for %s: %s",
+                cve_label or "run",
+                redact_secrets(str(report_exc), sensitive),
+            )
 
         try:
             render_associations_report(
@@ -5736,7 +5971,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             logging.error(
                 "Failed to write Associations report for %s: %s",
                 cve_label or "run",
-                report_exc,
+                redact_secrets(str(report_exc), sensitive),
             )
 
         try:
@@ -5750,29 +5985,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                 generated_report_files=generated_report_files,
             )
             logging.info("HTML report: %s", target_primary_path.resolve())
-            if target_records:
+            if target_records and target_records[0].status == "ok" and not fatal_error:
                 written_primary_reports.append((cve_label, target_primary_path))
-            else:
-                fallback_primary_path = target_primary_path
         except Exception as report_exc:  # noqa: BLE001
             report_failed = True
             logging.error(
                 "Failed to write primary HTML report for %s: %s",
                 cve_label or "run",
-                report_exc,
+                redact_secrets(str(report_exc), sensitive),
             )
 
     if not args.no_open:
-        if written_primary_reports:
-            open_report_in_browser(written_primary_reports[0][1])
-        elif fallback_primary_path is not None:
-            open_report_in_browser(fallback_primary_path)
+        open_reports_in_browser(written_primary_reports)
     if report_failed and exit_code == 0:
         exit_code = 1
 
-    if generated_report_files and select_report_to_open(
-        written_primary_reports if not args.no_open else []
-    ):
+    if generated_report_files and wait_for_report_review():
         cleanup_generated_reports(generated_report_files)
 
     return exit_code

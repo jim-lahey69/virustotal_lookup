@@ -1,4 +1,4 @@
-"""Association retrieval, normalization, attack-chain integrity, and report tests."""
+"""Association retrieval, normalization, and report tests."""
 
 from __future__ import annotations
 
@@ -141,15 +141,21 @@ class AssociationAttachmentTests(unittest.TestCase):
         def get_attack_technique_tactics(self, technique_id: str, *, limit: int = 40):
             return TACTICS.get(technique_id, {"data": []}), None, 200
 
-    def test_builds_mapped_chain_from_direct_techniques_and_tactics(self) -> None:
+    def test_attaches_actors_campaigns_and_vulnerability_techniques(self) -> None:
         rec = ce.CVERecord(cve="CVE-2026-10000", status="ok")
         client = self.Client()
         ce.attach_associations(client, rec)  # type: ignore[arg-type]
 
         self.assertEqual(rec.association_status, "complete")
-        self.assertEqual([stage.stage_id for stage in rec.attack_chain], ["TA0001", "TA0002"])
-        self.assertTrue(all(stage.evidence_type == "Analytical Mapping" for stage in rec.attack_chain))
-        self.assertIn("not an observed intrusion chronology", rec.attack_chain_note)
+        self.assertEqual([item.name for item in rec.threat_actors], ["Example Actor"])
+        self.assertEqual([item.name for item in rec.campaigns], ["Example Campaign"])
+        self.assertEqual(
+            [item.technique_id for item in rec.attack_techniques],
+            ["T1190", "T1059.001"],
+        )
+        self.assertEqual(rec.attack_techniques[0].tactics[0]["id"], "TA0001")
+        self.assertEqual(rec.attack_techniques[0].scope, "vulnerability")
+        self.assertFalse(hasattr(rec, "attack_chain"))
         self.assertEqual(
             client.calls,
             [
@@ -165,18 +171,19 @@ class AssociationAttachmentTests(unittest.TestCase):
             rec,
         )  # type: ignore[arg-type]
         self.assertEqual(rec.association_status, "none")
-        self.assertEqual(rec.attack_chain, [])
-        self.assertIn("Insufficient VirusTotal intelligence", rec.attack_chain_note)
+        self.assertEqual(rec.threat_actors, [])
+        self.assertEqual(rec.campaigns, [])
+        self.assertEqual(rec.attack_techniques, [])
 
-    def test_actor_without_attack_evidence_does_not_fabricate_a_chain(self) -> None:
+    def test_actor_without_techniques_does_not_invent_ttps(self) -> None:
         rec = ce.CVERecord(cve="CVE-2026-10002", status="ok")
         ce.attach_associations(
             self.Client(associations=ASSOCIATIONS_PAYLOAD, techniques={"data": []}),
             rec,
         )  # type: ignore[arg-type]
         self.assertEqual(len(rec.threat_actors), 1)
-        self.assertEqual(rec.attack_chain, [])
-        self.assertIn("Insufficient VirusTotal intelligence", rec.attack_chain_note)
+        self.assertEqual(rec.attack_techniques, [])
+        self.assertEqual(rec.threat_actors[0].association_basis, "associated")
 
     def test_api_failure_is_partial_and_retains_available_techniques(self) -> None:
         class PartialClient(self.Client):
@@ -188,8 +195,72 @@ class AssociationAttachmentTests(unittest.TestCase):
         rec = ce.CVERecord(cve="CVE-2026-10003", status="ok")
         ce.attach_associations(PartialClient(), rec)  # type: ignore[arg-type]
         self.assertEqual(rec.association_status, "partial")
-        self.assertEqual(len(rec.attack_chain), 2)
+        self.assertEqual(len(rec.attack_techniques), 2)
         self.assertIn("HTTP 429", rec.association_error)
+
+    def test_pagination_error_is_not_reported_as_complete(self) -> None:
+        payload = {
+            "data": ASSOCIATIONS_PAYLOAD["data"],
+            "meta": {"count": 8},
+            "_pagination_error": "pagination request failed (HTTP 429, rate_limited)",
+        }
+        rec = ce.CVERecord(cve="CVE-2026-10010", status="ok")
+        ce.attach_associations(
+            self.Client(associations=payload, techniques={"data": []}),
+            rec,
+        )  # type: ignore[arg-type]
+        self.assertEqual(rec.association_status, "partial")
+        self.assertIn("pagination request failed", rec.association_error)
+
+    def test_explicit_campaign_actor_and_technique_stay_scoped(self) -> None:
+        payload = {
+            "data": [
+                {
+                    "type": "collection",
+                    "id": "campaign--campaign-2",
+                    "attributes": {
+                        "collection_type": "campaign",
+                        "name": "Scoped Campaign",
+                        "description": "Campaign context",
+                        "threat_actors": [{"name": "Named Actor"}],
+                        "attack_techniques": ["T1190"],
+                    },
+                    "context_attributes": {
+                        "relationship": "exploited this vulnerability",
+                    },
+                }
+            ]
+        }
+        rec = ce.CVERecord(cve="CVE-2026-10011", status="ok")
+        ce.attach_associations(
+            self.Client(associations=payload, techniques={"data": []}),
+            rec,
+        )  # type: ignore[arg-type]
+        self.assertEqual(rec.campaigns[0].association_basis, "reported_exploitation")
+        self.assertEqual(rec.campaigns[0].related_actors, ["Named Actor"])
+        self.assertEqual(rec.attack_techniques[0].scope, "campaign")
+        self.assertEqual(rec.attack_techniques[0].technique_id, "T1190")
+        self.assertIn("Not confirmed", rec.attack_techniques[0].context)
+
+    def test_missing_technique_id_is_not_invented(self) -> None:
+        payload = {
+            "data": [
+                {
+                    "type": "attack_technique",
+                    "id": "initial-access-description",
+                    "attributes": {"name": "Described without an ID"},
+                }
+            ]
+        }
+        techniques = ce.parse_attack_techniques(payload)
+        self.assertEqual(techniques[0].technique_id, "")
+        self.assertIn("without a MITRE", techniques[0].context)
+
+    def test_duplicate_association_objects_collapse(self) -> None:
+        duplicate = dict(ASSOCIATIONS_PAYLOAD)
+        duplicate["data"] = ASSOCIATIONS_PAYLOAD["data"][:1] * 2
+        groups = ce.parse_associations(duplicate)
+        self.assertEqual(len(groups["threat_actors"]), 1)
 
 
 class AssociationPaginationTests(unittest.TestCase):
@@ -253,27 +324,41 @@ class AssociationReportTests(unittest.TestCase):
 
         self.assertIn('href="associations_report.html#CVE-2026-10005"', primary)
         self.assertIn("Associated Threat Actors", associations)
+        self.assertIn("Associated TTPs / MITRE ATT&amp;CK", associations)
+        self.assertIn("Associated Campaigns", associations)
         self.assertIn("Example Actor", associations)
         self.assertIn("Example Campaign", associations)
         self.assertIn("Example Malware", associations)
         self.assertIn("T1190", associations)
-        self.assertIn("Evidence type", associations)
-        self.assertIn("Analytical Mapping", associations)
-        self.assertIn("not an observed intrusion chronology", associations)
-        self.assertIn("CVE-level co-association does not prove technique-level attribution", associations)
+        self.assertIn("Exploit Public-Facing Application", associations)
+        self.assertIn("TA0001", associations)
+        self.assertIn("Vulnerability-level", associations)
+        self.assertNotIn("Attack Chain", associations)
+        self.assertNotIn("Analytical Mapping", associations)
+        self.assertIn("does not establish that the actor exploited", associations)
 
-    def test_no_data_and_insufficient_chain_messages_are_explicit(self) -> None:
+    def test_no_data_messages_are_explicit(self) -> None:
         rec = ce.CVERecord(cve="CVE-2026-10006", status="ok", association_status="none")
-        rec.attack_chain_note = (
-            "Insufficient VirusTotal intelligence is available to construct a defensible "
-            "attack chain for this vulnerability."
+        _, associations = self._render([rec])
+        self.assertIn("No associated threat actors identified.", associations)
+        self.assertIn("No associated campaigns identified.", associations)
+        self.assertIn("No associated TTPs identified.", associations)
+        self.assertNotIn("Attack Chain", associations)
+
+    def test_partial_retrieval_is_labeled_incomplete(self) -> None:
+        rec = ce.CVERecord(
+            cve="CVE-2026-10012",
+            status="ok",
+            association_status="partial",
+            association_error="associations: pagination request failed (HTTP 500, error)",
+            threat_actors=[
+                ce.AssociationEntity("threat-actor--one", "threat-actor", "Partial Actor")
+            ],
         )
         _, associations = self._render([rec])
-        self.assertIn(
-            "No threat actor or campaign associations were returned by VirusTotal for this vulnerability.",
-            associations,
-        )
-        self.assertIn("Insufficient VirusTotal intelligence", associations)
+        self.assertIn("not a complete dataset", associations)
+        self.assertIn("Partial Actor", associations)
+        self.assertIn("pagination request failed", associations)
 
     def test_multiple_cve_state_is_isolated(self) -> None:
         first = ce.CVERecord(

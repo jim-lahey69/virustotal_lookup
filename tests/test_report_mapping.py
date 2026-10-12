@@ -274,10 +274,14 @@ class CanonicalIdentifierTests(unittest.TestCase):
     def test_unrelated_api_alias_is_not_rendered(self) -> None:
         payload = _load("cve-2026-34621.json")
         payload["data"]["attributes"]["legacy_identifier"] = "LEGACY-DO-NOT-RENDER"
+        payload["data"]["attributes"]["mve_id"] = "MVE-2021-9999"
+        payload["data"]["attributes"]["description"] = "Also tracked as MVE-2021-9999."
         rec = ce.extract_record("CVE-2026-34621", payload)
         html = _html_for(rec)
         self.assertIn("CVE-2026-34621", html)
         self.assertNotIn("LEGACY-DO-NOT-RENDER", html)
+        self.assertNotIn("MVE-2021-9999", html)
+        self.assertNotIn("MVE-2021-9999", rec.description)
 
 
 class HtmlFeatureTests(unittest.TestCase):
@@ -298,13 +302,24 @@ class HtmlFeatureTests(unittest.TestCase):
     def test_internal_priority_breakdown_and_labeled_vt_value(self) -> None:
         rec = ce.extract_record("CVE-2021-44228", _load("cve-2021-44228.json"))
         html = _html_for(rec)
-        self.assertIn("Internal Priority Score", html)
-        self.assertIn("Total Internal Priority Score", html)
+        self.assertIn("Internal Vulnerability Risk Score", html)
+        self.assertIn("Total Vulnerability Risk Score", html)
+        self.assertIn("View VRS Scoring Breakdown", html)
+        self.assertIn('<details class="vrs-breakdown">', html)
+        self.assertNotIn('<details class="vrs-breakdown" open', html)
+        self.assertIn("Vulnerability Severity", html)
+        self.assertIn("Active Exploitation", html)
+        self.assertIn("Exploitation Probability", html)
+        self.assertIn("Exploit Maturity", html)
+        self.assertIn("Exploit Automatability", html)
         self.assertIn("Supporting VirusTotal intelligence", html)
         self.assertIn("Potential impact", html)
         self.assertIn("Exploit accessibility", html)
         self.assertIn("Real-world use", html)
         self.assertIn('<svg class="priority-chart"', html)
+        self.assertIn("max-width: 280px", html)
+        self.assertIn("aspect-ratio: 500 / 380", html)
+        self.assertNotIn("max-height: 26rem", html)
         self.assertIn('data-axis="risk" data-level="4"', html)
         self.assertIn('data-axis="availability" data-level="4"', html)
         self.assertIn('data-axis="state" data-level="4"', html)
@@ -314,12 +329,18 @@ class HtmlFeatureTests(unittest.TestCase):
             html,
         )
         self.assertEqual(rec.vt_priority_raw, "True")
-        self.assertIn(
-            "VirusTotal priority (comparison only; not used)</th><td>True</td>",
-            html,
-        )
         self.assertEqual(rec.priority_score, 90.0)
         self.assertEqual(rec.priority_rating, "P0")
+        vrs, gti = html.split('class="score-card score-vrs"', 1)[1].split(
+            'class="score-card score-gti"', 1
+        )
+        self.assertIn("90 <span>/ 100</span>", vrs)
+        self.assertIn(">P0<", vrs)
+        self.assertIn("Not available", gti)
+        self.assertIn("Remediation priority flag: Yes", gti)
+        self.assertIn("Google Threat Intelligence / VirusTotal", gti)
+        self.assertNotIn("90 <span>/ 100</span>", gti)
+        self.assertNotIn(">P0<", gti)
 
     def test_priority_svg_changes_with_normalized_values(self) -> None:
         low_signal = ce.extract_record(
